@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>簽到結果</title>
+<style>body{font-family:system-ui,sans-serif;background:#f6f7fb;margin:0}.box{max-width:520px;margin:48px auto;background:#fff;border-radius:16px;padding:28px;box-shadow:0 4px 20px #0001;text-align:center}.ok{font-size:28px}.sub{color:#6b7280}.btn{display:inline-block;margin-top:22px;background:#111827;color:#fff;padding:10px 16px;border-radius:9px;text-decoration:none}</style></head>
+<body><div class="box">
+{% if kind == 'check_in' %}<div class="ok">✅ 到班完成</div><h1>{{ student }}</h1><p>{{ course }}</p><p>{{ time[11:16] }}{% if late > 0 %}<br><strong>遲到 {{ late }} 分鐘</strong>{% endif %}</p>
+{% elif kind == 'check_out' %}<div class="ok">👋 離班完成</div><h1>{{ student }}</h1><p>{{ course }}</p><p>到班：{{ check_in[11:16] }}<br>離班：{{ time[11:16] }}</p>
+{% elif kind == 'duplicate' %}<div class="ok">ℹ️ 已有紀錄</div><h1>{{ student }}</h1><p>{{ message }}</p>
+{% else %}<div class="ok">⚠️ {{ message }}</div><h1>{{ student }}</h1>
+{% endif %}<a class="btn" href="/">返回管理頁</a></div></body></html>
