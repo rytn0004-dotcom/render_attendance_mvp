@@ -18,6 +18,8 @@ services:
         value: "10"
       - key: CHECKOUT_GRACE_MINUTES
         value: "15"
+      - key: CHECKIN_EARLY_MINUTES
+        value: "60"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_ADMIN_USER_ID

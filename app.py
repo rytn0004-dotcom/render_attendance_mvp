@@ -4,6 +4,7 @@ import io
 import os
 import secrets
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import requests
@@ -19,6 +20,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_ADMIN_USER_ID = os.getenv("LINE_ADMIN_USER_ID", "").strip()
 LATE_GRACE_MINUTES = int(os.getenv("LATE_GRACE_MINUTES", "10"))
 CHECKOUT_GRACE_MINUTES = int(os.getenv("CHECKOUT_GRACE_MINUTES", "15"))
+CHECKIN_EARLY_MINUTES = int(os.getenv("CHECKIN_EARLY_MINUTES", "60"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -31,8 +33,8 @@ app = FastAPI(title="Attendance Test MVP")
 
 
 def now_local() -> datetime:
-    # Test environment uses Asia/Taipei local server time by convention.
-    return datetime.now().replace(microsecond=0)
+    # Store Taiwan local time as a naive timestamp because DB columns are TIMESTAMP.
+    return datetime.now(ZoneInfo("Asia/Taipei")).replace(microsecond=0, tzinfo=None)
 
 
 def iso(dt: datetime) -> str:
@@ -162,7 +164,7 @@ def get_today_course(cur, student_id: int, when: datetime):
 def log_notification(cur, attendance_id: int | None, notification_type: str,
                      recipient: str | None, message: str, mode: str,
                      status: str, error: str | None = None) -> None:
-    sent = datetime.now() if status == "sent" else None
+    sent = now_local() if status == "sent" else None
     cur.execute(
         """
         INSERT INTO notification_logs
@@ -237,6 +239,9 @@ def scan_student(token: str) -> dict[str, Any]:
             scheduled_start = parse_hhmm(course["start_time"], date_str.strftime("%Y-%m-%d"))
 
             if attendance is None:
+                if when < scheduled_start - timedelta(minutes=CHECKIN_EARLY_MINUTES):
+                    conn.commit()
+                    return {"kind": "too_early", "student": student["name"], "course": course["course_name"], "time": iso(when), "message": f"距離課程開始時間過早，請於課前 {CHECKIN_EARLY_MINUTES} 分鐘內再掃描。"}
                 late = max(0, int((when - scheduled_start).total_seconds() // 60))
                 status = "late" if late > LATE_GRACE_MINUTES else "checked_in"
                 cur.execute(
@@ -264,6 +269,10 @@ def scan_student(token: str) -> dict[str, Any]:
             if attendance["check_out_time"]:
                 conn.commit()
                 return {"kind": "duplicate", "student": student["name"], "message": f"今天已完成到班與離班，離班時間：{attendance['check_out_time']:%H:%M}"}
+
+            if when < scheduled_start:
+                conn.commit()
+                return {"kind": "duplicate", "student": student["name"], "message": f"已於 {attendance['check_in_time']:%H:%M} 到班，但目前尚未到課程開始時間，不會視為離班。"}
 
             if attendance["check_in_time"] and (when - attendance["check_in_time"]).total_seconds() < 600:
                 conn.commit()
@@ -342,9 +351,9 @@ def render_dashboard(request: Request):
         "open": sum(1 for r in rows if r["check_in_time"] and not r["check_out_time"]),
     }
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "rows": rows,
             "students": students,
             "notifications": notifications,
@@ -367,10 +376,19 @@ def dashboard(request: Request):
     return render_dashboard(request)
 
 
+@app.head("/")
+def dashboard_head():
+    return None
+
+
 @app.get("/scan/{token}", response_class=HTMLResponse)
 def scan(token: str, request: Request):
     result = scan_student(token)
-    return templates.TemplateResponse("scan_result.html", {"request": request, **result})
+    return templates.TemplateResponse(
+        request=request,
+        name="scan_result.html",
+        context=result,
+    )
 
 
 @app.get("/qr/{student_code}.png")
