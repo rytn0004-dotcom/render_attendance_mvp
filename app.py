@@ -28,7 +28,75 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
+os.makedirs(TEMPLATE_DIR, exist_ok=True)
+
+# Render 部署時若 templates/ 沒有被一起上傳，啟動時自動補齊。
+# 這讓測試版不再依賴 GitHub 是否正確保留 templates 資料夾。
+DASHBOARD_TEMPLATE = r"""
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>出勤測試系統</title>
+<style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7fb;margin:0;color:#1f2937}
+.wrap{max-width:1180px;margin:0 auto;padding:22px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}
+h1{margin:0 0 4px}.muted{color:#6b7280}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0}.card{background:#fff;padding:15px 18px;border-radius:12px;box-shadow:0 2px 10px #0000000b;min-width:130px}.num{font-size:28px;font-weight:700}
+section{background:#fff;border-radius:14px;padding:18px;margin-top:16px;box-shadow:0 2px 10px #0000000b} table{width:100%;border-collapse:collapse}th,td{padding:10px 8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}th{background:#fafafa}
+.badge{padding:4px 8px;border-radius:999px;font-size:12px}.green{background:#dcfce7}.orange{background:#ffedd5}.red{background:#fee2e2}.gray{background:#f3f4f6}
+.btn{display:inline-block;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;background:#111827;color:#fff;text-decoration:none}.btn2{background:#e5e7eb;color:#111827}.mini{font-size:12px}
+input{padding:7px 8px;border:1px solid #d1d5db;border-radius:7px;width:150px}.qr{width:90px;height:90px;border:1px solid #eee}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.log{max-height:380px;overflow:auto;white-space:pre-wrap}.notice{padding:10px;border-radius:9px;background:#fff7ed}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.wrap{padding:12px}th,td{font-size:12px}.qr{width:72px;height:72px}}
+</style>
+<script>
+async function checkMissing(){try{await fetch('/admin/check-missing',{method:'POST'});location.reload()}catch(e){console.log(e)}}
+setInterval(checkMissing,60000);
+</script>
+</head>
+<body><div class="wrap">
+<div class="top"><div><h1>出勤測試系統</h1><div class="muted">Render 隔離測試站｜LINE：{{ line_mode }}</div></div>
+<div><a class="btn btn2" href="/admin/export.csv">匯出 Excel 可開啟的 CSV</a> <button class="btn" onclick="checkMissing()">立即檢查未離班</button></div></div>
+<div class="cards">
+<div class="card"><div class="muted">今日紀錄</div><div class="num">{{ stats.today }}</div></div>
+<div class="card"><div class="muted">遲到</div><div class="num">{{ stats.late }}</div></div>
+<div class="card"><div class="muted">尚未離班</div><div class="num">{{ stats.open }}</div></div>
+<div class="card"><div class="muted">遲到門檻</div><div class="num">{{ late_grace }}分</div></div>
+</div>
+<section><h2>測試學生 QR</h2><p class="muted mini">手機掃描 QR 後會直接進入該學生的簽到頁。第一版先用示範資料測試。</p>
+<table><tr><th>學生</th><th>編號</th><th>QR</th><th>LINE User ID</th><th></th></tr>
+{% for s in students %}<tr><td>{{ s.name }}</td><td>{{ s.student_code }}</td><td><img class="qr" src="/qr/{{ s.student_code }}.png"></td><td><form method="post" action="/admin/student/{{ s.id }}/line"><input name="line_user_id" value="{{ s.line_user_id or '' }}" placeholder="Uxxxx"><button class="btn" type="submit">儲存</button></form></td><td class="mini">掃一次＝到班<br>10分鐘內重掃不離班</td></tr>{% endfor %}
+</table></section>
+<div class="grid"><section><h2>今日出勤</h2><div style="overflow:auto"><table><tr><th>學生</th><th>課程</th><th>預定</th><th>到班</th><th>離班</th><th>狀態</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ r.name }}<br><span class="muted mini">{{ r.student_code }}</span></td><td>{{ r.course_name or '' }}</td><td>{{ r.start_time or '' }}-{{ r.end_time or '' }}</td><td>{{ r.check_in_time.strftime('%H:%M:%S') if r.check_in_time else '-' }}</td><td>{{ r.check_out_time.strftime('%H:%M:%S') if r.check_out_time else '-' }}</td><td>{% if r.check_out_time %}<span class="badge green">完成</span>{% elif r.late_minutes > late_grace %}<span class="badge orange">遲到</span>{% else %}<span class="badge gray">到班</span>{% endif %}</td><td><form method="post" action="/admin/resend/{{ r.id }}"><button class="btn btn2 mini" type="submit">重送 LINE</button></form></td></tr>{% endfor %}</table></div></section>
+<section><h2>LINE / 通知紀錄</h2><div class="log">{% for n in notifications %}{{ n.created_at.strftime('%Y-%m-%d %H:%M:%S') }}｜{{ n.notification_type }}｜{{ n.status }}
+{{ n.message }}
+{% if n.error_message %}錯誤：{{ n.error_message }}
+{% endif %}--------------------
+{% endfor %}</div></section></div>
+</div></body></html>
+"""
+
+SCAN_RESULT_TEMPLATE = r"""
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>簽到結果</title>
+<style>body{font-family:system-ui,sans-serif;background:#f6f7fb;margin:0}.box{max-width:520px;margin:48px auto;background:#fff;border-radius:16px;padding:28px;box-shadow:0 4px 20px #0001;text-align:center}.ok{font-size:28px}.sub{color:#6b7280}.btn{display:inline-block;margin-top:22px;background:#111827;color:#fff;padding:10px 16px;border-radius:9px;text-decoration:none}</style></head>
+<body><div class="box">
+{% if kind == 'check_in' %}<div class="ok">✅ 到班完成</div><h1>{{ student }}</h1><p>{{ course }}</p><p>{{ time[11:16] }}{% if late > 0 %}<br><strong>遲到 {{ late }} 分鐘</strong>{% endif %}</p>
+{% elif kind == 'check_out' %}<div class="ok">👋 離班完成</div><h1>{{ student }}</h1><p>{{ course }}</p><p>到班：{{ check_in[11:16] }}<br>離班：{{ time[11:16] }}</p>
+{% elif kind == 'duplicate' %}<div class="ok">ℹ️ 已有紀錄</div><h1>{{ student }}</h1><p>{{ message }}</p>
+{% else %}<div class="ok">⚠️ {{ message }}</div><h1>{{ student }}</h1>
+{% endif %}<a class="btn" href="/">返回管理頁</a></div></body></html>
+"""
+
+# 啟動時自動建立模板檔案；就算 GitHub 沒有 templates/ 也能正常運作。
+for _name, _content in (("dashboard.html", DASHBOARD_TEMPLATE), ("scan_result.html", SCAN_RESULT_TEMPLATE)):
+    _path = os.path.join(TEMPLATE_DIR, _name)
+    if not os.path.exists(_path):
+        with open(_path, "w", encoding="utf-8") as _f:
+            _f.write(_content)
+
+templates = Jinja2Templates(directory=TEMPLATE_DIR)
 app = FastAPI(title="Attendance Test MVP")
 
 
