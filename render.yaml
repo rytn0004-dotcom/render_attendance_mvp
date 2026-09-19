@@ -20,12 +20,24 @@ services:
         value: "15"
       - key: CHECKIN_EARLY_MINUTES
         value: "60"
+      - key: BINDING_LINK_MINUTES
+        value: "60"
       - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
         sync: false
       - key: LINE_ADMIN_USER_ID
         sync: false
+      - key: LINE_LOGIN_CHANNEL_ID
+        sync: false
+      - key: LIFF_ID
+        sync: false
       - key: PUBLIC_BASE_URL
         value: ""
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
 
 databases:
   - name: attendance-test-db

@@ -1,41 +1,56 @@
-# 出勤簽到測試系統 V0.2
+# 出勤系統 V0.3.0｜LINE 與學生綁定測試版
 
-這一版是 Render 隔離測試用，與原本 LINE／課務系統分開。
+本版本延續 V0.2 的出勤功能，將家長 LINE 綁定改為「管理員產生一次性 LIFF 連結 → 家長在 LINE 開啟 → LINE 身分驗證 → 確認學生 → 建立綁定」。
 
-## 新增功能
-- 後台「課程時間」：可修改永久週課表。
-- 「今日校正」：只修改指定日期的開始／結束時間，不改掉整個週課表；今日校正會直接影響今天的簽到、遲到與未離班判斷。
-- 每堂課可設定「遲到門檻」與「未離班通知延遲」。
-- 後台「校正」：可補登／修改實際到班、離班時間、狀態與備註，並留下校正者與校正時間。
-- 自動未到通知：課程開始時間＋遲到門檻後，仍沒有到班紀錄時建立未到紀錄並通知管理者。
-- 自動遲到通知：學生掃描後若超過該課程遲到門檻，通知管理者。
-- 自動未離班通知：課程結束時間＋未離班延遲後，仍無離班時間時通知管理者。
-- 手動通知：後台可單獨發送遲到、未到、未離班通知。
-- LINE 仍可維持 simulation 模式做大量測試；切成 live 後才真的呼叫 LINE Messaging API。
-- 無需 templates 資料夾，首頁與掃描結果頁直接由 app.py 產生。
+## 綁定規則
+- 每個綁定連結 30 分鐘有效、使用一次後失效。
+- 同一學生可綁定多個 LINE 使用者。
+- 同一個 LINE 使用者可綁定多位學生。
+- 家長端不提供「解除綁定」；解除綁定只由管理員後台操作。
+- QR 簽到與 LINE 身分完全分離：學生只需要持有自己的 QR 卡，不需要手機或 LINE。
 
-## Render
-Build Command:
-`pip install -r requirements.txt`
+## LINE Developers 設定
+1. Messaging API Channel 與 LINE Login Channel 請建立在同一個 Provider。
+2. 在 LINE Login Channel 建立 LIFF App，Endpoint URL 填：`https://你的Render網域/liff/bind`。
+3. LIFF Scope 至少勾選 `openid`，才能取得 ID Token。
+4. Render Environment Variables：
+   - `LINE_MODE=live`
+   - `LINE_CHANNEL_ACCESS_TOKEN`
+   - `LINE_CHANNEL_SECRET`
+   - `LINE_ADMIN_USER_ID`
+   - `LINE_LOGIN_CHANNEL_ID`
+   - `LIFF_ID`
+   - `ADMIN_PASSWORD`
+5. Messaging API Webhook URL：`https://你的Render網域/webhook/line`，並開啟 Webhook。
 
-Start Command:
-`uvicorn app:app --host 0.0.0.0 --port $PORT`
+## 測試流程
+1. 管理員進 `/admin`。
+2. 在「學生 QR / 家長 LINE」對指定學生按「產生家長綁定連結」。
+3. 把產生的 LIFF 連結傳給自己的 LINE 測試帳號。
+4. 在 LINE 開啟連結，看到學生姓名後按「確認綁定」。
+5. 回到 `/admin/line`，應看到新的綁定紀錄。
+6. 在後台按「測試 LINE」，確認 Push 到正確的 LINE。
+7. 最後再測 QR 到班 / 離班，確認出勤通知送到剛綁定的 LINE。
 
-需要環境變數：
-- DATABASE_URL：由 Render PostgreSQL 提供
-- LINE_MODE：simulation / live
-- LINE_CHANNEL_ACCESS_TOKEN：live 才需要
-- LINE_ADMIN_USER_ID：管理者 LINE User ID
-- ADMIN_USER / ADMIN_PASSWORD：後台 Basic Auth
+## 安全
+- 伺服器不信任前端直接傳來的 LINE User ID，而是把 LIFF `id_token` 送到 LINE 的 Verify ID token endpoint 取得 `sub`（LINE User ID）。
+- Webhook 仍驗證 `x-line-signature`。
+- 綁定 token 只在資料庫儲存 SHA-256 雜湊值。
 
-## 管理後台
-根網址 `/` 或 `/admin` 會要求管理員登入。
-預設測試帳密：
-- 使用者：admin
-- 密碼：test1234
 
-正式測試前請在 Render Environment Variables 改掉 ADMIN_PASSWORD。
+## V0.3.1 綁定規則
+- 系統自動為每位學生建立 1 小時有效的家長綁定連結。
+- 同一條連結在有效期內可供多位家長使用。
+- 同一個 LINE 使用者可透過不同學生連結綁定多位孩子。
+- 家長端不提供解除綁定；解除／新增綁定由管理員處理。
+- 管理員可從「LINE 綁定 / 測試」下載 CSV，用 Excel 修改後另存 UTF-8 CSV，再上傳回 Render。
+- LINE User ID 由 LINE 平台產生，伺服器透過 LIFF ID Token 驗證後保存。
 
-## 自動通知觸發方式
-程式每 60 秒在背景檢查一次，管理頁也會在每次載入時檢查一次。
-Render Free 如果服務進入休眠，休眠期間不會執行背景檢查；正式環境再改成外部排程或 Render Cron/其他常駐服務。
+## V0.3.2 通知範本
+- 到班預設：`{greeting}，{student_name}到教室了😊`
+- 離開教室預設：`{greeting}，{student_name}離開教室了，{thanks}😊`
+- `{greeting}` 會依家長關係自動變成「媽媽您好／爸爸您好／家長您好」等；`{thanks}` 會依關係變成「感謝媽媽／感謝爸爸／感謝您」。
+- 管理員可在 `/admin/templates` 修改預設範本，也可建立「個別學生範本」。
+- 個別範本支援「永久個別」、「一次性（成功送出後自動恢復預設）」與「期限內」。
+- Excel 可透過「通知範本 CSV」下載／修改／匯入，學生編號留白代表修改預設範本。
+- 建議範本內容例：`{greeting}，{student_name}說日記回去想，先離開教室了，{thanks}😊`；設定成「一次性」後，成功送出這次離開教室通知即自動恢復預設離開教室訊息。

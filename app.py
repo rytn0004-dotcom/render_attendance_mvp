@@ -5,6 +5,9 @@ import csv
 import io
 import os
 import secrets
+import hmac
+import hashlib
+import base64
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
@@ -14,13 +17,17 @@ import qrcode
 import requests
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Form, HTTPException, Request, Depends
+from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 LINE_MODE = os.getenv("LINE_MODE", "simulation").lower()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_ADMIN_USER_ID = os.getenv("LINE_ADMIN_USER_ID", "").strip()
+LINE_LOGIN_CHANNEL_ID = os.getenv("LINE_LOGIN_CHANNEL_ID", "").strip()
+LIFF_ID = os.getenv("LIFF_ID", "").strip()
+BINDING_LINK_MINUTES = int(os.getenv("BINDING_LINK_MINUTES", "60"))
 DEFAULT_LATE_GRACE_MINUTES = int(os.getenv("LATE_GRACE_MINUTES", "10"))
 DEFAULT_CHECKOUT_GRACE_MINUTES = int(os.getenv("CHECKOUT_GRACE_MINUTES", "15"))
 CHECKIN_EARLY_MINUTES = int(os.getenv("CHECKIN_EARLY_MINUTES", "60"))
@@ -33,10 +40,64 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "test1234")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.2")
+app = FastAPI(title="Attendance Test MVP v0.3.2")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+# 內部仍使用英文代碼，畫面與匯出資料優先顯示中文。
+STATUS_LABELS = {
+    "checked_in": "已到班",
+    "late": "遲到",
+    "completed": "已完成",
+    "absent": "未到班",
+}
+NOTIFICATION_TYPE_LABELS = {
+    "check_in": "到班通知",
+    "check_out": "離班通知",
+    "late": "遲到通知",
+    "absent": "未到班通知",
+    "missing_checkout": "未離班通知",
+    "manual_late": "手動遲到通知",
+    "manual_absent": "手動未到通知",
+    "manual_missing_checkout": "手動未離班通知",
+    "invalid_schedule": "無課程掃描通知",
+    "line_test": "LINE 連線測試",
+}
+NOTIFY_STATUS_LABELS = {
+    "sent": "已發送",
+    "simulated": "模擬發送",
+    "failed": "發送失敗",
+}
+LINE_MODE_LABELS = {
+    "simulation": "模擬模式",
+    "live": "正式發送",
+}
+
+TEMPLATE_TYPE_LABELS = {
+    "check_in": "到班通知",
+    "check_out": "離開教室通知",
+    "late": "遲到通知",
+    "absent": "未到班通知",
+    "missing_checkout": "未離班通知",
+}
+
+DEFAULT_NOTIFICATION_TEMPLATES = {
+    "check_in": "{greeting}，{student_name}到教室了😊",
+    "check_out": "{greeting}，{student_name}離開教室了，{thanks}😊",
+    "late": "⚠️ 學生遲到\n\n{student_name}\n課程：{course_name}\n原定：{scheduled_start}\n實際到班：{check_in_time}\n遲到：{late_minutes} 分鐘",
+    "absent": "🔴 學生未到班\n\n{student_name}\n課程：{course_name}\n原定：{scheduled_start}\n截至 {now_time} 尚未完成到班簽到。",
+    "missing_checkout": "🔴 未完成離班簽到\n\n{student_name}\n課程：{course_name}\n到班：{check_in_time}\n原定下課：{scheduled_end}\n截至 {now_time} 尚未完成離班簽到。",
+}
+
+def status_label(value: str | None) -> str:
+    return STATUS_LABELS.get(value or "", value or "")
+
+def notification_type_label(value: str | None) -> str:
+    return NOTIFICATION_TYPE_LABELS.get(value or "", value or "")
+
+def notify_status_label(value: str | None) -> str:
+    return NOTIFY_STATUS_LABELS.get(value or "", value or "")
 
 
 def now_local() -> datetime:
@@ -171,6 +232,72 @@ def init_db() -> None:
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     sent_at TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS line_binding_codes (
+                    id BIGSERIAL PRIMARY KEY,
+                    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                    code TEXT NOT NULL UNIQUE,
+                    expires_at TIMESTAMP NOT NULL,
+                    used_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS student_line_bindings (
+                    id BIGSERIAL PRIMARY KEY,
+                    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                    line_user_id TEXT NOT NULL,
+                    display_name TEXT,
+                    relation TEXT NOT NULL DEFAULT '家長/監護人',
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    bound_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    bound_by TEXT NOT NULL DEFAULT 'LIFF'
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding
+                    ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE;
+                CREATE INDEX IF NOT EXISTS idx_student_line_user
+                    ON student_line_bindings(line_user_id) WHERE active=TRUE;
+                CREATE TABLE IF NOT EXISTS line_bind_tokens (
+                    id BIGSERIAL PRIMARY KEY,
+                    student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    token_value TEXT,
+                    expires_at TIMESTAMP NOT NULL,
+                    used_at TIMESTAMP,
+                    use_count INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TIMESTAMP,
+                    created_by TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_line_bind_tokens_student
+                    ON line_bind_tokens(student_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS line_message_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_id TEXT,
+                    direction TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    line_user_id TEXT,
+                    student_id BIGINT REFERENCES students(id),
+                    message TEXT,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS notification_templates (
+                    id BIGSERIAL PRIMARY KEY,
+                    notification_type TEXT NOT NULL,
+                    student_id BIGINT REFERENCES students(id) ON DELETE CASCADE,
+                    template_text TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'permanent',
+                    remaining_uses INTEGER,
+                    expires_at TIMESTAMP,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    note TEXT,
+                    created_by TEXT,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_notification_templates_lookup
+                    ON notification_templates(notification_type, student_id, active, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id);
                 CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
                 CREATE INDEX IF NOT EXISTS idx_attendance_open ON attendance(date, check_out_time);
                 """
@@ -182,6 +309,9 @@ def init_db() -> None:
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS manual_note TEXT")
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS adjusted_at TIMESTAMP")
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS adjusted_by TEXT")
+            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS token_value TEXT")
+            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP")
             cur.execute(
                 "UPDATE courses SET late_grace_minutes=%s WHERE late_grace_minutes IS NULL",
                 (DEFAULT_LATE_GRACE_MINUTES,),
@@ -191,6 +321,7 @@ def init_db() -> None:
                 (DEFAULT_CHECKOUT_GRACE_MINUTES,),
             )
             seed_demo_data(cur)
+            seed_notification_templates(cur)
         conn.commit()
 
 
@@ -218,6 +349,130 @@ def seed_demo_data(cur) -> None:
                 """,
                 (row["id"], "測試課程", "測試老師", weekday, start, end, DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES),
             )
+
+
+def seed_notification_templates(cur) -> None:
+    for notification_type, template_text in DEFAULT_NOTIFICATION_TEMPLATES.items():
+        cur.execute(
+            "SELECT id FROM notification_templates WHERE notification_type=%s AND student_id IS NULL AND active=TRUE LIMIT 1",
+            (notification_type,),
+        )
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO notification_templates(notification_type,student_id,template_text,mode,active,created_by) VALUES (%s,NULL,%s,'default',TRUE,'system')",
+                (notification_type, template_text),
+            )
+
+
+def get_effective_template(cur, notification_type: str, student_id: int | None = None) -> dict[str, Any] | None:
+    now = now_local()
+    if student_id is not None:
+        cur.execute(
+            """SELECT * FROM notification_templates
+               WHERE notification_type=%s AND student_id=%s AND active=TRUE
+                 AND (expires_at IS NULL OR expires_at>%s)
+                 AND (remaining_uses IS NULL OR remaining_uses>0)
+               ORDER BY created_at DESC LIMIT 1""",
+            (notification_type, student_id, now),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+    cur.execute(
+        """SELECT * FROM notification_templates
+           WHERE notification_type=%s AND student_id IS NULL AND active=TRUE
+             AND (expires_at IS NULL OR expires_at>%s)
+             AND (remaining_uses IS NULL OR remaining_uses>0)
+           ORDER BY created_at DESC LIMIT 1""",
+        (notification_type, now),
+    )
+    return cur.fetchone()
+
+
+def _recipient_words(relation: str | None) -> tuple[str, str]:
+    relation = (relation or "").strip()
+    if "媽媽" in relation or relation.lower() == "mother":
+        return "媽媽您好", "感謝媽媽"
+    if "爸爸" in relation or relation.lower() == "father":
+        return "爸爸您好", "感謝爸爸"
+    if "奶奶" in relation:
+        return "奶奶您好", "感謝奶奶"
+    if "爺爺" in relation:
+        return "爺爺您好", "感謝爺爺"
+    if "外婆" in relation:
+        return "外婆您好", "感謝外婆"
+    if "外公" in relation:
+        return "外公您好", "感謝外公"
+    return "家長您好", "感謝您"
+
+
+def render_notification_template(template_text: str, student: dict[str, Any], course: dict[str, Any] | None = None,
+                                  relation: str | None = None, check_in_time: datetime | None = None,
+                                  check_out_time: datetime | None = None, when: datetime | None = None,
+                                  late_minutes: int = 0) -> str:
+    when = when or now_local()
+    greeting, thanks = _recipient_words(relation)
+    values = {
+        "greeting": greeting,
+        "thanks": thanks,
+        "student_name": student.get("name") or "",
+        "student_code": student.get("student_code") or "",
+        "course_name": (course or {}).get("course_name") or "",
+        "teacher_name": (course or {}).get("teacher_name") or "",
+        "scheduled_start": (course or {}).get("effective_start") or (course or {}).get("start_time") or "",
+        "scheduled_end": (course or {}).get("effective_end") or (course or {}).get("end_time") or "",
+        "check_in_time": check_in_time.strftime("%H:%M") if check_in_time else "",
+        "check_out_time": check_out_time.strftime("%H:%M") if check_out_time else "",
+        "now_time": when.strftime("%H:%M"),
+        "late_minutes": str(late_minutes),
+    }
+    try:
+        return template_text.format(**values)
+    except KeyError:
+        # 範本有未知變數時，不讓簽到流程整體失敗。
+        return template_text
+
+
+def consume_one_time_template(cur, template_row: dict[str, Any] | None) -> None:
+    if not template_row or template_row.get("student_id") is None or not template_row.get("active"):
+        return
+    if template_row.get("mode") != "once":
+        return
+    if template_row.get("remaining_uses") is None or template_row.get("remaining_uses") <= 1:
+        cur.execute("UPDATE notification_templates SET remaining_uses=0,active=FALSE,updated_at=%s WHERE id=%s", (now_local(), template_row["id"]))
+    else:
+        cur.execute("UPDATE notification_templates SET remaining_uses=remaining_uses-1,updated_at=%s WHERE id=%s", (now_local(), template_row["id"]))
+
+
+def active_line_bindings(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[dict[str, Any]]:
+    cur.execute(
+        "SELECT id,line_user_id,display_name,relation FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+        (student_id,),
+    )
+    rows = cur.fetchall()
+    if legacy_line_user_id and not any(r["line_user_id"] == legacy_line_user_id for r in rows):
+        rows.append({"id": None, "line_user_id": legacy_line_user_id, "display_name": None, "relation": "家長/監護人"})
+    return rows
+
+
+def send_student_template_line(cur, attendance_id: int | None, student: dict[str, Any], course: dict[str, Any] | None,
+                               notification_type: str, check_in_time: datetime | None = None,
+                               check_out_time: datetime | None = None, when: datetime | None = None,
+                               late_minutes: int = 0, legacy_line_user_id: str | None = None) -> bool:
+    bindings = active_line_bindings(cur, student["id"], legacy_line_user_id)
+    if not bindings:
+        default_msg = render_notification_template(DEFAULT_NOTIFICATION_TEMPLATES[notification_type], student, course, None, check_in_time, check_out_time, when, late_minutes)
+        log_notification(cur, attendance_id, notification_type, None, default_msg, LINE_MODE, "failed", "學生尚未綁定 LINE")
+        return False
+    template_row = get_effective_template(cur, notification_type, student["id"])
+    template_text = template_row["template_text"] if template_row else DEFAULT_NOTIFICATION_TEMPLATES[notification_type]
+    results = []
+    for binding in bindings:
+        msg = render_notification_template(template_text, student, course, binding.get("relation"), check_in_time, check_out_time, when, late_minutes)
+        results.append(send_line(cur, attendance_id, binding["line_user_id"], msg, notification_type))
+    if any(results):
+        consume_one_time_template(cur, template_row)
+    return bool(results) and all(results)
 
 
 def get_student(cur, token: str):
@@ -261,6 +516,284 @@ def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attend
     return scored[0][3]
 
 
+def log_line_message(cur, event_id: str | None, direction: str, message_type: str,
+                     line_user_id: str | None, student_id: int | None, message: str | None,
+                     status: str, error: str | None = None) -> None:
+    cur.execute(
+        """INSERT INTO line_message_logs
+           (event_id,direction,message_type,line_user_id,student_id,message,status,error_message)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (event_id, direction, message_type, line_user_id, student_id, message, status, error),
+    )
+
+
+def verify_line_signature(body: bytes, signature: str | None) -> bool:
+    if not LINE_CHANNEL_SECRET or not signature:
+        return False
+    digest = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def line_profile(line_user_id: str) -> str:
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return ""
+    try:
+        r = requests.get(
+            f"https://api.line.me/v2/bot/profile/{line_user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
+        if r.ok:
+            return (r.json().get("displayName") or "").strip()
+    except requests.RequestException:
+        pass
+    return ""
+
+
+def reply_line(reply_token: str, message: str, event_id: str | None, line_user_id: str | None, student_id: int | None = None) -> bool:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if not LINE_CHANNEL_ACCESS_TOKEN:
+                log_line_message(cur, event_id, "outbound", "reply", line_user_id, student_id, message, "failed", "LINE_CHANNEL_ACCESS_TOKEN 未設定")
+                conn.commit()
+                return False
+            try:
+                response = requests.post(
+                    "https://api.line.me/v2/bot/message/reply",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+                    json={"replyToken": reply_token, "messages": [{"type": "text", "text": message}]},
+                    timeout=10,
+                )
+                if 200 <= response.status_code < 300:
+                    log_line_message(cur, event_id, "outbound", "reply", line_user_id, student_id, message, "sent")
+                    conn.commit()
+                    return True
+                log_line_message(cur, event_id, "outbound", "reply", line_user_id, student_id, message, "failed", f"HTTP {response.status_code}: {response.text[:500]}")
+                conn.commit()
+                return False
+            except requests.RequestException as exc:
+                log_line_message(cur, event_id, "outbound", "reply", line_user_id, student_id, message, "failed", str(exc))
+                conn.commit()
+                return False
+
+
+def make_binding_code() -> str:
+    # 保留舊版函式，供資料庫相容；正式綁定改用一次性連結。
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def hash_bind_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def make_binding_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def create_binding_token(student_id: int, created_by: str = "admin") -> tuple[str, datetime]:
+    token = make_binding_token()
+    expires = now_local() + timedelta(minutes=BINDING_LINK_MINUTES)
+    now = now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            # 同一學生只保留最新一條有效邀請連結；但這一條連結在有效期限內可以讓多位家長使用。
+            cur.execute(
+                "UPDATE line_bind_tokens SET expires_at=%s WHERE student_id=%s AND used_at IS NULL AND expires_at>%s",
+                (now, student_id, now),
+            )
+            cur.execute(
+                "INSERT INTO line_bind_tokens(student_id,token_hash,token_value,expires_at,use_count,last_used_at,created_by) VALUES (%s,%s,%s,%s,0,NULL,%s)",
+                (student_id, hash_bind_token(token), token, expires, created_by),
+            )
+            conn.commit()
+    return token, expires
+
+
+def get_or_create_binding_token(student_id: int, created_by: str = "system") -> tuple[str, datetime, bool]:
+    now = now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT token_value,expires_at FROM line_bind_tokens WHERE student_id=%s AND used_at IS NULL AND expires_at>%s AND token_value IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (student_id, now),
+            )
+            row = cur.fetchone()
+    if row and row["token_value"]:
+        return row["token_value"], row["expires_at"], False
+    token, expires = create_binding_token(student_id, created_by)
+    return token, expires, True
+
+def binding_link(token: str) -> str:
+    if not LIFF_ID:
+        return ""
+    # 透過 LIFF URL 開啟，讓家長在 LINE 內完成 LINE 身分驗證。
+    return f"https://liff.line.me/{LIFF_ID}/bind?token={token}"
+
+
+def active_line_recipients(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[str]:
+    cur.execute(
+        "SELECT DISTINCT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+        (student_id,),
+    )
+    ids = [r["line_user_id"] for r in cur.fetchall() if r["line_user_id"]]
+    if legacy_line_user_id and legacy_line_user_id not in ids:
+        ids.append(legacy_line_user_id)
+    return ids
+
+
+def send_student_line(cur, attendance_id: int | None, student_id: int, message: str, notification_type: str, legacy_line_user_id: str | None = None) -> bool:
+    recipients = active_line_recipients(cur, student_id, legacy_line_user_id)
+    if not recipients:
+        # 沒有收件人仍留一筆記錄，方便後台知道為何沒發出去。
+        log_notification(cur, attendance_id, notification_type, None, message, LINE_MODE, "failed", "學生尚未綁定 LINE")
+        return False
+    results = []
+    for rid in recipients:
+        results.append(send_line(cur, attendance_id, rid, message, notification_type))
+    return all(results)
+
+
+def verify_liff_id_token(id_token: str, expected_user_id: str | None = None) -> dict[str, Any]:
+    if not LINE_LOGIN_CHANNEL_ID:
+        raise HTTPException(500, "尚未設定 LINE_LOGIN_CHANNEL_ID")
+    if not id_token:
+        raise HTTPException(400, "缺少 LINE ID Token")
+    try:
+        response = requests.post(
+            "https://api.line.me/oauth2/v2.1/verify",
+            data={"id_token": id_token, "client_id": LINE_LOGIN_CHANNEL_ID},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"LINE ID Token 驗證失敗：{exc}") from exc
+    if not response.ok:
+        raise HTTPException(401, "LINE ID Token 無效或已過期")
+    data = response.json()
+    user_id = data.get("sub")
+    if not user_id:
+        raise HTTPException(401, "LINE 驗證結果缺少使用者 ID")
+    if expected_user_id and user_id != expected_user_id:
+        raise HTTPException(401, "LINE 使用者身分不一致")
+    return data
+
+
+def binding_token_info(cur, token: str) -> dict[str, Any] | None:
+    cur.execute(
+        """
+        SELECT bt.*, s.name, s.student_code, s.active AS student_active
+        FROM line_bind_tokens bt
+        JOIN students s ON s.id=bt.student_id
+        WHERE bt.token_hash=%s AND bt.used_at IS NULL AND bt.expires_at>%s
+        """,
+        (hash_bind_token(token), now_local()),
+    )
+    return cur.fetchone()
+
+
+def bind_liff_user(token: str, id_token: str, relation: str = "家長/監護人") -> dict[str, Any]:
+    profile = verify_liff_id_token(id_token)
+    line_user_id = profile["sub"]
+    display_name = (profile.get("name") or "").strip()[:100] or None
+    now = now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            row = binding_token_info(cur, token)
+            if not row:
+                raise HTTPException(400, "綁定連結無效或已過期。請請管理員重新產生連結。")
+            cur.execute(
+                "SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s AND active=TRUE",
+                (row["student_id"], line_user_id),
+            )
+            existing = cur.fetchone()
+            # 同一條連結 1 小時內可讓多位家長使用；同一 LINE 也可綁多位孩子。
+            if existing:
+                cur.execute(
+                    "UPDATE line_bind_tokens SET use_count=use_count+1,last_used_at=%s WHERE id=%s",
+                    (now, row["id"]),
+                )
+                conn.commit()
+                return {"student_id": row["student_id"], "student_name": row["name"], "already": True, "line_user_id": line_user_id}
+            cur.execute(
+                "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,bound_at,bound_by) VALUES (%s,%s,%s,%s,TRUE,%s,'LIFF')",
+                (row["student_id"], line_user_id, display_name, relation.strip() or "家長/監護人", now),
+            )
+            cur.execute("UPDATE students SET line_user_id=COALESCE(line_user_id,%s) WHERE id=%s", (line_user_id, row["student_id"]))
+            cur.execute(
+                "UPDATE line_bind_tokens SET use_count=use_count+1,last_used_at=%s WHERE id=%s",
+                (now, row["id"]),
+            )
+            conn.commit()
+    return {"student_id": row["student_id"], "student_name": row["name"], "already": False, "line_user_id": line_user_id}
+
+
+def unbind_line_binding(binding_id: int) -> tuple[bool, str]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT b.student_id,b.line_user_id,s.name
+                FROM student_line_bindings b JOIN students s ON s.id=b.student_id
+                WHERE b.id=%s AND b.active=TRUE
+                """,
+                (binding_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, "找不到有效的綁定。"
+            cur.execute("UPDATE student_line_bindings SET active=FALSE WHERE id=%s", (binding_id,))
+            # 若舊相容欄位就是被解除的帳號，清除；若還有其他綁定，改放其他有效帳號。
+            cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1", (row["student_id"],))
+            other = cur.fetchone()
+            cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (other["line_user_id"] if other else None, row["student_id"]))
+            conn.commit()
+            return True, row["name"]
+
+
+async def process_line_event(event: dict[str, Any]) -> None:
+    event_id = event.get("webhookEventId")
+    source = event.get("source") or {}
+    line_user_id = source.get("userId")
+    event_type = event.get("type")
+    if event_type == "follow":
+        msg = "👋 歡迎加入官方帳號！\n\n請使用管理員提供的「家長綁定連結」完成學生綁定。\n\n綁定完成後，學生到班與離班通知會自動送到此 LINE。"
+        if LINE_MODE == "live" and event.get("replyToken"):
+            reply_line(event["replyToken"], msg, event_id, line_user_id)
+        return
+    if event_type != "message":
+        return
+    message = event.get("message") or {}
+    msg_type = message.get("type", "unknown")
+    text = message.get("text", "").strip() if msg_type == "text" else ""
+    student_id = None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if line_user_id:
+                cur.execute(
+                    "SELECT student_id FROM student_line_bindings WHERE line_user_id=%s AND active=TRUE ORDER BY id LIMIT 1",
+                    (line_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    student_id = row["student_id"]
+                else:
+                    cur.execute("SELECT id FROM students WHERE line_user_id=%s", (line_user_id,))
+                    row = cur.fetchone()
+                    student_id = row["id"] if row else None
+            log_line_message(cur, event_id, "inbound", msg_type, line_user_id, student_id, text or f"[{msg_type}]", "received")
+            conn.commit()
+    if not line_user_id or not event.get("replyToken"):
+        return
+    if text in {"測試", "測試通知"}:
+        reply = "✅ 已收到你的測試訊息。\nLINE 內外訊息連線正常。"
+    elif text in {"我的ID", "查ID"}:
+        reply = f"你的 LINE 使用者 ID：\n{line_user_id}\n\n內測用途，請勿公開貼出。"
+    else:
+        reply = "✅ 已收到訊息。\n請使用管理員提供的「家長綁定連結」完成學生綁定；管理員可在後台解除綁定。"
+    if LINE_MODE == "live":
+        reply_line(event["replyToken"], reply, event_id, line_user_id, student_id)
+
 def log_notification(cur, attendance_id: int | None, notification_type: str,
                      recipient: str | None, message: str, mode: str,
                      status: str, error: str | None = None) -> None:
@@ -279,12 +812,15 @@ def send_line(cur, attendance_id: int | None, recipient: str | None,
     # Simulation 直接記錄成功，不要求真的有 recipient，方便大量測試。
     if LINE_MODE != "live":
         log_notification(cur, attendance_id, notification_type, recipient, message, "simulation", "simulated")
+        log_line_message(cur, None, "outbound", "push", recipient, None, message, "simulated")
         return True
     if not recipient:
         log_notification(cur, attendance_id, notification_type, None, message, "live", "failed", "未設定 LINE User ID")
+        log_line_message(cur, None, "outbound", "push", None, None, message, "failed", "未設定 LINE User ID")
         return False
     if not LINE_CHANNEL_ACCESS_TOKEN:
         log_notification(cur, attendance_id, notification_type, recipient, message, "live", "failed", "LINE_CHANNEL_ACCESS_TOKEN 未設定")
+        log_line_message(cur, None, "outbound", "push", recipient, None, message, "failed", "LINE_CHANNEL_ACCESS_TOKEN 未設定")
         return False
     try:
         response = requests.post(
@@ -295,11 +831,14 @@ def send_line(cur, attendance_id: int | None, recipient: str | None,
         )
         if 200 <= response.status_code < 300:
             log_notification(cur, attendance_id, notification_type, recipient, message, "live", "sent")
+            log_line_message(cur, None, "outbound", "push", recipient, None, message, "sent")
             return True
         log_notification(cur, attendance_id, notification_type, recipient, message, "live", "failed", f"HTTP {response.status_code}: {response.text[:500]}")
+        log_line_message(cur, None, "outbound", "push", recipient, None, message, "failed", f"HTTP {response.status_code}")
         return False
     except requests.RequestException as exc:
         log_notification(cur, attendance_id, notification_type, recipient, message, "live", "failed", str(exc))
+        log_line_message(cur, None, "outbound", "push", recipient, None, message, "failed", str(exc))
         return False
 
 
@@ -394,14 +933,14 @@ def scan_student(token: str) -> dict[str, Any]:
                         "UPDATE attendance SET check_out_time=%s,status='completed',last_scan_time=%s,updated_at=%s WHERE id=%s",
                         (when, when, when, attendance_id),
                     )
-                    send_line(cur, attendance_id, student["line_user_id"], checkout_message(student, course, attendance["check_in_time"], when), "check_out")
+                    send_student_template_line(cur, attendance_id, student, course, "check_out", check_in_time=attendance["check_in_time"], check_out_time=when, when=when, legacy_line_user_id=student["line_user_id"])
                     conn.commit()
                     return {"kind": "check_out", "student": student["name"], "course": course["course_name"], "time": iso(when), "check_in": iso(attendance["check_in_time"])}
 
             # 到班通知（含原本先未到、後來補打卡的情況）
             cur.execute("SELECT * FROM attendance WHERE id=%s", (attendance_id,))
             final_a = cur.fetchone()
-            send_line(cur, attendance_id, student["line_user_id"], checkin_message(student, course, final_a["check_in_time"]), "check_in")
+            send_student_template_line(cur, attendance_id, student, course, "check_in", check_in_time=final_a["check_in_time"], when=final_a["check_in_time"], legacy_line_user_id=student["line_user_id"])
             if final_a["late_minutes"] > course["late_grace_minutes"] and not final_a["late_notified_at"]:
                 admin_msg = late_admin_message(student["name"], course["course_name"], course["effective_start"], final_a["check_in_time"], final_a["late_minutes"])
                 sent = send_line(cur, attendance_id, LINE_ADMIN_USER_ID, admin_msg, "late")
@@ -546,7 +1085,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>課程時間</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>課程時間</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -559,7 +1098,7 @@ def dashboard(_: str = Depends(admin_auth)):
     checks = run_all_checks()
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.2</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE)}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.3.2</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
     ]
     with db_conn() as conn:
@@ -609,25 +1148,39 @@ def dashboard(_: str = Depends(admin_auth)):
 
     qr_rows = []
     for s in students:
+        with db_conn() as c2:
+            with c2.cursor() as ccur:
+                ccur.execute(
+                    "SELECT id,line_user_id,display_name,relation,bound_at FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+                    (s["id"],),
+                )
+                binds = ccur.fetchall()
+        bind_text = "<br>".join(
+            f"{escape(b['display_name'] or 'LINE 使用者')}｜{escape(b['relation'])}｜{escape(b['line_user_id'])} <form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/unbind'><button class='btn btn2 mini'>解除</button></form>"
+            for b in binds
+        ) or "尚未綁定"
+        test_btn = f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s['line_user_id'] else "尚未綁定"
         qr_rows.append(
             f"<tr><td>{escape(s['name'])}</td><td>{escape(s['student_code'])}</td>"
             f"<td><img class='qr' src='/qr/{escape(s['student_code'])}.png'></td>"
-            f"<td><form method='post' action='/admin/student/{s['id']}/line'><input name='line_user_id' value='{escape(s['line_user_id'] or '', quote=True)}' placeholder='LINE User ID'><button>儲存</button></form></td></tr>"
+            f"<td>{bind_text}</td>"
+            f"<td><form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>產生家長綁定連結</button></form></td>"
+            f"<td>{test_btn}</td></tr>"
         )
-    body_parts.append("<section><h2>學生 QR / LINE</h2><table><tr><th>學生</th><th>編號</th><th>QR</th><th>LINE User ID</th></tr>" + "".join(qr_rows) + "</table></section>")
+    body_parts.append("<section><h2>學生 QR / 家長 LINE</h2><p class='muted mini'>學生的 QR 只負責出勤。家長 LINE 透過一次性綁定連結與學生建立關聯；一位學生可綁定多位家長，同一個 LINE 也可綁定多位孩子。解除綁定只由管理員操作。</p><table><tr><th>學生</th><th>編號</th><th>學生 QR</th><th>已綁定 LINE</th><th>綁定連結</th><th>測試</th></tr>" + "".join(qr_rows) + "</table></section>")
 
     roster_rows = []
     for r in roster:
         a = r["attendance"]
         late = a["late_minutes"] if a else 0
         if a and a["check_out_time"]:
-            status = "<span class='green'>完成</span>"
+            status = "<span class='green'>✅ 已完成</span>"
         elif a and a["status"] == "absent" and not a["check_in_time"]:
-            status = "<span class='red'>未到</span>"
+            status = "<span class='red'>🔴 未到班</span>"
         elif late > r["late_grace_minutes"]:
-            status = "<span class='orange'>遲到</span>"
+            status = "<span class='orange'>🟠 遲到</span>"
         elif a and a["check_in_time"]:
-            status = "<span class='gray'>到班</span>"
+            status = "<span class='gray'>✅ 已到班</span>"
         else:
             status = "<span class='gray'>尚未掃描</span>"
         actions = []
@@ -654,7 +1207,7 @@ def dashboard(_: str = Depends(admin_auth)):
 
     logs = []
     for n in notifications:
-        logs.append(f"<div style='padding:8px 0;border-bottom:1px solid #eee'><b>{n['created_at']:%m-%d %H:%M:%S}</b>｜{escape(n['notification_type'])}｜{escape(n['status'])}<br>{escape(n['message'])}{('<br><span class=muted>錯誤：'+escape(n['error_message'])+'</span>') if n['error_message'] else ''}</div>")
+        logs.append(f"<div style='padding:8px 0;border-bottom:1px solid #eee'><b>{n['created_at']:%m-%d %H:%M:%S}</b>｜{escape(notification_type_label(n['notification_type']))}｜{escape(notify_status_label(n['status']))}<br>{escape(n['message'])}{('<br><span class=muted>錯誤：'+escape(n['error_message'])+'</span>') if n['error_message'] else ''}</div>")
     body_parts.append("<section><h2>最近通知紀錄</h2>" + ("".join(logs) or "尚無通知紀錄") + "</section>")
     return page("出勤測試系統", "".join(body_parts))
 
@@ -755,7 +1308,7 @@ def edit_attendance(attendance_id: int, _: str = Depends(admin_auth)):
     <form method='post' action='/admin/attendance/{attendance_id}/adjust'>
     <p>到班時間（HH:MM）<input type='time' name='check_in' value='{a['check_in_time'].strftime('%H:%M') if a['check_in_time'] else ''}'>
     離班時間（HH:MM）<input type='time' name='check_out' value='{a['check_out_time'].strftime('%H:%M') if a['check_out_time'] else ''}'></p>
-    <p>狀態 <select name='status'>{''.join(f"<option value='{x}' {'selected' if a['status']==x else ''}>{x}</option>" for x in ['checked_in','late','completed','absent'])}</select>
+    <p>狀態 <select name='status'>{''.join(f"<option value='{x}' {'selected' if a['status']==x else ''}>{STATUS_LABELS[x]}</option>" for x in ['checked_in','late','completed','absent'])}</select>
     遲到分鐘 <input type='number' name='late_minutes' value='{a['late_minutes']}' min='0'> </p>
     <p>校正備註</p><textarea name='manual_note' rows='4' placeholder='例如：學生忘記掃離班，由櫃台依監視器時間補登。'>{escape(a['manual_note'] or '')}</textarea>
     <p><button>儲存校正</button> <a class='btn btn2' href='/admin'>取消</a></p></form></section>
@@ -860,6 +1413,249 @@ def manual_missing(attendance_id: int, _: str = Depends(admin_auth)):
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.get("/admin/templates", response_class=HTMLResponse)
+def admin_templates(_: str = Depends(admin_auth)):
+    body=[f"<div class='top'><div><h1>LINE 通知範本</h1><div class='muted'>預設範本 + 個別學生覆寫。一次性覆寫送出成功後會自動恢復預設；期限型覆寫到期後自動恢復預設。</div></div>{admin_nav()}</div>"]
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,notification_type,template_text FROM notification_templates WHERE student_id IS NULL AND active=TRUE ORDER BY id")
+            defaults=cur.fetchall()
+            cur.execute("SELECT id,student_code,name FROM students WHERE active=TRUE ORDER BY name")
+            students=cur.fetchall()
+            cur.execute("""SELECT nt.id,nt.notification_type,nt.template_text,nt.mode,nt.remaining_uses,nt.expires_at,nt.note,s.student_code,s.name
+                         FROM notification_templates nt JOIN students s ON s.id=nt.student_id
+                         WHERE nt.student_id IS NOT NULL AND nt.active=TRUE
+                         ORDER BY s.name,nt.notification_type,nt.created_at DESC""")
+            overrides=cur.fetchall()
+    body.append("<section><h2>預設範本</h2><p class='muted'>可使用變數：{greeting}、{thanks}、{student_name}、{course_name}、{teacher_name}、{scheduled_start}、{scheduled_end}、{check_in_time}、{check_out_time}、{now_time}、{late_minutes}。</p><div style='overflow:auto'><table><tr><th>通知</th><th>範本內容</th><th>操作</th></tr>")
+    for r in defaults:
+        body.append(f"<tr><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td><td><form method='post' action='/admin/template/default'><input type='hidden' name='notification_type' value='{escape(r['notification_type'])}'><textarea name='template_text' rows='4' style='min-width:520px'>{escape(r['template_text'])}</textarea></td><td><button>儲存預設範本</button></form></td></tr>")
+    body.append("</table></div></section>")
+    student_options=''.join(f"<option value='{s['id']}'>{escape(s['name'])}｜{escape(s['student_code'])}</option>" for s in students)
+    type_options=''.join(f"<option value='{k}'>{escape(v)}</option>" for k,v in TEMPLATE_TYPE_LABELS.items())
+    body.append(f"<section><h2>新增／修改個別學生範本</h2><p class='muted'>適合臨時通知。例如：媽媽您好，采璇說日記回去想，先離開教室了，感謝媽媽😊。選「一次性」後，第一次成功送出就自動回復預設範本。</p><form method='post' action='/admin/template/student'><div class='grid'><label>學生<br><select name='student_id'>{student_options}</select></label><label>通知類型<br><select name='notification_type'>{type_options}</select></label><label>套用方式<br><select name='mode'><option value='permanent'>永久個別</option><option value='once'>一次性（送出成功後自動恢復）</option><option value='until'>期限內</option></select></label><label>剩餘次數<br><input type='number' name='remaining_uses' value='1' min='1'></label></div><p>範本內容</p><textarea name='template_text' rows='5' style='width:100%' placeholder='例如：{greeting}，{student_name}說日記回去想，先離開教室了，{thanks}😊'></textarea><p>期限（選填，格式 YYYY-MM-DD HH:MM） <input class='wide' name='expires_at' placeholder='例如 2026-09-20 20:00'>　備註 <input class='wide' name='note' placeholder='例如：今天臨時通知'></p><button>儲存個別範本</button></form></section>")
+    rows=[]
+    for r in overrides:
+        expires = r['expires_at'].strftime('%Y-%m-%d %H:%M') if r['expires_at'] else ''
+        mode_label={'permanent':'永久個別','once':'一次性','until':'期限內'}.get(r['mode'],r['mode'])
+        rows.append(f"<tr><td>{escape(r['name'])}<br><span class='muted mini'>{escape(r['student_code'])}</span></td><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td><td style='white-space:pre-wrap'>{escape(r['template_text'])}</td><td>{mode_label}<br>剩餘：{r['remaining_uses'] if r['remaining_uses'] is not None else '不限'}<br>有效至：{expires or '不限'}</td><td><form method='post' action='/admin/template/{r['id']}/restore'><button class='btn btn2 mini'>恢復預設</button></form></td></tr>")
+    body.append("<section><h2>目前有效的個別範本</h2><div style='overflow:auto'><table><tr><th>學生</th><th>通知</th><th>內容</th><th>規則</th><th>操作</th></tr>"+''.join(rows)+"</table></div></section>")
+    body.append("<section><h2>Excel 管理</h2><p>下載 CSV 後可直接用 Excel 修改。欄位支援：通知類型、學生編號、訊息範本、套用方式、剩餘次數、有效至、啟用、備註。學生編號留白代表修改預設範本。修改後請另存為「CSV UTF-8」再上傳。</p><p><a class='btn btn2' href='/admin/templates/export.csv'>下載通知範本 CSV</a></p><form method='post' action='/admin/templates/import.csv' enctype='multipart/form-data'><input type='file' name='file' accept='.csv,text/csv' required> <button>匯入通知範本 CSV</button></form></section>")
+    return page("LINE 通知範本", ''.join(body))
+
+
+@app.post("/admin/template/default")
+def save_default_template(notification_type: str=Form(...), template_text: str=Form(...), _: str=Depends(admin_auth)):
+    if notification_type not in DEFAULT_NOTIFICATION_TEMPLATES:
+        raise HTTPException(400,"不支援的通知類型")
+    if not template_text.strip():
+        raise HTTPException(400,"範本內容不可空白")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id IS NULL AND active=TRUE", (now_local(),notification_type))
+            cur.execute("INSERT INTO notification_templates(notification_type,student_id,template_text,mode,active,created_by) VALUES (%s,NULL,%s,'default',TRUE,'admin')", (notification_type,template_text.strip()))
+            conn.commit()
+    return RedirectResponse("/admin/templates", status_code=303)
+
+
+def parse_template_expiry(value: str) -> datetime | None:
+    value=value.strip()
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d %H:%M")
+
+
+@app.post("/admin/template/student")
+def save_student_template(student_id:int=Form(...), notification_type:str=Form(...), template_text:str=Form(...), mode:str=Form(...), remaining_uses:int=Form(1), expires_at:str=Form(""), note:str=Form(""), _: str=Depends(admin_auth)):
+    if notification_type not in DEFAULT_NOTIFICATION_TEMPLATES:
+        raise HTTPException(400,"不支援的通知類型")
+    if mode not in {"permanent","once","until"}:
+        raise HTTPException(400,"不支援的套用方式")
+    if not template_text.strip():
+        raise HTTPException(400,"範本內容不可空白")
+    exp=parse_template_expiry(expires_at) if expires_at.strip() else None
+    if mode=="until" and not exp:
+        raise HTTPException(400,"期限內範本需要填寫有效期限")
+    uses=max(1,remaining_uses) if mode=="once" else None
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id=%s AND active=TRUE", (now_local(),notification_type,student_id))
+            cur.execute("""INSERT INTO notification_templates(notification_type,student_id,template_text,mode,remaining_uses,expires_at,active,note,created_by)
+                         VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,'admin')""", (notification_type,student_id,template_text.strip(),mode,uses,exp,note.strip() or None))
+            conn.commit()
+    return RedirectResponse("/admin/templates",status_code=303)
+
+
+@app.post("/admin/template/{template_id}/restore")
+def restore_student_template(template_id:int, _: str=Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE id=%s AND student_id IS NOT NULL", (now_local(),template_id))
+            conn.commit()
+    return RedirectResponse("/admin/templates",status_code=303)
+
+
+@app.get("/admin/templates/export.csv")
+def export_notification_templates(_: str=Depends(admin_auth)):
+    buf=io.StringIO(); buf.write("\ufeff"); writer=csv.writer(buf)
+    writer.writerow(["通知類型","學生編號","學生姓名","訊息範本","套用方式","剩餘次數","有效至","啟用","備註"])
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT nt.notification_type,s.student_code,s.name,nt.template_text,nt.mode,nt.remaining_uses,nt.expires_at,nt.active,nt.note
+                         FROM notification_templates nt LEFT JOIN students s ON s.id=nt.student_id
+                         WHERE nt.active=TRUE ORDER BY s.name NULLS FIRST,nt.notification_type""")
+            for r in cur.fetchall():
+                mode_label={'default':'預設','permanent':'永久個別','once':'一次性','until':'期限內'}.get(r['mode'],r['mode'])
+                writer.writerow([TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']),r['student_code'] or '',r['name'] or '',r['template_text'],mode_label,r['remaining_uses'] if r['remaining_uses'] is not None else '',r['expires_at'].strftime('%Y-%m-%d %H:%M') if r['expires_at'] else '', '是' if r['active'] else '否', r['note'] or ''])
+    return StreamingResponse(io.BytesIO(buf.getvalue().encode('utf-8-sig')),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=notification_templates.csv'})
+
+
+@app.post("/admin/templates/import.csv")
+async def import_notification_templates(file:UploadFile=File(...), _: str=Depends(admin_auth)):
+    raw=await file.read()
+    text=raw.decode('utf-8-sig')
+    reader=csv.DictReader(io.StringIO(text))
+    required={"通知類型","學生編號","訊息範本","套用方式"}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise HTTPException(400,"CSV 欄位不足：至少需要 通知類型、學生編號、訊息範本、套用方式")
+    type_map={v:k for k,v in TEMPLATE_TYPE_LABELS.items()}
+    mode_map={"預設":"default","永久個別":"permanent","一次性":"once","期限內":"until"}
+    true_set={"是","啟用","1","true","TRUE","yes","Y","y"}
+    imported=0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for raw_row in reader:
+                row={str(k).strip():str(v).strip() if v is not None else '' for k,v in raw_row.items()}
+                ntype=type_map.get(row.get("通知類型"), row.get("通知類型"))
+                if ntype not in DEFAULT_NOTIFICATION_TEMPLATES or not row.get("訊息範本"):
+                    continue
+                mode=mode_map.get(row.get("套用方式"),row.get("套用方式","永久個別"))
+                if mode not in {"default","permanent","once","until"}:
+                    continue
+                active=row.get("啟用","是") in true_set
+                student_id=None
+                student_code=row.get("學生編號","")
+                if student_code:
+                    cur.execute("SELECT id FROM students WHERE student_code=%s AND active=TRUE", (student_code,))
+                    st=cur.fetchone()
+                    if not st:
+                        continue
+                    student_id=st["id"]
+                if not active:
+                    # 停用目前同類型覆寫，達到手動恢復預設。
+                    cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id IS NOT DISTINCT FROM %s AND active=TRUE", (now_local(),ntype,student_id))
+                    imported += 1
+                    continue
+                exp=parse_template_expiry(row.get("有效至","")) if row.get("有效至") else None
+                if mode=="until" and not exp:
+                    continue
+                uses=int(row.get("剩餘次數") or 1) if mode=="once" else None
+                cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id IS NOT DISTINCT FROM %s AND active=TRUE", (now_local(),ntype,student_id))
+                cur.execute("""INSERT INTO notification_templates(notification_type,student_id,template_text,mode,remaining_uses,expires_at,active,note,created_by)
+                             VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,'EXCEL')""", (ntype,student_id,row["訊息範本"],mode,max(1,uses) if mode=="once" else None,exp,row.get("備註") or None))
+                imported += 1
+            conn.commit()
+    return RedirectResponse("/admin/templates",status_code=303)
+
+
+@app.get("/admin/line", response_class=HTMLResponse)
+def admin_line(_: str = Depends(admin_auth)):
+    body=[f"<div class='top'><div><h1>LINE 綁定 / 測試</h1><div class='muted'>第一次綁定由系統建立 1 小時有效的家長連結；同一學生可綁定多位家長，同一個 LINE 也可綁定多位學生。</div></div>{admin_nav()}</div>"]
+    webhook_url=f"{public_base_url()}/webhook/line"
+    liff_endpoint=f"{public_base_url()}/liff/bind"
+    body.append(
+        f"<section><h2>LINE 設定</h2><p>Webhook URL：<code>{escape(webhook_url)}</code></p>"
+        f"<p>LIFF Endpoint URL：<code>{escape(liff_endpoint)}</code></p>"
+        f"<p>LIFF ID：<b>{'已設定' if LIFF_ID else '尚未設定'}</b>｜LINE Login Channel ID：<b>{'已設定' if LINE_LOGIN_CHANNEL_ID else '尚未設定'}</b></p>"
+        f"<p>目前 LINE 模式：<b>{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</b>｜家長綁定連結：<b>{BINDING_LINK_MINUTES} 分鐘</b></p>"
+        f"<div class='alert'>第一次綁定：系統會自動為每位學生建立 1 小時有效的家長綁定連結，管理員把連結傳給家長即可。這條連結在有效時間內可讓多位家長綁定同一學生；同一位家長也可以使用不同學生的連結，把多位孩子綁到同一個 LINE。重新綁定或新增綁定人，後續由管理員維護即可。</div>"
+        f"<p><a class='btn btn2' href='/admin/line/export.csv'>下載 LINE 綁定表（Excel 可直接開啟的 CSV）</a></p></section>"
+    )
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,student_code FROM students WHERE active=TRUE ORDER BY name")
+            students=cur.fetchall()
+            bindings=[]
+            for s in students:
+                # 自動建立第一次綁定連結；若已有仍有效連結，get_or_create_binding_token 會建立新連結，因此只在需要顯示時生成。
+                token, expires, _ = get_or_create_binding_token(s["id"], "admin_auto")
+                cur.execute(
+                    "SELECT id,line_user_id,display_name,relation,bound_at FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+                    (s["id"],),
+                )
+                binds=cur.fetchall()
+                link=binding_link(token)
+                bindings.append((s, binds, link, expires))
+            cur.execute("SELECT * FROM line_message_logs ORDER BY id DESC LIMIT 50")
+            rows=cur.fetchall()
+
+    cards=[]
+    for s, binds, link, expires in bindings:
+        bind_text = "<br>".join(
+            f"{escape(b['display_name'] or 'LINE 使用者')}｜{escape(b['relation'])}｜<span class='mini'>{escape(b['line_user_id'])}</span> <form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/unbind'><button class='btn btn2 mini'>解除</button></form>"
+            for b in binds
+        ) or "尚未綁定"
+        test_btn = f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s.get('line_user_id') else "尚未綁定"
+        linkbox = f"<textarea rows='2' style='width:100%' readonly>{escape(link)}</textarea><div class='mini muted'>有效至 {expires:%Y-%m-%d %H:%M}（台灣時間）</div><form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>重新產生連結</button></form>" if link else "尚未設定 LIFF_ID"
+        cards.append(
+            f"<tr><td>{escape(s['name'])}<br><span class='muted mini'>{escape(s['student_code'])}</span></td>"
+            f"<td>{bind_text}</td><td>{linkbox}</td><td>{test_btn}</td></tr>"
+        )
+    body.append("<section><h2>學生與家長 LINE 綁定</h2><p class='muted'>開啟本頁時，若學生沒有有效的綁定連結，系統會自動建立一條 1 小時有效連結。家長使用後，連結在期限內仍可供其他家長使用。</p><div style='overflow:auto'><table><tr><th>學生</th><th>目前綁定人</th><th>第一次／新增家長連結</th><th>測試</th></tr>" + "".join(cards) + "</table></div></section>")
+
+    table="<section><h2>最近 LINE 訊息</h2><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"
+    for r in rows:
+        dlabel="收到" if r['direction']=='inbound' else "送出"
+        mtype={"push":"主動推送","reply":"回覆","text":"文字"}.get(r['message_type'],r['message_type'])
+        slabel={"received":"已收到","sent":"已送出","simulated":"模擬送出","failed":"失敗"}.get(r['status'],r['status'])
+        table += f"<tr><td>{r['created_at']}</td><td>{dlabel}</td><td>{mtype}</td><td class='mini'>{escape(r['line_user_id'] or '')}</td><td>{escape(r['message'] or '')}</td><td>{slabel}</td></tr>"
+    table += "</table></section>"
+    body.append(table)
+    body.append("<section><h2>用 Excel 管理綁定</h2><p>把上方的 CSV 下載後，用 Excel 修改「LINE User ID、關係、啟用」等欄位，另存為 CSV UTF-8，再由下方按鈕上傳。可用來重新綁定或新增同一學生的其他家長。</p><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data'><input type='file' name='file' accept='.csv,text/csv' required> <button>匯入綁定 CSV</button></form><p class='mini muted'>欄位：學生編號、學生姓名、LINE 顯示名稱、LINE User ID、關係、啟用。匯入時空白的 LINE User ID 會略過。</p></section>")
+    return page("LINE 綁定 / 測試", "".join(body))
+
+
+@app.post("/admin/student/{student_id}/binding-link", response_class=HTMLResponse)
+def generate_binding_link(student_id:int, admin_user: str=Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,student_code FROM students WHERE id=%s AND active=TRUE", (student_id,))
+            student=cur.fetchone()
+    if not student:
+        raise HTTPException(404,"找不到學生")
+    token, expires = create_binding_token(student_id, admin_user)
+    link = binding_link(token)
+    if not link:
+        body = f"<section><h1>無法產生綁定連結</h1><div class='alert danger'>尚未設定 LIFF_ID。請先在 Render Environment Variables 設定 LIFF_ID。</div><a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+    else:
+        body = f"<section><h1>家長綁定連結</h1><p>學生：<b>{escape(student['name'])}</b>（{escape(student['student_code'])}）</p><p>有效期限：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p><p>此連結在有效期限內可供多位家長使用；例如同一學生的爸爸、媽媽可以使用同一條連結完成綁定。若一個 LINE 有多位孩子，請分別開啟各學生的連結。</p><p><textarea rows='4' style='width:100%' readonly>{escape(link)}</textarea></p><p><a class='btn' href='{escape(link)}' target='_blank'>開啟綁定頁</a> <a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></p></section>"
+    return page("家長綁定連結", body)
+
+
+@app.post("/admin/student/{student_id}/binding/{binding_id}/unbind")
+def admin_unbind(student_id: int, binding_id: int, _: str=Depends(admin_auth)):
+    ok, name = unbind_line_binding(binding_id)
+    if not ok:
+        raise HTTPException(404, name)
+    return RedirectResponse("/admin/line", status_code=303)
+
+
+@app.post("/admin/test-line/{student_id}")
+def test_line(student_id:int, _: str=Depends(admin_auth)):
+    now=now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM students WHERE id=%s AND active=TRUE", (student_id,))
+            s=cur.fetchone()
+            if not s:
+                raise HTTPException(404,"找不到學生")
+            msg=f"🔔 LINE 連線測試\n學生：{s['name']}\n時間：{now:%H:%M:%S}\n這是一則測試通知。"
+            send_student_line(cur,None,s['id'],msg,"line_test",s['line_user_id'])
+            conn.commit()
+    return RedirectResponse("/admin/line", status_code=303)
+
+
+# 保留管理員手動輸入 ID 的相容端點，但正式介面不提供此操作。
 @app.post("/admin/student/{student_id}/line")
 def update_student_line(student_id: int, line_user_id: str = Form(""), _: str = Depends(admin_auth)):
     with db_conn() as conn:
@@ -869,6 +1665,124 @@ def update_student_line(student_id: int, line_user_id: str = Form(""), _: str = 
                 raise HTTPException(404, "找不到學生")
             conn.commit()
     return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/line/export.csv")
+def export_line_bindings(_: str = Depends(admin_auth)):
+    buf = io.StringIO(); buf.write("\ufeff")
+    writer = csv.writer(buf)
+    writer.writerow(["學生編號","學生姓名","LINE 顯示名稱","LINE User ID","關係","啟用"] )
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT s.student_code,s.name,b.display_name,b.line_user_id,b.relation,b.active FROM student_line_bindings b JOIN students s ON s.id=b.student_id ORDER BY s.name,b.id"
+            )
+            for r in cur.fetchall():
+                writer.writerow([r["student_code"],r["name"],r["display_name"] or "",r["line_user_id"],r["relation"],"是" if r["active"] else "否"])
+    data=buf.getvalue().encode("utf-8-sig")
+    return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=line_bindings.csv"})
+
+
+@app.post("/admin/line/import.csv")
+async def import_line_bindings(file: UploadFile = File(...), _: str = Depends(admin_auth)):
+    raw = await file.read()
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"學生編號","LINE User ID"}
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        raise HTTPException(400, "CSV 欄位不完整，至少需要：學生編號、LINE User ID")
+    allowed_true = {"是","啟用","1","true","TRUE","yes","Y","y"}
+    imported=0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for raw_row in reader:
+                row={str(k).strip(): (str(v).strip() if v is not None else "") for k,v in raw_row.items()}
+                student_code=row.get("學生編號", "")
+                line_user_id=row.get("LINE User ID", "")
+                if not student_code or not line_user_id:
+                    continue
+                cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (student_code,))
+                student=cur.fetchone()
+                if not student:
+                    continue
+                display_name=row.get("LINE 顯示名稱") or None
+                relation=row.get("關係") or "家長/監護人"
+                active=row.get("啟用", "是") in allowed_true
+                cur.execute("SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s", (student["id"], line_user_id))
+                b=cur.fetchone()
+                if b:
+                    cur.execute("UPDATE student_line_bindings SET display_name=%s,relation=%s,active=%s WHERE id=%s", (display_name,relation,active,b["id"]))
+                else:
+                    cur.execute("INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,'EXCEL')", (student["id"],line_user_id,display_name,relation,active,now_local()))
+                # 每次匯入後重新整理 students.line_user_id 相容欄位，避免停用後仍誤發通知。
+                cur.execute(
+                    "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1",
+                    (student["id"],),
+                )
+                primary = cur.fetchone()
+                cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (primary["line_user_id"] if primary else None, student["id"]))
+                imported += 1
+            conn.commit()
+    return RedirectResponse("/admin/line", status_code=303)
+
+
+@app.get("/bind/{token}")
+def bind_redirect(token: str):
+    if not LIFF_ID:
+        return page("家長綁定", "<section><h1>尚未完成設定</h1><p>這個測試站尚未設定 LIFF。請聯絡管理員。</p></section>")
+    return RedirectResponse(binding_link(token), status_code=307)
+
+
+@app.get("/liff/bind", response_class=HTMLResponse)
+def liff_bind_page(request: Request):
+    html = f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>家長綁定</title><script src='https://static.line-scdn.net/liff/edge/2/sdk.js'></script><style>body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f7fb;margin:0;padding:18px;color:#1f2937}}.box{{max-width:520px;margin:40px auto;background:white;border-radius:18px;padding:24px;box-shadow:0 4px 20px #0001}}button{{border:0;border-radius:10px;padding:12px 18px;background:#111827;color:white;font-size:16px}}.muted{{color:#6b7280}}.ok{{background:#ecfdf5;padding:14px;border-radius:12px}}.warn{{background:#fff7ed;padding:14px;border-radius:12px}}</style></head><body><div class='box'><h1>家長綁定</h1><div id='app'>正在確認 LINE 身分…</div></div><script>
+const LIFF_ID={LIFF_ID!r};
+function bindingToken(){{
+  const p=new URLSearchParams(location.search); if(p.get('token')) return p.get('token');
+  const state=p.get('liff.state'); if(state){{ try{{ const u=new URL(state, location.origin); return u.searchParams.get('token') || ''; }}catch(e){{}} }}
+  return '';
+}}
+const token=bindingToken();
+async function postJSON(url,payload){{ const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}); const d=await r.json().catch(()=>({{detail:'伺服器回應無法讀取'}})); if(!r.ok) throw new Error(d.detail||'操作失敗'); return d; }}
+async function main(){{
+  const root=document.getElementById('app');
+  if(!token){{ root.innerHTML='<div class="warn">找不到有效的綁定連結。</div>'; return; }}
+  try{{
+    await liff.init({{liffId:LIFF_ID}});
+    if(!liff.isLoggedIn()){{ liff.login({{redirectUri:location.href}}); return; }}
+    const idToken=liff.getIDToken();
+    if(!idToken) throw new Error('無法取得 LINE ID Token，請重新開啟連結。');
+    const info=await postJSON('/api/liff/binding-preview',{{token:token,id_token:idToken}});
+    root.innerHTML=`<p>請確認您要綁定的學生：</p><h2>${{info.student_name}}</h2><p class="muted">學生編號：${{info.student_code}}</p><p>這個 LINE 帳號將接收該學生的到班與離班通知。此連結在有效期限內仍可供其他家長使用。</p><button id="confirm">確認綁定</button>`;
+    document.getElementById('confirm').onclick=async()=>{{
+      const b=document.getElementById('confirm'); b.disabled=true; b.textContent='綁定中…';
+      try{{ const result=await postJSON('/api/liff/bind',{{token:token,id_token:idToken,relation:'家長/監護人'}}); root.innerHTML=`<div class="ok"><h2>✅ 綁定成功</h2><p>學生：${{result.student_name}}</p><p>之後會接收到到班與離班通知。</p><p class="muted">這條連結在有效期限內仍可讓其他家長完成綁定。</p></div>`; }}catch(e){{ b.disabled=false; b.textContent='確認綁定'; root.innerHTML+=`<div class="warn">${{e.message}}</div>`; }}
+    }};
+  }}catch(e){{ root.innerHTML=`<div class="warn">${{e.message}}</div>`; }}
+}}
+main();</script></body></html>"""
+    return HTMLResponse(html)
+
+
+@app.post("/api/liff/binding-preview")
+async def liff_binding_preview(payload: dict[str, Any]):
+    token = str(payload.get("token") or "").strip()
+    id_token = str(payload.get("id_token") or "").strip()
+    verify_liff_id_token(id_token)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            row = binding_token_info(cur, token)
+            if not row:
+                raise HTTPException(400, "綁定連結無效、已使用或已過期。")
+            return {"student_name": row["name"], "student_code": row["student_code"]}
+
+
+@app.post("/api/liff/bind")
+async def liff_bind(payload: dict[str, Any]):
+    token = str(payload.get("token") or "").strip()
+    id_token = str(payload.get("id_token") or "").strip()
+    relation = str(payload.get("relation") or "家長/監護人").strip()[:50]
+    return bind_liff_user(token, id_token, relation)
 
 
 @app.get("/qr/{student_code}.png")
@@ -904,7 +1818,7 @@ def scan(token: str):
 def export_csv(_: str = Depends(admin_auth)):
     buf = io.StringIO(); buf.write("\ufeff")
     writer = csv.writer(buf)
-    writer.writerow(["紀錄ID","日期","學生編號","學生姓名","課程","老師","預定開始","預定結束","到班","離班","狀態","遲到分鐘","校正備註","校正時間","校正者"])
+    writer.writerow(["紀錄ID","日期","學生編號","學生姓名","課程","老師","預定開始","預定結束","到班","離班","狀態","狀態代碼","遲到分鐘","校正備註","校正時間","校正者"])
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -915,11 +1829,28 @@ def export_csv(_: str = Depends(admin_auth)):
                 """
             )
             for r in cur.fetchall():
-                writer.writerow([r[k] for k in ["id","date","student_code","name","course_name","teacher_name","start_time","end_time","check_in_time","check_out_time","status","late_minutes","manual_note","adjusted_at","adjusted_by"]])
+                writer.writerow([r[k] for k in ["id","date","student_code","name","course_name","teacher_name","start_time","end_time","check_in_time","check_out_time"]] + [status_label(r["status"]), r["status"], r["late_minutes"], r["manual_note"], r["adjusted_at"], r["adjusted_by"]])
     data = buf.getvalue().encode("utf-8-sig")
     return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=attendance_test_export.csv"})
 
 
+@app.post("/webhook/line")
+async def line_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("x-line-signature")
+    if LINE_MODE == "live":
+        if not verify_line_signature(body, signature):
+            raise HTTPException(status_code=400, detail="LINE webhook signature 驗證失敗")
+    try:
+        payload = __import__("json").loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="無效 JSON")
+    events = payload.get("events") or []
+    if LINE_MODE == "live":
+        await asyncio.gather(*(process_line_event(e) for e in events))
+    return JSONResponse({"ok": True, "events": len(events)})
+
+
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.2"})
+    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.3.2"})
