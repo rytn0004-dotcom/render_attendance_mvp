@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import zipfile
+import xml.etree.ElementTree as ET
 import os
 import secrets
 import hmac
 import hashlib
+import re
 import base64
 from datetime import date, datetime, timedelta
 from html import escape
@@ -41,7 +44,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.1")
+app = FastAPI(title="Attendance Test MVP v0.4.5")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -69,6 +72,7 @@ NOTIFY_STATUS_LABELS = {
     "sent": "已發送",
     "simulated": "模擬發送",
     "failed": "發送失敗",
+    "disabled": "已關閉",
 }
 LINE_MODE_LABELS = {
     "simulation": "模擬模式",
@@ -183,6 +187,7 @@ def init_db() -> None:
                     name TEXT NOT NULL,
                     qr_token TEXT NOT NULL UNIQUE,
                     line_user_id TEXT,
+                    parent_notify_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                     active BOOLEAN NOT NULL DEFAULT TRUE,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -256,6 +261,7 @@ def init_db() -> None:
                     display_name TEXT,
                     relation TEXT NOT NULL DEFAULT '家長/監護人',
                     active BOOLEAN NOT NULL DEFAULT TRUE,
+                    notify_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                     bound_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     bound_by TEXT NOT NULL DEFAULT 'LIFF'
                 );
@@ -329,8 +335,20 @@ def init_db() -> None:
                 """
             )
             # Migration for databases created by earlier V0.1 builds.
+            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS parent_notify_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS checkin_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_checkin_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_checkout_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_exception_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE student_line_bindings ADD COLUMN IF NOT EXISTS notify_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS late_grace_minutes INTEGER NOT NULL DEFAULT 10")
             cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS checkout_grace_minutes INTEGER NOT NULL DEFAULT 15")
+            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS actual_course_id TEXT")
+            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS course_date DATE")
+            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'legacy'")
+            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS source_note TEXT")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_courses_actual_course_id ON courses(actual_course_id) WHERE actual_course_id IS NOT NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_actual_date_student ON courses(course_date, student_id, active)")
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS absent_notified_at TIMESTAMP")
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS manual_note TEXT")
             cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS adjusted_at TIMESTAMP")
@@ -352,12 +370,14 @@ def init_db() -> None:
 
 
 def seed_demo_data(cur) -> None:
+    # 測試學生保留，並額外建立「今天」的實際課程資料。
     demo = [
         ("STU-000001", "王小明", "18:00", "19:30"),
         ("STU-000002", "林小華", "18:30", "20:00"),
         ("STU-000003", "陳小美", "19:00", "20:30"),
         ("STU-000004", "采璇", "19:00", "20:30"),
     ]
+    work_date = now_local().date()
     for code, name, start, end in demo:
         cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
         row = cur.fetchone()
@@ -368,14 +388,18 @@ def seed_demo_data(cur) -> None:
             )
             row = cur.fetchone()
         student_id = row["id"]
-        cur.execute("SELECT COUNT(*) AS c FROM courses WHERE student_id=%s", (student_id,))
-        if cur.fetchone()["c"] == 0:
-            for weekday in range(7):
-                cur.execute(
-                    """INSERT INTO courses(student_id, course_name, teacher_name, weekday, start_time, end_time, late_grace_minutes, checkout_grace_minutes)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (student_id, "測試課程", "測試老師", weekday, start, end, DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES),
-                )
+        actual_id = f"DEMO-{work_date:%Y%m%d}-{code}"
+        cur.execute("SELECT id FROM courses WHERE actual_course_id=%s", (actual_id,))
+        if not cur.fetchone():
+            cur.execute(
+                """INSERT INTO courses(
+                    student_id, course_name, teacher_name, weekday, start_time, end_time,
+                    late_grace_minutes, checkout_grace_minutes, active, actual_course_id,
+                    course_date, source, source_note
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,'demo','V0.4.5 測試資料')""",
+                (student_id, "測試課程", "測試老師", work_date.weekday(), start, end,
+                 DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES, actual_id, work_date),
+            )
 
 
 def seed_notification_templates(cur) -> None:
@@ -473,19 +497,36 @@ def consume_one_time_template(cur, template_row: dict[str, Any] | None) -> None:
 
 def active_line_bindings(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[dict[str, Any]]:
     cur.execute(
-        "SELECT id,line_user_id,display_name,relation FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+        "SELECT id,line_user_id,display_name,relation,notify_enabled FROM student_line_bindings WHERE student_id=%s AND active=TRUE AND notify_enabled=TRUE ORDER BY id",
         (student_id,),
     )
     rows = cur.fetchall()
     if legacy_line_user_id and not any(r["line_user_id"] == legacy_line_user_id for r in rows):
-        rows.append({"id": None, "line_user_id": legacy_line_user_id, "display_name": None, "relation": "家長/監護人"})
+        rows.append({"id": None, "line_user_id": legacy_line_user_id, "display_name": None, "relation": "家長/監護人", "notify_enabled": True})
     return rows
+
+
+def parent_notification_enabled(student: dict[str, Any], notification_type: str) -> bool:
+    if not bool(student.get("parent_notify_enabled", True)):
+        return False
+    if notification_type == "check_in":
+        return bool(student.get("notify_checkin_enabled", True))
+    if notification_type == "check_out":
+        return bool(student.get("notify_checkout_enabled", True))
+    return bool(student.get("notify_exception_enabled", True))
 
 
 def send_student_template_line(cur, attendance_id: int | None, student: dict[str, Any], course: dict[str, Any] | None,
                                notification_type: str, check_in_time: datetime | None = None,
                                check_out_time: datetime | None = None, when: datetime | None = None,
                                late_minutes: int = 0, legacy_line_user_id: str | None = None) -> bool:
+    if not parent_notification_enabled(student, notification_type):
+        disabled_msg = render_notification_template(
+            DEFAULT_NOTIFICATION_TEMPLATES[notification_type], student, course, None,
+            check_in_time, check_out_time, when, late_minutes
+        )
+        log_notification(cur, attendance_id, notification_type, None, disabled_msg, LINE_MODE, "disabled", "此學生的家長 LINE 通知已由管理員關閉")
+        return False
     bindings = active_line_bindings(cur, student["id"], legacy_line_user_id)
     if not bindings:
         default_msg = render_notification_template(DEFAULT_NOTIFICATION_TEMPLATES[notification_type], student, course, None, check_in_time, check_out_time, when, late_minutes)
@@ -540,21 +581,38 @@ def require_checkin_device(request: Request) -> dict[str, Any]:
             return device
 
 
-def pair_device(pair_token: str) -> tuple[str, str]:
-    device_raw_token = secrets.token_urlsafe(32)
+def device_pair_info(pair_token: str) -> dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT p.id,p.device_id,d.name,d.active AS device_active
+                """SELECT p.id,p.device_id,p.expires_at,d.name,d.active AS device_active
                    FROM device_pair_tokens p JOIN checkin_devices d ON d.id=p.device_id
                    WHERE p.token_hash=%s AND p.used_at IS NULL AND p.expires_at>%s""",
                 (hash_device_token(pair_token), now_local()),
             )
             pair = cur.fetchone()
+    if not pair or not pair["device_active"]:
+        raise HTTPException(status_code=400, detail="設備配對連結無效、已使用或已過期。請由管理員重新產生。")
+    return pair
+
+
+def confirm_device_pair(pair_token: str) -> tuple[str, str]:
+    device_raw_token = secrets.token_urlsafe(32)
+    now = now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT p.id,p.device_id,d.name,d.active AS device_active
+                   FROM device_pair_tokens p JOIN checkin_devices d ON d.id=p.device_id
+                   WHERE p.token_hash=%s AND p.used_at IS NULL AND p.expires_at>%s
+                   FOR UPDATE""",
+                (hash_device_token(pair_token), now),
+            )
+            pair = cur.fetchone()
             if not pair or not pair["device_active"]:
                 raise HTTPException(status_code=400, detail="設備配對連結無效、已使用或已過期。請由管理員重新產生。")
             cur.execute("UPDATE checkin_devices SET token_hash=%s,active=TRUE WHERE id=%s", (hash_device_token(device_raw_token), pair["device_id"]))
-            cur.execute("UPDATE device_pair_tokens SET used_at=%s WHERE id=%s", (now_local(), pair["id"]))
+            cur.execute("UPDATE device_pair_tokens SET used_at=%s WHERE id=%s", (now, pair["id"]))
             conn.commit()
             return device_raw_token, pair["name"]
 
@@ -565,9 +623,13 @@ def get_student(cur, token: str):
 
 
 def get_courses_today(cur, student_id: int, work_date: date):
+    """出勤唯一課程來源：總表「實際課程」同步進來的日課程。"""
     cur.execute(
-        "SELECT * FROM courses WHERE student_id=%s AND weekday=%s AND active=TRUE ORDER BY start_time",
-        (student_id, work_date.weekday()),
+        """SELECT * FROM courses
+           WHERE student_id=%s AND course_date=%s AND active=TRUE
+             AND actual_course_id IS NOT NULL
+           ORDER BY start_time, id""",
+        (student_id, work_date),
     )
     raw = cur.fetchall()
     result = []
@@ -590,11 +652,11 @@ def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attend
     scored = []
     for c in courses:
         st = parse_hhmm(c["effective_start"], when.date())
-        en = parse_hhmm(c["effective_end"], when.date())
+        en = parse_hhmm(c["effective_end"], when.date()) if c.get("effective_end") else st
         early = st - timedelta(minutes=CHECKIN_EARLY_MINUTES)
         late_end = en + timedelta(minutes=max(c["checkout_grace_minutes"], 60))
         inside = early <= when <= late_end
-        distance = 0 if inside else min(abs((when - st).total_seconds()), abs((when - en).total_seconds()))
+        distance = 0 if inside else abs((when - st).total_seconds())
         scored.append((0 if inside else 1, distance, st, c))
     scored.sort(key=lambda x: (x[0], x[1], x[2]))
     return scored[0][3]
@@ -800,7 +862,7 @@ def bind_liff_user(token: str, id_token: str, relation: str = "家長/監護人"
                 conn.commit()
                 return {"student_id": row["student_id"], "student_name": row["name"], "already": True, "line_user_id": line_user_id}
             cur.execute(
-                "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,bound_at,bound_by) VALUES (%s,%s,%s,%s,TRUE,%s,'LIFF')",
+                "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,notify_enabled,bound_at,bound_by) VALUES (%s,%s,%s,%s,TRUE,TRUE,%s,'LIFF')",
                 (row["student_id"], line_user_id, display_name, relation.strip() or "家長/監護人", now),
             )
             cur.execute("UPDATE students SET line_user_id=COALESCE(line_user_id,%s) WHERE id=%s", (line_user_id, row["student_id"]))
@@ -954,6 +1016,8 @@ def scan_student(token: str) -> dict[str, Any]:
             student = get_student(cur, token)
             if not student:
                 raise HTTPException(status_code=404, detail="無效 QR Code")
+            if not bool(student.get("checkin_enabled", True)):
+                return {"kind": "error", "student": student["name"], "message": "此學生的簽到功能目前已由管理員關閉。"}
             courses = get_courses_today(cur, student["id"], work_date)
             if not courses:
                 msg = f"⚠️ 無課程簽到\n學生：{student['name']}\n時間：{when:%H:%M}"
@@ -1046,10 +1110,10 @@ def check_scheduled_absences() -> int:
                 """
                 SELECT c.*, s.name, s.active AS student_active
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.weekday=%s AND c.active=TRUE AND s.active=TRUE
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND s.active=TRUE
                 ORDER BY c.start_time
                 """,
-                (work_date.weekday(),),
+                (work_date,),
             )
             courses = cur.fetchall()
             for course in courses:
@@ -1113,6 +1177,8 @@ def check_missing_checkout() -> int:
                 eff = effective_schedule(cur, course, work_date)
                 if not eff:
                     continue
+                if not eff.get("effective_end"):
+                    continue
                 end_dt = parse_hhmm(eff["effective_end"], work_date)
                 if now >= end_dt + timedelta(minutes=eff["checkout_grace_minutes"]):
                     row = dict(row)
@@ -1169,7 +1235,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>課程時間</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1182,7 +1248,7 @@ def dashboard(_: str = Depends(admin_auth)):
     checks = run_all_checks()
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.4.1</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.4.5</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
     ]
     with db_conn() as conn:
@@ -1205,10 +1271,10 @@ def dashboard(_: str = Depends(admin_auth)):
                 """
                 SELECT c.*, s.name, s.student_code, s.line_user_id
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.weekday=%s AND c.active=TRUE
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL
                 ORDER BY c.start_time, s.name
                 """,
-                (today.weekday(),),
+                (today,),
             )
             roster_raw = cur.fetchall()
             roster = []
@@ -1244,14 +1310,17 @@ def dashboard(_: str = Depends(admin_auth)):
             for b in binds
         ) or "尚未綁定"
         test_btn = f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s['line_user_id'] else "尚未綁定"
+        notify_label = "啟用" if s.get("parent_notify_enabled", True) else "已關閉"
         qr_rows.append(
             f"<tr><td>{escape(s['name'])}</td><td>{escape(s['student_code'])}</td>"
-            f"<td><img class='qr' src='/qr/{escape(s['student_code'])}.png'></td>"
+            f"<td><img class='qr' src='/qr/{escape(s['student_code'])}.png'><br><span class='mini muted'>QR 固定不變；只有管理員按下重新產生才會更新。</span>"
+            f"<form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/qr-regenerate'><button class='btn btn2 mini'>重新產生學生 QR</button></form></td>"
             f"<td>{bind_text}</td>"
-            f"<td><form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>產生家長綁定連結</button></form></td>"
+            f"<td><span class='{ 'green' if s.get('parent_notify_enabled', True) else 'gray' }'>家長提醒：{notify_label}</span>"
+            f"<form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/toggle-parent-notify'><button class='btn btn2 mini'>{'關閉家長提醒' if s.get('parent_notify_enabled', True) else '開啟家長提醒'}</button></form></td>"
             f"<td>{test_btn}</td></tr>"
         )
-    body_parts.append("<section><h2>學生 QR / 家長 LINE</h2><p class='muted mini'>學生的 QR 只負責出勤。家長 LINE 透過一次性綁定連結與學生建立關聯；一位學生可綁定多位家長，同一個 LINE 也可綁定多位孩子。解除綁定只由管理員操作。</p><table><tr><th>學生</th><th>編號</th><th>學生 QR</th><th>已綁定 LINE</th><th>綁定連結</th><th>測試</th></tr>" + "".join(qr_rows) + "</table></section>")
+    body_parts.append("<section><h2>學生 QR / 家長 LINE</h2><p class='muted mini'>學生 QR 是永久識別碼：日常不會變，只有管理員主動重新產生才會更新。家長 LINE 不由學生手機綁定，而是從既有 LINE 客服／Excel 的 LINE User ID 與學生姓名（或學生編號）建立關聯。</p><table><tr><th>學生</th><th>編號</th><th>學生 QR</th><th>已綁定 LINE</th><th>家長提醒</th><th>測試</th></tr>" + "".join(qr_rows) + "</table></section>")
 
     roster_rows = []
     for r in roster:
@@ -1299,45 +1368,50 @@ def dashboard(_: str = Depends(admin_auth)):
 @app.get("/admin/courses", response_class=HTMLResponse)
 def admin_courses(_: str = Depends(admin_auth)):
     today = now_local().date()
-    body = [f"<div class='top'><div><h1>課程時間設定</h1><div class='muted'>永久週課表 + 指定日期校正。今日校正會優先影響今天的簽到判斷。</div></div>{admin_nav()}</div>"]
+    body = [
+        f"<div class='top'><div><h1>實際課程</h1><div class='muted'>出勤只依據總表「實際課程」同步資料。固定課表／調課請在原本總表處理；這裡只提供今天的臨時校正。</div></div>{admin_nav()}</div>",
+        "<section><h2>同步規則</h2><p>上傳總表後，Render 會依「實際課程」的 Course ID＋課程日期＋學生建立/更新出勤課程。若原本課表調課已確認，正式時間以「實際課程」為準；「課程提醒」仍是獨立通知佇列，不會反過來修改出勤時間。</p></section>"
+    ]
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT c.*, s.name, s.student_code
-                FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.active=TRUE
-                ORDER BY s.name,c.weekday,c.start_time
-                """
+                """SELECT c.*, s.name, s.student_code
+                   FROM courses c JOIN students s ON s.id=c.student_id
+                   WHERE c.active=TRUE AND c.actual_course_id IS NOT NULL AND c.course_date >= %s
+                   ORDER BY c.course_date,c.start_time,s.name LIMIT 300""",
+                (today,),
             )
-            courses = cur.fetchall()
-            for c in courses:
-                cur.execute("SELECT * FROM schedule_overrides WHERE course_id=%s AND work_date=%s", (c["id"], today))
-                ov = cur.fetchone()
-                wd = c["weekday"]
-                weekday_options = ''.join(
-                    f"<option value='{i}' {'selected' if i == wd else ''}>{WEEKDAYS[i]}</option>"
-                    for i in range(7)
-                )
-                body.append(
-                    f"<section><h2>{escape(c['name'])}｜{escape(c['course_name'])}</h2>"
-                    f"<form method='post' action='/admin/course/{c['id']}'><div class='grid'>"
-                    f"<div><label>星期<br><select name='weekday'>{weekday_options}</select></label> "
-                    f"<label>開始<br><input type='time' name='start_time' value='{escape(c['start_time'])}'></label> "
-                    f"<label>結束<br><input type='time' name='end_time' value='{escape(c['end_time'])}'></label></div>"
-                    f"<div><label>遲到門檻(分)<br><input type='number' name='late_grace_minutes' value='{c['late_grace_minutes']}' min='0' max='180'></label> "
-                    f"<label>未離班通知(分)<br><input type='number' name='checkout_grace_minutes' value='{c['checkout_grace_minutes']}' min='1' max='240'></label></div></div>"
-                    f"<p><label>課程名稱 <input class='wide' name='course_name' value='{escape(c['course_name'], quote=True)}'></label> "
-                    f"<label>老師 <input class='wide' name='teacher_name' value='{escape(c['teacher_name'] or '', quote=True)}'></label> <button>儲存永久課表</button></p></form>"
-                    f"<hr><h3>今日 ({today:%Y-%m-%d}) 校正</h3>"
-                    f"<form method='post' action='/admin/course/{c['id']}/override'><label>今天開始 <input type='time' name='start_time' value='{escape((ov['start_time'] if ov and ov['start_time'] else c['start_time']))}'></label> "
-                    f"<label>今天結束 <input type='time' name='end_time' value='{escape((ov['end_time'] if ov and ov['end_time'] else c['end_time']))}'></label> "
-                    f"<label>備註 <input class='wide' name='note' value='{escape((ov['note'] if ov else ''), quote=True)}' placeholder='例如：9/18 臨時調課'></label> "
-                    f"<button>儲存今日校正</button>"
-                    f"<label style='margin-left:8px'><input type='checkbox' name='cancelled' value='1' {'checked' if ov and ov['cancelled'] else ''}> 今日取消</label></form>"
-                    f"<p class='mini muted'>目前今日有效時間：<b>{escape((ov['start_time'] if ov and ov['start_time'] else c['start_time']))} - {escape((ov['end_time'] if ov and ov['end_time'] else c['end_time']))}</b>。修改後會直接影響今天的到班、遲到與未離班判斷。</p></section>"
-                )
-    return page("課程時間設定", "".join(body))
+            rows = cur.fetchall()
+            grouped = {}
+            for c in rows:
+                grouped.setdefault(c["course_date"], []).append(c)
+            for d, items in grouped.items():
+                body.append(f"<section><h2>{d:%Y-%m-%d}　{WEEKDAYS[d.weekday()]}</h2><div style='overflow:auto'><table><tr><th>學生</th><th>Course ID</th><th>課程</th><th>老師</th><th>來源時間</th><th>今日校正</th></tr>")
+                for c in items:
+                    cur.execute("SELECT * FROM schedule_overrides WHERE course_id=%s AND work_date=%s", (c["id"], d))
+                    ov = cur.fetchone()
+                    effective_start = ov["start_time"] if ov and ov["start_time"] else c["start_time"]
+                    effective_end = ov["end_time"] if ov and ov["end_time"] else c["end_time"]
+                    end_display = effective_end or "未設定"
+                    warning = "<br><span class='red mini'>⚠️ 缺少下課時間：無法自動判定未離班</span>" if not effective_end else ""
+                    body.append(
+                        f"<tr><td><b>{escape(c['name'])}</b><br><span class='mini muted'>{escape(c['student_code'])}</span></td>"
+                        f"<td class='mini'>{escape(c['actual_course_id'])}</td>"
+                        f"<td>{escape(c['course_name'])}</td><td>{escape(c['teacher_name'] or '')}</td>"
+                        f"<td>{escape(effective_start)}-{escape(end_display)}{warning}</td>"
+                        f"<td><form method='post' action='/admin/course/{c['id']}/override'>"
+                        f"<input type='date' name='work_date' value='{d:%Y-%m-%d}' style='width:145px' readonly> "
+                        f"<input type='time' name='start_time' value='{escape(effective_start)}'> "
+                        f"<input type='time' name='end_time' value='{escape(effective_end or '')}'> "
+                        f"<input class='wide' name='note' value='{escape((ov['note'] if ov else ''), quote=True)}' placeholder='臨時校正原因'> "
+                        f"<label><input type='checkbox' name='cancelled' value='1' {'checked' if ov and ov['cancelled'] else ''}> 取消</label> "
+                        f"<button class='btn btn2 mini'>儲存今天校正</button></form>"
+                        f"<div class='mini muted'>目前有效時間：{escape(effective_start)}-{escape(end_display)}</div></td></tr>"
+                    )
+                body.append("</table></div></section>")
+    if len(rows) == 0:
+        body.append("<section class='alert'>目前沒有已同步的未來「實際課程」。請到「LINE 綁定 / 測試」上傳最新總表 Excel。</section>")
+    return page("實際課程", "".join(body))
 
 
 @app.post("/admin/course/{course_id}")
@@ -1355,8 +1429,11 @@ def update_course(course_id: int, weekday: int = Form(...), start_time: str = Fo
 
 
 @app.post("/admin/course/{course_id}/override")
-def save_override(course_id: int, start_time: str = Form(...), end_time: str = Form(...), note: str = Form(""), cancelled: str | None = Form(None), _: str = Depends(admin_auth)):
-    today = now_local().date()
+def save_override(course_id: int, start_time: str = Form(...), end_time: str = Form(...), note: str = Form(""), cancelled: str | None = Form(None), work_date: str = Form(""), _: str = Depends(admin_auth)):
+    target_date = datetime.strptime(work_date, "%Y-%m-%d").date() if work_date else now_local().date()
+    if end_time.strip():
+        if parse_hhmm(start_time, target_date) >= parse_hhmm(end_time, target_date):
+            raise HTTPException(400, "結束時間必須晚於開始時間。")
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1365,7 +1442,7 @@ def save_override(course_id: int, start_time: str = Form(...), end_time: str = F
                 VALUES (%s,%s,%s,%s,%s,%s)
                 ON CONFLICT(course_id,work_date) DO UPDATE SET start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,cancelled=EXCLUDED.cancelled,note=EXCLUDED.note
                 """,
-                (course_id, today, start_time.strip() or None, end_time.strip() or None, bool(cancelled), note.strip() or None),
+                (course_id, target_date, start_time.strip() or None, end_time.strip() or None, bool(cancelled), note.strip() or None),
             )
             conn.commit()
     return RedirectResponse("/admin/courses", status_code=303)
@@ -1643,69 +1720,75 @@ async def import_notification_templates(file:UploadFile=File(...), _: str=Depend
 
 
 @app.get("/admin/line", response_class=HTMLResponse)
-def admin_line(_: str = Depends(admin_auth)):
-    body=[f"<div class='top'><div><h1>LINE 綁定 / 測試</h1><div class='muted'>第一次綁定由系統建立 1 小時有效的家長連結；同一學生可綁定多位家長，同一個 LINE 也可綁定多位學生。</div></div>{admin_nav()}</div>"]
+def admin_line(request: Request, _: str = Depends(admin_auth)):
+    body=[f"<div class='top'><div><h1>LINE 綁定 / 測試</h1><div class='muted'>出勤系統直接使用既有 AI 客服／家長服務所蒐集的 LINE User ID，不要求學生本人有 LINE。</div></div>{admin_nav()}</div>"]
+    imported = request.query_params.get("imported")
+    actual_imported = request.query_params.get("actual_imported")
+    actual_skipped = request.query_params.get("actual_skipped")
+    errors = request.query_params.get("errors")
+    if imported is not None or actual_imported is not None:
+        source = "總表 Excel" if request.query_params.get("source") == "xlsx" else "CSV"
+        body.append(f"<section class='alert success'>✅ {source}同步完成：LINE 綁定 {escape(imported or '0')} 筆；實際課程 {escape(actual_imported or '0')} 筆。")
+        if actual_skipped and actual_skipped != '0':
+            body.append(f"<br>⚠️ 實際課程略過 {escape(actual_skipped)} 筆")
+        if errors and errors != '0':
+            body.append(f"<br>⚠️ 有 {escape(errors)} 筆同步資料需要檢查學生姓名／編號或時間格式。")
+        body.append("</section>")
     webhook_url=f"{public_base_url()}/webhook/line"
-    liff_endpoint=f"{public_base_url()}/liff/bind"
     body.append(
-        f"<section><h2>LINE 設定</h2><p>Webhook URL：<code>{escape(webhook_url)}</code></p>"
-        f"<p>LIFF Endpoint URL：<code>{escape(liff_endpoint)}</code></p>"
-        f"<p>LIFF ID：<b>{'已設定' if LIFF_ID else '尚未設定'}</b>｜LINE Login Channel ID：<b>{'已設定' if LINE_LOGIN_CHANNEL_ID else '尚未設定'}</b></p>"
-        f"<p>目前 LINE 模式：<b>{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</b>｜家長綁定連結：<b>{BINDING_LINK_MINUTES} 分鐘</b></p>"
-        f"<div class='alert'>第一次綁定：系統會自動為每位學生建立 1 小時有效的家長綁定連結，管理員把連結傳給家長即可。這條連結在有效時間內可讓多位家長綁定同一學生；同一位家長也可以使用不同學生的連結，把多位孩子綁到同一個 LINE。重新綁定或新增綁定人，後續由管理員維護即可。</div>"
-        f"<p><a class='btn btn2' href='/admin/line/export.csv'>下載 LINE 綁定表（Excel 可直接開啟的 CSV）</a></p></section>"
+        f"<section><h2>LINE 連線</h2><p>Webhook URL：<code>{escape(webhook_url)}</code></p>"
+        f"<p>目前 LINE 模式：<b>{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</b></p>"
+        f"<div class='alert'>家長端的 LINE 綁定可以繼續由你原本的 AI 客服處理。這個出勤站不再要求家長另外建立第二套綁定；只要從客服系統／Excel 取得「學生姓名（或學生編號）＋LINE User ID」，匯入這裡即可。</div>"
+        f"<p class='mini muted'>LIFF / LINE Login 目前不是出勤簽到的必要條件；未來若要做新的家長自助綁定，再另外啟用即可。</p></section>"
     )
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,name,student_code FROM students WHERE active=TRUE ORDER BY name")
+            cur.execute("SELECT id,name,student_code,parent_notify_enabled FROM students WHERE active=TRUE ORDER BY name")
             students=cur.fetchall()
-            bindings=[]
+            rows=[]
             for s in students:
-                # 自動建立第一次綁定連結；若已有仍有效連結，get_or_create_binding_token 會建立新連結，因此只在需要顯示時生成。
-                token, expires, _ = get_or_create_binding_token(s["id"], "admin_auto")
-                cur.execute(
-                    "SELECT id,line_user_id,display_name,relation,bound_at FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
-                    (s["id"],),
-                )
-                binds=cur.fetchall()
-                link=binding_link(token)
-                bindings.append((s, binds, link, expires))
-            cur.execute("SELECT * FROM line_message_logs ORDER BY id DESC LIMIT 50")
-            rows=cur.fetchall()
-
-    cards=[]
-    for s, binds, link, expires in bindings:
-        bind_text = "<br>".join(
-            f"{escape(b['display_name'] or 'LINE 使用者')}｜{escape(b['relation'])}｜<span class='mini'>{escape(b['line_user_id'])}</span> <form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/unbind'><button class='btn btn2 mini'>解除</button></form>"
-            for b in binds
-        ) or "尚未綁定"
-        test_btn = f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s.get('line_user_id') else "尚未綁定"
-        if link:
-            qr_src = qr_data_uri(link)
-            linkbox = (
-                f"<div style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>"
-                f"<img class='qr' src='{qr_src}' alt='家長綁定 QR'>"
-                f"<div style='flex:1;min-width:260px'><textarea rows='2' style='width:100%' readonly>{escape(link)}</textarea>"
-                f"<div class='mini muted'>有效至 {expires:%Y-%m-%d %H:%M}（台灣時間）</div>"
-                f"<form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>重新產生連結＋QR</button></form></div></div>"
+                cur.execute("SELECT id,line_user_id,display_name,relation,bound_at,active,notify_enabled FROM student_line_bindings WHERE student_id=%s ORDER BY id DESC", (s["id"],))
+                rows.extend([dict(x, student_id=s["id"], student_name=s["name"], student_code=s["student_code"], parent_notify_enabled=s["parent_notify_enabled"]) for x in cur.fetchall()])
+            cur.execute("SELECT * FROM line_message_logs ORDER BY id DESC LIMIT 80")
+            logs=cur.fetchall()
+    table=["<section><h2>學生與 LINE</h2><p class='muted'>可由學生層級總開關控制，也可對單一家長綁定個別關閉提醒；簽到紀錄本身不會因為關閉提醒而停止。</p><div style='overflow:auto'><table><tr><th>學生</th><th>LINE</th><th>家長提醒</th><th>測試</th></tr>"]
+    for s in students:
+        binds=[r for r in rows if r["student_id"]==s["id"] and r["active"]]
+        count_text = f"共 {len(binds)} 位" if binds else "尚未綁定"
+        bind_rows=[]
+        for b in binds:
+            display = escape(b['display_name'] or 'LINE 使用者')
+            relation = escape(b['relation'] or '家長/監護人')
+            uid = escape(b['line_user_id'])
+            notify_label = "提醒啟用" if b.get("notify_enabled", True) else "提醒關閉"
+            notify_btn = (
+                f"<form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/toggle-notify'>"
+                + ("<button class='btn btn2 mini'>關閉提醒</button>" if b.get("notify_enabled", True) else "<button class='btn btn2 mini'>開啟提醒</button>")
+                + "</form>"
             )
-        else:
-            linkbox = "尚未設定 LIFF_ID"
-        cards.append(
-            f"<tr><td>{escape(s['name'])}<br><span class='muted mini'>{escape(s['student_code'])}</span></td>"
-            f"<td>{bind_text}</td><td>{linkbox}</td><td>{test_btn}</td></tr>"
-        )
-    body.append("<section><h2>學生與家長 LINE 綁定</h2><p class='muted'>開啟本頁時，若學生沒有有效的綁定連結，系統會自動建立一條 1 小時有效連結。家長使用後，連結在期限內仍可供其他家長使用。</p><div style='overflow:auto'><table><tr><th>學生</th><th>目前綁定人</th><th>第一次／新增家長連結</th><th>測試</th></tr>" + "".join(cards) + "</table></div></section>")
+            bind_rows.append(
+                f"<div style='padding:7px 0;border-bottom:1px solid #eee'><b>{display}</b>｜{relation}<br>"
+                f"<span class='mini'>{uid}</span>｜綁定 {b['bound_at']}｜<span class='mini'>{notify_label}</span> "
+                + notify_btn + " "
+                + f"<form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/unbind'><button class='btn btn2 mini'>解除</button></form></div>"
+            )
+        bind_text = count_text + ("<div>" + "".join(bind_rows) + "</div>" if bind_rows else "")
+        test_btn=f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s.get('line_user_id') else "尚未綁定"
+        toggle_text = "關閉全部" if s["parent_notify_enabled"] else "開啟全部"
+        table.append(f"<tr><td><b>{escape(s['name'])}</b><br><span class='mini muted'>{escape(s['student_code'])}</span></td><td>{bind_text}</td><td><span class='{ 'green' if s['parent_notify_enabled'] else 'gray' }'>{'啟用' if s['parent_notify_enabled'] else '已關閉'}</span><form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/toggle-parent-notify'><button class='btn btn2 mini'>{toggle_text}家長提醒</button></form></td><td>{test_btn}</td></tr>")
+    table.append("</table></div></section>")
+    body.append("".join(table))
 
-    table="<section><h2>最近 LINE 訊息</h2><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"
-    for r in rows:
+    body.append("<section><h2>匯入原本 LINE 客服／總表 Excel 的綁定資料</h2><p>目前總表包含「實際課程」、「出勤學生」與「出勤LINE綁定」等資料。Render 匯入後，出勤的日期／時間唯一依據是「實際課程」；LINE 綁定則使用「出勤LINE綁定」，若該表沒有可用資料才回退讀取「聯絡人」。每一列 LINE 綁定代表「一位學生＋一位家長」。</p><p><b>推薦：</b>直接上傳目前的總表 <code>.xlsx</code>；如果只想匯入綁定，也可上傳 CSV。</p><form method='post' action='/admin/line/import.xlsx' enctype='multipart/form-data'><input type='file' name='file' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required> <button>匯入總表 Excel</button></form><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data' style='margin-top:8px'><input type='file' name='file' accept='.csv,text/csv' required> <button class='btn btn2'>匯入 LINE 綁定 CSV</button></form><p><a class='btn btn2' href='/admin/line/export.csv'>下載目前 LINE 綁定 CSV</a></p><p class='mini muted'>出勤同步會讀取「實際課程」、「出勤學生」、「出勤LINE綁定」。實際課程由固定課表＋已確認調課形成；「課程提醒」仍維持原系統獨立發送，不會改變出勤時間。每位家長的「家長提醒」可個別開關。</p></section>")
+
+    log_table=["<section><h2>最近 LINE 訊息</h2><div style='overflow:auto'><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"]
+    for r in logs:
         dlabel="收到" if r['direction']=='inbound' else "送出"
         mtype={"push":"主動推送","reply":"回覆","text":"文字"}.get(r['message_type'],r['message_type'])
-        slabel={"received":"已收到","sent":"已送出","simulated":"模擬送出","failed":"失敗"}.get(r['status'],r['status'])
-        table += f"<tr><td>{r['created_at']}</td><td>{dlabel}</td><td>{mtype}</td><td class='mini'>{escape(r['line_user_id'] or '')}</td><td>{escape(r['message'] or '')}</td><td>{slabel}</td></tr>"
-    table += "</table></section>"
-    body.append(table)
-    body.append("<section><h2>用 Excel 管理綁定</h2><p>把上方的 CSV 下載後，用 Excel 修改「LINE User ID、關係、啟用」等欄位，另存為 CSV UTF-8，再由下方按鈕上傳。可用來重新綁定或新增同一學生的其他家長。</p><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data'><input type='file' name='file' accept='.csv,text/csv' required> <button>匯入綁定 CSV</button></form><p class='mini muted'>欄位：學生編號、學生姓名、LINE 顯示名稱、LINE User ID、關係、啟用。匯入時空白的 LINE User ID 會略過。</p></section>")
+        slabel={"received":"已收到","sent":"已送出","simulated":"模擬送出","failed":"失敗","disabled":"已關閉"}.get(r['status'],r['status'])
+        log_table.append(f"<tr><td>{r['created_at']}</td><td>{dlabel}</td><td>{mtype}</td><td class='mini'>{escape(r['line_user_id'] or '')}</td><td>{escape(r['message'] or '')}</td><td>{slabel}</td></tr>")
+    log_table.append("</table></div></section>")
+    body.append("".join(log_table))
     return page("LINE 綁定 / 測試", "".join(body))
 
 
@@ -1759,6 +1842,17 @@ def test_line(student_id:int, _: str=Depends(admin_auth)):
 
 
 # 保留管理員手動輸入 ID 的相容端點，但正式介面不提供此操作。
+@app.post("/admin/student/{student_id}/toggle-parent-notify")
+def toggle_parent_notify(student_id: int, _: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE students SET parent_notify_enabled=NOT parent_notify_enabled WHERE id=%s AND active=TRUE", (student_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "找不到學生")
+            conn.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/student/{student_id}/line")
 def update_student_line(student_id: int, line_user_id: str = Form(""), _: str = Depends(admin_auth)):
     with db_conn() as conn:
@@ -1774,57 +1868,395 @@ def update_student_line(student_id: int, line_user_id: str = Form(""), _: str = 
 def export_line_bindings(_: str = Depends(admin_auth)):
     buf = io.StringIO(); buf.write("\ufeff")
     writer = csv.writer(buf)
-    writer.writerow(["學生編號","學生姓名","LINE 顯示名稱","LINE User ID","關係","啟用"] )
+    writer.writerow(["學生編號","學生姓名","LINE 顯示名稱","LINE User ID","關係","啟用","家長提醒"] )
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.student_code,s.name,b.display_name,b.line_user_id,b.relation,b.active FROM student_line_bindings b JOIN students s ON s.id=b.student_id ORDER BY s.name,b.id"
+                "SELECT s.student_code,s.name,b.display_name,b.line_user_id,b.relation,b.active,b.notify_enabled "
+                "FROM student_line_bindings b JOIN students s ON s.id=b.student_id ORDER BY s.name,b.id"
             )
             for r in cur.fetchall():
-                writer.writerow([r["student_code"],r["name"],r["display_name"] or "",r["line_user_id"],r["relation"],"是" if r["active"] else "否"])
+                writer.writerow([r["student_code"],r["name"],r["display_name"] or "",r["line_user_id"],r["relation"],"是" if r["active"] else "否", "是" if r["notify_enabled"] else "否"])
     data=buf.getvalue().encode("utf-8-sig")
     return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=line_bindings.csv"})
+
+
+def _truthy_binding(value: Any, default: bool = True) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip() in {"是","啟用","1","true","TRUE","yes","Y","y"}
+
+
+def _normalize_binding_row(raw_row: dict[str, Any]) -> dict[str, str]:
+    row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw_row.items()}
+    return {
+        "student_code": row.get("學生編號", "") or row.get("學生ID", "") or row.get("student_code", ""),
+        "student_name": row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", ""),
+        "line_user_id": row.get("LINE User ID", "") or row.get("LINE ID", "") or row.get("LINE_ID", "") or row.get("line_user_id", ""),
+        "display_name": row.get("LINE 顯示名稱", "") or row.get("LINE顯示名稱", "") or "",
+        "relation": row.get("關係", "") or row.get("家長關係", "") or "家長/監護人",
+        "active": "是" if _truthy_binding(row.get("啟用"), True) else "否",
+        "notify": "是" if _truthy_binding(row.get("家長提醒"), True) else "否",
+    }
+
+
+def _upsert_students_from_excel(cur, rows: list[dict[str, Any]]) -> set[int]:
+    affected: set[int] = set()
+    for raw in rows:
+        row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
+        code = row.get("學生編號", "") or row.get("學生ID", "") or row.get("student_code", "")
+        name = row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", "")
+        qr_token = row.get("簽到識別碼", "") or row.get("QR Token", "") or row.get("qr_token", "")
+        if not code or not name:
+            continue
+        cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
+        student = cur.fetchone()
+        if student:
+            sid = student["id"]
+            if qr_token:
+                cur.execute(
+                    "UPDATE students SET name=%s,qr_token=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
+                    (name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
+                )
+            else:
+                cur.execute(
+                    "UPDATE students SET name=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
+                    (name, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
+                )
+        else:
+            if not qr_token:
+                qr_token = f"ATT-{secrets.token_urlsafe(12)}"
+            cur.execute(
+                "INSERT INTO students(student_code,name,qr_token,checkin_enabled,notify_checkin_enabled,notify_checkout_enabled,notify_exception_enabled) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (code, name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True)),
+            )
+            sid = cur.fetchone()["id"]
+        affected.add(sid)
+    return affected
+
+
+def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set[int]]:
+    imported = 0
+    affected: set[int] = set()
+    for raw_row in rows:
+        row = _normalize_binding_row(raw_row)
+        if not row["line_user_id"] or (not row["student_code"] and not row["student_name"]):
+            continue
+        if row["student_code"]:
+            cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (row["student_code"],))
+        else:
+            cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (row["student_name"],))
+        matches = cur.fetchall()
+        if len(matches) != 1:
+            continue
+        student = matches[0]
+        active = row["active"] == "是"
+        notify = row["notify"] == "是"
+        cur.execute("SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s", (student["id"], row["line_user_id"]))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                "UPDATE student_line_bindings SET display_name=%s,relation=%s,active=%s,notify_enabled=%s WHERE id=%s",
+                (row["display_name"] or None, row["relation"], active, notify, existing["id"]),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,notify_enabled,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,%s,'EXCEL')",
+                (student["id"], row["line_user_id"], row["display_name"] or None, row["relation"], active, notify, now_local()),
+            )
+        affected.add(student["id"])
+        imported += 1
+    for sid in affected:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM student_line_bindings WHERE student_id=%s AND active=TRUE AND notify_enabled=TRUE) AS enabled",
+            (sid,),
+        )
+        enabled = bool(cur.fetchone()["enabled"])
+        cur.execute("UPDATE students SET parent_notify_enabled=%s WHERE id=%s", (enabled, sid))
+        cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1", (sid,))
+        primary = cur.fetchone()
+        cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (primary["line_user_id"] if primary else None, sid))
+    return imported, affected
+
+
+def _xlsx_col_index(ref: str) -> int:
+    letters = "".join(ch for ch in ref if ch.isalpha())
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        ns_pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+        wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+        rel_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        rels = {r.attrib.get("Id"): r.attrib.get("Target") for r in rel_root}
+        sheet_target = None
+        for sh in wb_root.findall(f"{{{ns_main}}}sheets/{{{ns_main}}}sheet"):
+            if sh.attrib.get("name") == target_name:
+                rid = sh.attrib.get(f"{{{ns_rel}}}id")
+                sheet_target = rels.get(rid)
+                break
+        if not sheet_target:
+            return []
+        if sheet_target.startswith("/"):
+            sheet_path = sheet_target.lstrip("/")
+        elif sheet_target.startswith("xl/"):
+            sheet_path = sheet_target
+        else:
+            sheet_path = "xl/" + sheet_target
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            ss_root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in ss_root.findall(f"{{{ns_main}}}si"):
+                shared.append("".join((t.text or "") for t in si.iter(f"{{{ns_main}}}t")))
+        root = ET.fromstring(z.read(sheet_path))
+        data = root.find(f"{{{ns_main}}}sheetData")
+        matrix: list[dict[int,str]] = []
+        max_col = -1
+        if data is not None:
+            for row_el in data.findall(f"{{{ns_main}}}row"):
+                row_map: dict[int,str] = {}
+                for cell in row_el.findall(f"{{{ns_main}}}c"):
+                    ref = cell.attrib.get("r", "")
+                    idx = _xlsx_col_index(ref)
+                    typ = cell.attrib.get("t")
+                    value = ""
+                    if typ == "inlineStr":
+                        value = "".join((t.text or "") for t in cell.iter(f"{{{ns_main}}}t"))
+                    else:
+                        v = cell.find(f"{{{ns_main}}}v")
+                        value = v.text if v is not None and v.text is not None else ""
+                        if typ == "s" and value.isdigit() and int(value) < len(shared):
+                            value = shared[int(value)]
+                    row_map[idx] = value
+                    max_col = max(max_col, idx)
+                matrix.append(row_map)
+        if not matrix:
+            return []
+        # 有些 Excel 工作表第一列是標題（例如「聯絡人｜V4 正式資料＋綁定」），
+        # 因此不要硬把第 1 列當欄位名稱；改找出包含關鍵欄位的標題列。
+        header_idx = 0
+        known_headers = {
+            "學生編號", "學生姓名", "姓名", "身分", "學生姓名/關聯（可多位）",
+            "學生姓名/關聯", "LINE User ID", "LINE ID", "LINE_ID", "關係",
+            "家長提醒", "啟用", "簽到識別碼"
+        }
+        best_score = -1
+        for i, row in enumerate(matrix[:10]):
+            vals = {str(v).strip() for v in row.values() if str(v).strip()}
+            score = len(vals & known_headers)
+            if score > best_score and score >= 2:
+                best_score = score
+                header_idx = i
+        headers = [matrix[header_idx].get(i, "").strip() for i in range(max_col + 1)]
+        out = []
+        for row in matrix[header_idx + 1:]:
+            obj = {headers[i]: row.get(i, "") for i in range(len(headers)) if headers[i]}
+            if any(str(v).strip() for v in obj.values()):
+                out.append(obj)
+        return out
+
+
+
+def _parse_excel_date_value(value: Any) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # 支援 Excel serial date（1900 date system）與常見文字格式。
+    try:
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            serial = float(text)
+            if serial > 30000:
+                return (date(1899, 12, 30) + timedelta(days=int(serial)))
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _weekday_index(value: Any, fallback: date) -> int:
+    text = str(value or "").strip()
+    mapping = {"一":0,"二":1,"三":2,"四":3,"五":4,"六":5,"日":6,"天":6,
+               "星期一":0,"星期二":1,"星期三":2,"星期四":3,"星期五":4,"星期六":5,"星期日":6,"星期天":6}
+    if text in mapping:
+        return mapping[text]
+    return fallback.weekday()
+
+
+def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[int, int, list[str]]:
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    parsed_rows: list[dict[str, Any]] = []
+    dates: set[date] = set()
+    for i, raw in enumerate(rows, start=2):
+        row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
+        actual_id = row.get("Course ID", "") or row.get("課程ID", "")
+        course_date = _parse_excel_date_value(row.get("課程日期") or row.get("日期"))
+        student_code = row.get("學生編號", "") or row.get("學生ID", "")
+        student_name = row.get("學生", "") or row.get("學生姓名", "") or row.get("姓名", "")
+        time_text = row.get("上課時間", "") or row.get("課程時間", "") or ""
+        start_time = row.get("開始時間", "") or row.get("開始", "") or ""
+        end_time = row.get("下課時間", "") or row.get("結束時間", "") or row.get("結束", "") or ""
+        if not start_time and time_text:
+            m = re.search(r"(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})", time_text)
+            if m:
+                start_time, end_time = m.group(1), m.group(2)
+            else:
+                start_time = time_text
+        if not actual_id or not course_date or not student_name or not start_time:
+            skipped += 1
+            if any(row.values()):
+                errors.append(f"第 {i} 列缺少 Course ID／日期／學生／上課時間，已略過。")
+            continue
+        # 若「上課時間」只有開始時間，仍可建立到班課程；離班/未離班判斷會在後台標記缺少下課時間。
+        try:
+            parse_hhmm(start_time, course_date)
+            if end_time:
+                parse_hhmm(end_time, course_date)
+        except ValueError:
+            skipped += 1
+            errors.append(f"第 {i} 列時間格式錯誤：{start_time}-{end_time}。")
+            continue
+        if student_code:
+            cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (student_code,))
+            matches = cur.fetchall()
+        else:
+            cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
+            matches = cur.fetchall()
+        if len(matches) != 1:
+            skipped += 1
+            errors.append(f"第 {i} 列學生「{student_name}」無法唯一對應（找到 {len(matches)} 位）。")
+            continue
+        student_id = matches[0]["id"]
+        parsed_rows.append({
+            "actual_id": actual_id,
+            "course_date": course_date,
+            "student_id": student_id,
+            "student_name": student_name,
+            "weekday": _weekday_index(row.get("星期"), course_date),
+            "start_time": start_time,
+            "end_time": end_time,
+            "course_name": row.get("課程", "") or "未命名課程",
+            "teacher_name": row.get("老師", ""),
+            "source_note": "；".join([x for x in [row.get("來源", ""), row.get("固定課表ID", ""), row.get("調課ID", ""), row.get("調課結果", ""), row.get("備註", "")] if x]),
+        })
+        dates.add(course_date)
+
+    # 以「實際課程」為該日期唯一來源：該日期原本同步進來的課程先停用，再寫入新快照。
+    for d in dates:
+        cur.execute("UPDATE courses SET active=FALSE WHERE actual_course_id IS NOT NULL AND course_date=%s", (d,))
+
+    for r in parsed_rows:
+        cur.execute("SELECT id FROM courses WHERE actual_course_id=%s", (r["actual_id"],))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute(
+                """UPDATE courses SET student_id=%s,course_name=%s,teacher_name=%s,weekday=%s,start_time=%s,end_time=%s,
+                   late_grace_minutes=%s,checkout_grace_minutes=%s,active=TRUE,course_date=%s,source='實際課程',source_note=%s
+                   WHERE id=%s""",
+                (r["student_id"],r["course_name"],r["teacher_name"] or None,r["weekday"],r["start_time"],r["end_time"],
+                 DEFAULT_LATE_GRACE_MINUTES,DEFAULT_CHECKOUT_GRACE_MINUTES,r["course_date"],r["source_note"] or None,existing["id"]),
+            )
+        else:
+            cur.execute(
+                """INSERT INTO courses(student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,
+                   active,actual_course_id,course_date,source,source_note)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,'實際課程',%s)""",
+                (r["student_id"],r["course_name"],r["teacher_name"] or None,r["weekday"],r["start_time"],r["end_time"],
+                 DEFAULT_LATE_GRACE_MINUTES,DEFAULT_CHECKOUT_GRACE_MINUTES,r["actual_id"],r["course_date"],r["source_note"] or None),
+            )
+        imported += 1
+    return imported, skipped, errors
 
 
 @app.post("/admin/line/import.csv")
 async def import_line_bindings(file: UploadFile = File(...), _: str = Depends(admin_auth)):
     raw = await file.read()
-    text = raw.decode("utf-8-sig")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "CSV 必須使用 UTF-8 編碼。")
     reader = csv.DictReader(io.StringIO(text))
-    required = {"學生編號","LINE User ID"}
-    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-        raise HTTPException(400, "CSV 欄位不完整，至少需要：學生編號、LINE User ID")
-    allowed_true = {"是","啟用","1","true","TRUE","yes","Y","y"}
-    imported=0
+    rows = list(reader)
     with db_conn() as conn:
         with conn.cursor() as cur:
-            for raw_row in reader:
-                row={str(k).strip(): (str(v).strip() if v is not None else "") for k,v in raw_row.items()}
-                student_code=row.get("學生編號", "")
-                line_user_id=row.get("LINE User ID", "")
-                if not student_code or not line_user_id:
-                    continue
-                cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (student_code,))
-                student=cur.fetchone()
-                if not student:
-                    continue
-                display_name=row.get("LINE 顯示名稱") or None
-                relation=row.get("關係") or "家長/監護人"
-                active=row.get("啟用", "是") in allowed_true
-                cur.execute("SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s", (student["id"], line_user_id))
-                b=cur.fetchone()
-                if b:
-                    cur.execute("UPDATE student_line_bindings SET display_name=%s,relation=%s,active=%s WHERE id=%s", (display_name,relation,active,b["id"]))
-                else:
-                    cur.execute("INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,'EXCEL')", (student["id"],line_user_id,display_name,relation,active,now_local()))
-                # 每次匯入後重新整理 students.line_user_id 相容欄位，避免停用後仍誤發通知。
-                cur.execute(
-                    "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1",
-                    (student["id"],),
-                )
-                primary = cur.fetchone()
-                cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (primary["line_user_id"] if primary else None, student["id"]))
-                imported += 1
+            imported, _ = _upsert_line_binding_rows(cur, rows)
+            conn.commit()
+    return RedirectResponse(f"/admin/line?imported={imported}", status_code=303)
+
+
+@app.post("/admin/line/import.xlsx")
+async def import_line_master_xlsx(file: UploadFile = File(...), _: str = Depends(admin_auth)):
+    raw = await file.read()
+    if not raw.startswith(b"PK"):
+        raise HTTPException(400, "這不是有效的 .xlsx 檔案。")
+    try:
+        student_rows = _xlsx_read_sheet(raw, "出勤學生")
+        binding_rows = _xlsx_read_sheet(raw, "出勤LINE綁定")
+        contact_rows = _xlsx_read_sheet(raw, "聯絡人")
+        actual_course_rows = _xlsx_read_sheet(raw, "實際課程")
+        reminder_rows = _xlsx_read_sheet(raw, "課程提醒")
+    except Exception as exc:
+        raise HTTPException(400, f"讀取 Excel 失敗：{exc}") from exc
+
+    actual_imported = actual_skipped = binding_imported = 0
+    errors: list[str] = []
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            _upsert_students_from_excel(cur, student_rows)
+            if actual_course_rows:
+                actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
+            if binding_rows:
+                binding_imported, _ = _upsert_line_binding_rows(cur, binding_rows)
+            # 相容目前 V4 總表的「聯絡人」格式：家長可在「學生姓名/關聯」放多位學生，以「、」分隔。
+            if binding_imported == 0 and contact_rows:
+                fallback_rows = []
+                for r in contact_rows:
+                    role = str(r.get("身分", "")).strip()
+                    line_id = str(r.get("LINE User ID", "") or r.get("LINE ID", "") or r.get("LINE_ID", "")).strip()
+                    person = str(r.get("姓名", "")).strip()
+                    related = str(r.get("學生姓名/關聯（可多位）", "") or r.get("學生姓名/關聯", "")).strip()
+                    if role != "家長" or not line_id or not related:
+                        continue
+                    for student_name in [x.strip() for x in related.replace("，", "、").split("、") if x.strip()]:
+                        fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
+                binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
+            conn.commit()
+
+    if actual_imported == 0 and not student_rows and not binding_rows and not contact_rows and not actual_course_rows and not reminder_rows:
+        raise HTTPException(400, "Excel 找不到可同步的資料。請確認包含「實際課程」、「出勤學生」、「出勤LINE綁定」或「聯絡人」工作表。")
+
+    msg = f"actual={actual_imported}; skipped={actual_skipped}; binding={binding_imported}"
+    if errors:
+        msg += "&errors=" + str(len(errors))
+    return RedirectResponse(f"/admin/line?imported={binding_imported}&actual_imported={actual_imported}&actual_skipped={actual_skipped}&errors={len(errors)}&source=xlsx", status_code=303)
+
+
+@app.post("/admin/student/{student_id}/binding/{binding_id}/toggle-notify")
+def toggle_binding_notify(student_id: int, binding_id: int, _: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE student_line_bindings SET notify_enabled=NOT notify_enabled WHERE id=%s AND student_id=%s", (binding_id, student_id))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "找不到 LINE 綁定")
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM student_line_bindings WHERE student_id=%s AND active=TRUE AND notify_enabled=TRUE) AS enabled",
+                (student_id,),
+            )
+            enabled = bool(cur.fetchone()["enabled"])
+            cur.execute("UPDATE students SET parent_notify_enabled=%s WHERE id=%s", (enabled, student_id))
             conn.commit()
     return RedirectResponse("/admin/line", status_code=303)
 
@@ -1900,6 +2332,17 @@ def qr(student_code: str):
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
 
+@app.post("/admin/student/{student_id}/qr-regenerate")
+def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
+    new_token = secrets.token_urlsafe(18)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE students SET qr_token=%s WHERE id=%s AND active=TRUE", (new_token, student_id))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "找不到學生")
+            conn.commit()
+    return RedirectResponse("/admin", status_code=303)
+
 
 @app.get("/scan/{token}", response_class=HTMLResponse)
 def scan(token: str, request: Request):
@@ -1929,8 +2372,8 @@ def admin_devices(_: str = Depends(admin_auth)):
         status = "啟用" if d["active"] else "停用"
         label = "停用" if d["active"] else "啟用"
         rows.append(f"<tr><td>{escape(d['name'])}</td><td>{status}</td><td>{d['created_at']}</td><td>{d['last_used_at'] or '-'}</td><td><form method='post' action='/admin/device/{d['id']}/toggle'><button class='btn btn2 mini'>{label}</button></form></td></tr>")
-    body = f"<div class='top'><div><h1>教室簽到設備</h1><div class='muted'>只有已配對的手機／電腦瀏覽器才能完成學生 QR 簽到。</div></div>{admin_nav()}</div>"
-    body += "<section><h2>建立設備配對</h2><form method='post' action='/admin/devices/new'><label>設備名稱 <input class='wide' name='name' value='教室手機' required></label> <button>產生 30 分鐘配對連結＋QR</button></form><p class='mini muted'>這裡就是設備配對連結的管理位置。管理員產生後，教室手機直接掃 QR 即可，不需要另外填 Render 環境變數或手動輸入 code；配對成功後這條連結立即失效。</p></section>"
+    body = f"<div class='top'><div><h1>教室簽到設備</h1><div class='muted'>只有已配對的教室手機（或教室電腦瀏覽器）才能完成學生 QR 簽到。一般家長／學生自己的手機即使拿到 QR，也不能直接簽到。</div></div>{admin_nav()}</div>"
+    body += "<section><h2>建立設備配對</h2><form method='post' action='/admin/devices/new'><label>設備名稱 <input class='wide' name='name' value='教室手機' required></label> <button>產生 30 分鐘設備配對連結＋QR</button></form><p class='mini muted'>這裡就是設備配對連結的管理位置。管理員產生後，教室手機直接掃 QR 即可，不需要另外填 Render 環境變數或手動輸入 code；教室手機開啟連結後還要按「確認配對」，確認後這條連結才失效。</p></section>"
     body += "<section><h2>已授權設備</h2><table><tr><th>設備</th><th>狀態</th><th>建立時間</th><th>最後使用</th><th>操作</th></tr>"+"".join(rows)+"</table></section>"
     return page("教室簽到設備", body)
 
@@ -1963,16 +2406,32 @@ def toggle_device(device_id: int, _: str = Depends(admin_auth)):
 
 @app.get("/device/pair", response_class=HTMLResponse)
 def device_pair(code: str):
-    raw_token, name = pair_device(code)
+    pair = device_pair_info(code)
+    body = (
+        f"<section style='max-width:560px;margin:40px auto;text-align:center'>"
+        f"<h1>教室設備配對</h1>"
+        f"<p>即將配對設備：<b>{escape(pair['name'])}</b></p>"
+        f"<p>此配對連結有效至：<b>{pair['expires_at']:%Y-%m-%d %H:%M}</b>（台灣時間）</p>"
+        f"<div class='alert'>請確認現在使用的就是放在教室、專門用來掃學生 QR 的手機。</div>"
+        f"<form method='post' action='/device/pair/confirm'><input type='hidden' name='code' value='{escape(code)}'><button>確認配對這支手機</button></form>"
+        f"<p class='mini muted'>這一步是為了避免手機瀏覽器或 QR 預覽工具自動開啟連結時，意外消耗配對碼。</p>"
+        f"</section>"
+    )
+    return page("教室設備配對", body)
+
+
+@app.post("/device/pair/confirm", response_class=HTMLResponse)
+def device_pair_confirm(code: str = Form(...)):
+    raw_token, name = confirm_device_pair(code.strip())
     response = RedirectResponse("/device", status_code=303)
-    response.set_cookie(DEVICE_COOKIE_NAME, raw_token, httponly=True, secure=True, samesite="lax", max_age=60*60*24*30)
+    response.set_cookie(DEVICE_COOKIE_NAME, raw_token, httponly=True, secure=True, samesite="lax", max_age=60*60*24*30, path="/")
     return response
 
 
 @app.get("/device", response_class=HTMLResponse)
 def device_home(request: Request):
     device = require_checkin_device(request)
-    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>現在可以用手機內建相機掃描學生 QR。請固定使用目前這個瀏覽器。</p><p class='mini muted'>如果清除 Cookie、換瀏覽器或換手機，需要重新配對。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
+    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>現在可以用這支教室手機的內建相機掃描學生 QR。這就是正式的教室簽到設備，不需要電腦。</p><p class='mini muted'>如果清除瀏覽器 Cookie、換瀏覽器或換手機，需要重新配對；只要這支手機的這個瀏覽器保持登入配對即可。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
     return page("教室簽到設備", body)
 
 
@@ -1980,18 +2439,18 @@ def device_home(request: Request):
 def export_csv(_: str = Depends(admin_auth)):
     buf = io.StringIO(); buf.write("\ufeff")
     writer = csv.writer(buf)
-    writer.writerow(["紀錄ID","日期","學生編號","學生姓名","課程","老師","預定開始","預定結束","到班","離班","狀態","狀態代碼","遲到分鐘","校正備註","校正時間","校正者"])
+    writer.writerow(["紀錄ID","日期","學生編號","學生姓名","Actual Course ID","課程","老師","預定開始","預定結束","到班","離班","狀態","狀態代碼","遲到分鐘","校正備註","校正時間","校正者"])
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT a.id,a.date,s.student_code,s.name,c.course_name,c.teacher_name,c.start_time,c.end_time,a.check_in_time,a.check_out_time,a.status,a.late_minutes,a.manual_note,a.adjusted_at,a.adjusted_by
+                SELECT a.id,a.date,s.student_code,s.name,c.actual_course_id,c.course_date,c.course_name,c.teacher_name,c.start_time,c.end_time,a.check_in_time,a.check_out_time,a.status,a.late_minutes,a.manual_note,a.adjusted_at,a.adjusted_by
                 FROM attendance a JOIN students s ON s.id=a.student_id LEFT JOIN courses c ON c.id=a.course_id
                 ORDER BY a.date DESC,a.id DESC
                 """
             )
             for r in cur.fetchall():
-                writer.writerow([r[k] for k in ["id","date","student_code","name","course_name","teacher_name","start_time","end_time","check_in_time","check_out_time"]] + [status_label(r["status"]), r["status"], r["late_minutes"], r["manual_note"], r["adjusted_at"], r["adjusted_by"]])
+                writer.writerow([r[k] for k in ["id","date","student_code","name","actual_course_id","course_name","teacher_name","start_time","end_time","check_in_time","check_out_time"]] + [status_label(r["status"]), r["status"], r["late_minutes"], r["manual_note"], r["adjusted_at"], r["adjusted_by"]])
     data = buf.getvalue().encode("utf-8-sig")
     return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=attendance_test_export.csv"})
 
@@ -2015,4 +2474,4 @@ async def line_webhook(request: Request):
 
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.0"})
+    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.5"})
