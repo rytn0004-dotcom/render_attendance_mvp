@@ -41,7 +41,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.0")
+app = FastAPI(title="Attendance Test MVP v0.4.1")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -99,6 +99,14 @@ def notification_type_label(value: str | None) -> str:
 
 def notify_status_label(value: str | None) -> str:
     return NOTIFY_STATUS_LABELS.get(value or "", value or "")
+
+
+def qr_data_uri(text: str) -> str:
+    """Generate an inline QR image for admin pages without exposing a separate QR route."""
+    img = qrcode.make(text)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def now_local() -> datetime:
@@ -1174,7 +1182,7 @@ def dashboard(_: str = Depends(admin_auth)):
     checks = run_all_checks()
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.4.0</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.4.1</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
     ]
     with db_conn() as conn:
@@ -1672,7 +1680,17 @@ def admin_line(_: str = Depends(admin_auth)):
             for b in binds
         ) or "尚未綁定"
         test_btn = f"<form method='post' action='/admin/test-line/{s['id']}'><button>測試 LINE</button></form>" if binds or s.get('line_user_id') else "尚未綁定"
-        linkbox = f"<textarea rows='2' style='width:100%' readonly>{escape(link)}</textarea><div class='mini muted'>有效至 {expires:%Y-%m-%d %H:%M}（台灣時間）</div><form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>重新產生連結</button></form>" if link else "尚未設定 LIFF_ID"
+        if link:
+            qr_src = qr_data_uri(link)
+            linkbox = (
+                f"<div style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>"
+                f"<img class='qr' src='{qr_src}' alt='家長綁定 QR'>"
+                f"<div style='flex:1;min-width:260px'><textarea rows='2' style='width:100%' readonly>{escape(link)}</textarea>"
+                f"<div class='mini muted'>有效至 {expires:%Y-%m-%d %H:%M}（台灣時間）</div>"
+                f"<form method='post' action='/admin/student/{s['id']}/binding-link'><button class='btn btn2 mini'>重新產生連結＋QR</button></form></div></div>"
+            )
+        else:
+            linkbox = "尚未設定 LIFF_ID"
         cards.append(
             f"<tr><td>{escape(s['name'])}<br><span class='muted mini'>{escape(s['student_code'])}</span></td>"
             f"<td>{bind_text}</td><td>{linkbox}</td><td>{test_btn}</td></tr>"
@@ -1704,7 +1722,16 @@ def generate_binding_link(student_id:int, admin_user: str=Depends(admin_auth)):
     if not link:
         body = f"<section><h1>無法產生綁定連結</h1><div class='alert danger'>尚未設定 LIFF_ID。請先在 Render Environment Variables 設定 LIFF_ID。</div><a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
     else:
-        body = f"<section><h1>家長綁定連結</h1><p>學生：<b>{escape(student['name'])}</b>（{escape(student['student_code'])}）</p><p>有效期限：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p><p>此連結在有效期限內可供多位家長使用；例如同一學生的爸爸、媽媽可以使用同一條連結完成綁定。若一個 LINE 有多位孩子，請分別開啟各學生的連結。</p><p><textarea rows='4' style='width:100%' readonly>{escape(link)}</textarea></p><p><a class='btn' href='{escape(link)}' target='_blank'>開啟綁定頁</a> <a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></p></section>"
+        qr_src = qr_data_uri(link)
+        body = (
+            f"<section><h1>家長綁定連結</h1><p>學生：<b>{escape(student['name'])}</b>（{escape(student['student_code'])}）</p>"
+            f"<p>有效期限：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p>"
+            f"<div style='display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin:18px 0'>"
+            f"<img class='qr' src='{qr_src}' alt='家長綁定 QR' style='width:180px;height:180px'>"
+            f"<div style='flex:1;min-width:280px'><p>家長可以直接掃描 QR，也可以點擊下方連結。此連結在有效期限內可供多位家長使用；若一個 LINE 有多位孩子，請分別使用各學生的連結。</p>"
+            f"<textarea rows='4' style='width:100%' readonly>{escape(link)}</textarea></div></div>"
+            f"<p><a class='btn' href='{escape(link)}' target='_blank'>開啟綁定頁</a> <a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></p></section>"
+        )
     return page("家長綁定連結", body)
 
 
@@ -1903,7 +1930,7 @@ def admin_devices(_: str = Depends(admin_auth)):
         label = "停用" if d["active"] else "啟用"
         rows.append(f"<tr><td>{escape(d['name'])}</td><td>{status}</td><td>{d['created_at']}</td><td>{d['last_used_at'] or '-'}</td><td><form method='post' action='/admin/device/{d['id']}/toggle'><button class='btn btn2 mini'>{label}</button></form></td></tr>")
     body = f"<div class='top'><div><h1>教室簽到設備</h1><div class='muted'>只有已配對的手機／電腦瀏覽器才能完成學生 QR 簽到。</div></div>{admin_nav()}</div>"
-    body += "<section><h2>建立設備配對</h2><form method='post' action='/admin/devices/new'><label>設備名稱 <input class='wide' name='name' value='教室手機' required></label> <button>產生 30 分鐘配對連結</button></form><p class='mini muted'>在教室實際要掃學生 QR 的手機瀏覽器開啟配對連結；配對後連結立即失效。</p></section>"
+    body += "<section><h2>建立設備配對</h2><form method='post' action='/admin/devices/new'><label>設備名稱 <input class='wide' name='name' value='教室手機' required></label> <button>產生 30 分鐘配對連結＋QR</button></form><p class='mini muted'>這裡就是設備配對連結的管理位置。管理員產生後，教室手機直接掃 QR 即可，不需要另外填 Render 環境變數或手動輸入 code；配對成功後這條連結立即失效。</p></section>"
     body += "<section><h2>已授權設備</h2><table><tr><th>設備</th><th>狀態</th><th>建立時間</th><th>最後使用</th><th>操作</th></tr>"+"".join(rows)+"</table></section>"
     return page("教室簽到設備", body)
 
@@ -1912,7 +1939,16 @@ def admin_devices(_: str = Depends(admin_auth)):
 def admin_new_device(name: str = Form("教室手機"), _: str = Depends(admin_auth)):
     pair_token, expires, _device_id = create_device_pairing(name)
     link = f"{public_base_url()}/device/pair?code={pair_token}"
-    body = f"<section><h1>設備配對連結</h1><p>設備：<b>{escape(name.strip() or '教室手機')}</b></p><p>有效至：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p><textarea rows='3' style='width:100%' readonly>{escape(link)}</textarea><p>請只在教室要用來掃學生 QR 的手機／電腦瀏覽器開啟。配對後這條連結立即失效。</p><p><a class='btn' href='{escape(link)}' target='_blank'>在本機開啟配對</a> <a class='btn btn2' href='/admin/devices'>返回</a></p></section>"
+    qr_src = qr_data_uri(link)
+    body = (
+        f"<section><h1>設備配對</h1><p>設備：<b>{escape(name.strip() or '教室手機')}</b></p>"
+        f"<p>有效至：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p>"
+        f"<div style='display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin:18px 0'>"
+        f"<img class='qr' src='{qr_src}' alt='設備配對 QR' style='width:180px;height:180px'>"
+        f"<div style='flex:1;min-width:280px'><p><b>設備配對 code 不需要另外填到 Render。</b><br>它就在下方連結的 <code>code=...</code> 中。教室手機直接掃左側 QR 即可完成配對；成功後此 code 立即失效。</p>"
+        f"<textarea rows='3' style='width:100%' readonly>{escape(link)}</textarea></div></div>"
+        f"<p><a class='btn' href='{escape(link)}' target='_blank'>在本機開啟配對</a> <a class='btn btn2' href='/admin/devices'>返回</a></p></section>"
+    )
     return page("設備配對", body)
 
 
