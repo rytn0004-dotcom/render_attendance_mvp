@@ -36,11 +36,12 @@ RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "test1234")
+DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.3.2")
+app = FastAPI(title="Attendance Test MVP v0.4.0")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -280,6 +281,23 @@ def init_db() -> None:
                     error_message TEXT,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS checkin_devices (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS device_pair_tokens (
+                    id BIGSERIAL PRIMARY KEY,
+                    device_id BIGINT NOT NULL REFERENCES checkin_devices(id) ON DELETE CASCADE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TIMESTAMP NOT NULL,
+                    used_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_device_pair_tokens_lookup ON device_pair_tokens(token_hash, expires_at);
                 CREATE TABLE IF NOT EXISTS notification_templates (
                     id BIGSERIAL PRIMARY KEY,
                     notification_type TEXT NOT NULL,
@@ -326,29 +344,30 @@ def init_db() -> None:
 
 
 def seed_demo_data(cur) -> None:
-    cur.execute("SELECT COUNT(*) AS c FROM students")
-    if cur.fetchone()["c"]:
-        return
-    demo = [("STU-000001", "王小明"), ("STU-000002", "林小華"), ("STU-000003", "陳小美")]
-    for code, name in demo:
-        cur.execute(
-            "INSERT INTO students(student_code, name, qr_token) VALUES (%s,%s,%s)",
-            (code, name, secrets.token_urlsafe(18)),
-        )
-    cur.execute("SELECT id FROM students ORDER BY id")
-    students = cur.fetchall()
-    times = [("18:00", "19:30"), ("18:30", "20:00"), ("19:00", "20:30")]
-    for idx, row in enumerate(students):
-        start, end = times[idx % len(times)]
-        # 每天都 seed，讓測試任何一天都能直接掃。
-        for weekday in range(7):
+    demo = [
+        ("STU-000001", "王小明", "18:00", "19:30"),
+        ("STU-000002", "林小華", "18:30", "20:00"),
+        ("STU-000003", "陳小美", "19:00", "20:30"),
+        ("STU-000004", "采璇", "19:00", "20:30"),
+    ]
+    for code, name, start, end in demo:
+        cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
+        row = cur.fetchone()
+        if not row:
             cur.execute(
-                """
-                INSERT INTO courses(student_id, course_name, teacher_name, weekday, start_time, end_time, late_grace_minutes, checkout_grace_minutes)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (row["id"], "測試課程", "測試老師", weekday, start, end, DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES),
+                "INSERT INTO students(student_code, name, qr_token) VALUES (%s,%s,%s) RETURNING id",
+                (code, name, secrets.token_urlsafe(18)),
             )
+            row = cur.fetchone()
+        student_id = row["id"]
+        cur.execute("SELECT COUNT(*) AS c FROM courses WHERE student_id=%s", (student_id,))
+        if cur.fetchone()["c"] == 0:
+            for weekday in range(7):
+                cur.execute(
+                    """INSERT INTO courses(student_id, course_name, teacher_name, weekday, start_time, end_time, late_grace_minutes, checkout_grace_minutes)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (student_id, "測試課程", "測試老師", weekday, start, end, DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES),
+                )
 
 
 def seed_notification_templates(cur) -> None:
@@ -473,6 +492,63 @@ def send_student_template_line(cur, attendance_id: int | None, student: dict[str
     if any(results):
         consume_one_time_template(cur, template_row)
     return bool(results) and all(results)
+
+
+def hash_device_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_device_pairing(name: str) -> tuple[str, datetime, int]:
+    device_raw_token = secrets.token_urlsafe(32)
+    pair_token = secrets.token_urlsafe(24)
+    expires = now_local() + timedelta(minutes=30)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO checkin_devices(name,token_hash,active) VALUES (%s,%s,TRUE) RETURNING id",
+                (name.strip() or "教室設備", hash_device_token(device_raw_token)),
+            )
+            device_id = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO device_pair_tokens(device_id,token_hash,expires_at) VALUES (%s,%s,%s)",
+                (device_id, hash_device_token(pair_token), expires),
+            )
+            conn.commit()
+    return pair_token, expires, device_id
+
+
+def require_checkin_device(request: Request) -> dict[str, Any]:
+    raw = request.cookies.get(DEVICE_COOKIE_NAME)
+    if not raw:
+        raise HTTPException(status_code=403, detail="此頁面只能由已授權的教室簽到設備使用。請先在管理後台建立設備配對。")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,active FROM checkin_devices WHERE token_hash=%s", (hash_device_token(raw),))
+            device = cur.fetchone()
+            if not device or not device["active"]:
+                raise HTTPException(status_code=403, detail="此設備尚未授權或已停用，請聯絡管理員重新配對。")
+            cur.execute("UPDATE checkin_devices SET last_used_at=%s WHERE id=%s", (now_local(), device["id"]))
+            conn.commit()
+            return device
+
+
+def pair_device(pair_token: str) -> tuple[str, str]:
+    device_raw_token = secrets.token_urlsafe(32)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT p.id,p.device_id,d.name,d.active AS device_active
+                   FROM device_pair_tokens p JOIN checkin_devices d ON d.id=p.device_id
+                   WHERE p.token_hash=%s AND p.used_at IS NULL AND p.expires_at>%s""",
+                (hash_device_token(pair_token), now_local()),
+            )
+            pair = cur.fetchone()
+            if not pair or not pair["device_active"]:
+                raise HTTPException(status_code=400, detail="設備配對連結無效、已使用或已過期。請由管理員重新產生。")
+            cur.execute("UPDATE checkin_devices SET token_hash=%s,active=TRUE WHERE id=%s", (hash_device_token(device_raw_token), pair["device_id"]))
+            cur.execute("UPDATE device_pair_tokens SET used_at=%s WHERE id=%s", (now_local(), pair["id"]))
+            conn.commit()
+            return device_raw_token, pair["name"]
 
 
 def get_student(cur, token: str):
@@ -1085,7 +1161,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>課程時間</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>課程時間</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1098,7 +1174,7 @@ def dashboard(_: str = Depends(admin_auth)):
     checks = run_all_checks()
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.3.2</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.4.0</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
     ]
     with db_conn() as conn:
@@ -1799,7 +1875,8 @@ def qr(student_code: str):
 
 
 @app.get("/scan/{token}", response_class=HTMLResponse)
-def scan(token: str):
+def scan(token: str, request: Request):
+    require_checkin_device(request)
     result = scan_student(token)
     kind = result.get("kind")
     if kind == "check_in":
@@ -1812,6 +1889,55 @@ def scan(token: str):
         title = result.get("message", "系統訊息"); icon = "⚠️"; detail = ""
     body = f"<div style='max-width:540px;margin:60px auto;background:white;border-radius:16px;padding:28px;text-align:center;box-shadow:0 4px 20px #0001'><div style='font-size:30px'>{icon}</div><h1>{escape(title)}</h1><h2>{escape(result.get('student',''))}</h2><p>{escape(result.get('course',''))}</p><p>{detail}</p><p><a class='btn' href='/admin'>返回管理頁</a></p></div>"
     return page("簽到結果", body)
+
+
+@app.get("/admin/devices", response_class=HTMLResponse)
+def admin_devices(_: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,active,created_at,last_used_at FROM checkin_devices ORDER BY id DESC")
+            devices = cur.fetchall()
+    rows=[]
+    for d in devices:
+        status = "啟用" if d["active"] else "停用"
+        label = "停用" if d["active"] else "啟用"
+        rows.append(f"<tr><td>{escape(d['name'])}</td><td>{status}</td><td>{d['created_at']}</td><td>{d['last_used_at'] or '-'}</td><td><form method='post' action='/admin/device/{d['id']}/toggle'><button class='btn btn2 mini'>{label}</button></form></td></tr>")
+    body = f"<div class='top'><div><h1>教室簽到設備</h1><div class='muted'>只有已配對的手機／電腦瀏覽器才能完成學生 QR 簽到。</div></div>{admin_nav()}</div>"
+    body += "<section><h2>建立設備配對</h2><form method='post' action='/admin/devices/new'><label>設備名稱 <input class='wide' name='name' value='教室手機' required></label> <button>產生 30 分鐘配對連結</button></form><p class='mini muted'>在教室實際要掃學生 QR 的手機瀏覽器開啟配對連結；配對後連結立即失效。</p></section>"
+    body += "<section><h2>已授權設備</h2><table><tr><th>設備</th><th>狀態</th><th>建立時間</th><th>最後使用</th><th>操作</th></tr>"+"".join(rows)+"</table></section>"
+    return page("教室簽到設備", body)
+
+
+@app.post("/admin/devices/new", response_class=HTMLResponse)
+def admin_new_device(name: str = Form("教室手機"), _: str = Depends(admin_auth)):
+    pair_token, expires, _device_id = create_device_pairing(name)
+    link = f"{public_base_url()}/device/pair?code={pair_token}"
+    body = f"<section><h1>設備配對連結</h1><p>設備：<b>{escape(name.strip() or '教室手機')}</b></p><p>有效至：<b>{expires:%Y-%m-%d %H:%M}</b>（台灣時間）</p><textarea rows='3' style='width:100%' readonly>{escape(link)}</textarea><p>請只在教室要用來掃學生 QR 的手機／電腦瀏覽器開啟。配對後這條連結立即失效。</p><p><a class='btn' href='{escape(link)}' target='_blank'>在本機開啟配對</a> <a class='btn btn2' href='/admin/devices'>返回</a></p></section>"
+    return page("設備配對", body)
+
+
+@app.post("/admin/device/{device_id}/toggle")
+def toggle_device(device_id: int, _: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE checkin_devices SET active=NOT active WHERE id=%s", (device_id,))
+            conn.commit()
+    return RedirectResponse("/admin/devices", status_code=303)
+
+
+@app.get("/device/pair", response_class=HTMLResponse)
+def device_pair(code: str):
+    raw_token, name = pair_device(code)
+    response = RedirectResponse("/device", status_code=303)
+    response.set_cookie(DEVICE_COOKIE_NAME, raw_token, httponly=True, secure=True, samesite="lax", max_age=60*60*24*30)
+    return response
+
+
+@app.get("/device", response_class=HTMLResponse)
+def device_home(request: Request):
+    device = require_checkin_device(request)
+    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>現在可以用手機內建相機掃描學生 QR。請固定使用目前這個瀏覽器。</p><p class='mini muted'>如果清除 Cookie、換瀏覽器或換手機，需要重新配對。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
+    return page("教室簽到設備", body)
 
 
 @app.get("/admin/export.csv")
@@ -1853,4 +1979,4 @@ async def line_webhook(request: Request):
 
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.3.2"})
+    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.0"})
