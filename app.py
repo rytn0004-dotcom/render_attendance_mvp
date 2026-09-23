@@ -44,7 +44,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.7")
+app = FastAPI(title="Attendance Test MVP v0.4.8")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -780,7 +780,7 @@ def binding_link(token: str) -> str:
 
 def active_line_recipients(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[str]:
     cur.execute(
-        "SELECT DISTINCT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+        "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE GROUP BY line_user_id ORDER BY MIN(id)",
         (student_id,),
     )
     ids = [r["line_user_id"] for r in cur.fetchall() if r["line_user_id"]]
@@ -890,7 +890,7 @@ def unbind_line_binding(binding_id: int) -> tuple[bool, str]:
                 return False, "找不到有效的綁定。"
             cur.execute("UPDATE student_line_bindings SET active=FALSE WHERE id=%s", (binding_id,))
             # 若舊相容欄位就是被解除的帳號，清除；若還有其他綁定，改放其他有效帳號。
-            cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1", (row["student_id"],))
+            cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE GROUP BY line_user_id ORDER BY MIN(id) LIMIT 1", (row["student_id"],))
             other = cur.fetchone()
             cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (other["line_user_id"] if other else None, row["student_id"]))
             conn.commit()
@@ -1101,6 +1101,12 @@ def scan_student(token: str) -> dict[str, Any]:
 
 
 def check_scheduled_absences() -> int:
+    """自動判定未到班。
+
+    這裡可能同時被背景檢查與管理頁觸發，因此一定要鎖住 attendance
+    紀錄，並在同一個 transaction 內完成「檢查 -> 發送 -> 標記已通知」，
+    避免兩個 checker 同時看到 NULL 而重複 LINE Push。
+    """
     now = now_local()
     work_date = now.date()
     changed = 0
@@ -1124,36 +1130,52 @@ def check_scheduled_absences() -> int:
                 notify_at = start_dt + timedelta(minutes=eff["late_grace_minutes"])
                 if now < notify_at:
                     continue
+
+                # 唯一鍵為 (student_id, course_id, date)，避免併發時建立重複 attendance。
                 cur.execute(
-                    "SELECT * FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s",
-                    (course["student_id"], course["id"], work_date),
+                    """
+                    INSERT INTO attendance (student_id,course_id,date,status,updated_at)
+                    VALUES (%s,%s,%s,'absent',%s)
+                    ON CONFLICT (student_id,course_id,date) DO NOTHING
+                    RETURNING id
+                    """,
+                    (course["student_id"], course["id"], work_date, now),
                 )
-                a = cur.fetchone()
-                if a and a["check_in_time"]:
-                    continue
-                if not a:
-                    cur.execute(
-                        """
-                        INSERT INTO attendance (student_id,course_id,date,status,updated_at)
-                        VALUES (%s,%s,%s,'absent',%s) RETURNING id
-                        """,
-                        (course["student_id"], course["id"], work_date, now),
-                    )
-                    aid = cur.fetchone()["id"]
+                inserted = cur.fetchone()
+                if inserted:
+                    aid = inserted["id"]
                 else:
-                    aid = a["id"]
-                    if a["absent_notified_at"]:
+                    cur.execute(
+                        "SELECT * FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s FOR UPDATE",
+                        (course["student_id"], course["id"], work_date),
+                    )
+                    a = cur.fetchone()
+                    if not a:
                         continue
+                    if a["check_in_time"] or a["absent_notified_at"]:
+                        continue
+                    aid = a["id"]
+
+                # 新建立的紀錄也要再鎖一次，確保同一 transaction 內唯一送出。
+                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE", (aid,))
+                a = cur.fetchone()
+                if not a or a["check_in_time"] or a["absent_notified_at"]:
+                    continue
+
                 msg = absent_admin_message(course["name"], course["course_name"], eff["effective_start"], now)
                 sent = send_line(cur, aid, LINE_ADMIN_USER_ID, msg, "absent")
                 if sent:
-                    cur.execute("UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s", (now, now, aid))
-                changed += 1
+                    cur.execute(
+                        "UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s AND absent_notified_at IS NULL",
+                        (now, now, aid),
+                    )
+                    changed += cur.rowcount
             conn.commit()
     return changed
 
 
 def check_missing_checkout() -> int:
+    """自動判定未離班，使用 FOR UPDATE SKIP LOCKED 防止重複發送。"""
     now = now_local()
     work_date = now.date()
     changed = 0
@@ -1165,6 +1187,7 @@ def check_missing_checkout() -> int:
                 FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id
                 WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL
                   AND a.missing_checkout_notified_at IS NULL
+                FOR UPDATE OF a SKIP LOCKED
                 """,
                 (work_date,),
             )
@@ -1175,19 +1198,26 @@ def check_missing_checkout() -> int:
                 if not course:
                     continue
                 eff = effective_schedule(cur, course, work_date)
-                if not eff:
-                    continue
-                if not eff.get("effective_end"):
+                if not eff or not eff.get("effective_end"):
                     continue
                 end_dt = parse_hhmm(eff["effective_end"], work_date)
-                if now >= end_dt + timedelta(minutes=eff["checkout_grace_minutes"]):
-                    row = dict(row)
-                    row["effective_end"] = eff["effective_end"]
-                    msg = missing_checkout_message(row, now)
-                    sent = send_line(cur, row["id"], LINE_ADMIN_USER_ID, msg, "missing_checkout")
-                    if sent:
-                        cur.execute("UPDATE attendance SET missing_checkout_notified_at=%s, updated_at=%s WHERE id=%s", (now, now, row["id"]))
-                    changed += 1
+                if now < end_dt + timedelta(minutes=eff["checkout_grace_minutes"]):
+                    continue
+                # 再次確認尚未通知，避免同一 transaction 內其他流程已完成通知。
+                cur.execute("SELECT missing_checkout_notified_at, check_out_time FROM attendance WHERE id=%s FOR UPDATE", (row["id"],))
+                locked = cur.fetchone()
+                if not locked or locked["check_out_time"] or locked["missing_checkout_notified_at"]:
+                    continue
+                row = dict(row)
+                row["effective_end"] = eff["effective_end"]
+                msg = missing_checkout_message(row, now)
+                sent = send_line(cur, row["id"], LINE_ADMIN_USER_ID, msg, "missing_checkout")
+                if sent:
+                    cur.execute(
+                        "UPDATE attendance SET missing_checkout_notified_at=%s, updated_at=%s WHERE id=%s AND missing_checkout_notified_at IS NULL",
+                        (now, now, row["id"]),
+                    )
+                    changed += cur.rowcount
             conn.commit()
     return changed
 
@@ -1206,6 +1236,7 @@ def run_all_checks() -> dict[str, int]:
 
 
 async def periodic_checker():
+    await asyncio.to_thread(run_all_checks)
     while True:
         await asyncio.sleep(60)
         await asyncio.to_thread(run_all_checks)
@@ -1245,11 +1276,10 @@ def root(_: str = Depends(admin_auth)):
 
 @app.get("/admin", response_class=HTMLResponse)
 def dashboard(_: str = Depends(admin_auth)):
-    checks = run_all_checks()
     today = now_local().date()
     body_parts = [
         f"<div class='top'><div><h1>出勤測試系統 V0.4.7</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
-        f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
+        f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
     ]
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -1859,7 +1889,7 @@ def test_line(student_id:int, _: str=Depends(admin_auth)):
                     raise HTTPException(404, "找不到學生")
 
                 cur.execute(
-                    "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+                    "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE GROUP BY line_user_id ORDER BY MIN(id)",
                     (student_id,),
                 )
                 recipients = [r["line_user_id"] for r in cur.fetchall() if r["line_user_id"]]
@@ -2063,7 +2093,7 @@ def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set
         )
         enabled = bool(cur.fetchone()["enabled"])
         cur.execute("UPDATE students SET parent_notify_enabled=%s WHERE id=%s", (enabled, sid))
-        cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id LIMIT 1", (sid,))
+        cur.execute("SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE GROUP BY line_user_id ORDER BY MIN(id) LIMIT 1", (sid,))
         primary = cur.fetchone()
         cur.execute("UPDATE students SET line_user_id=%s WHERE id=%s", (primary["line_user_id"] if primary else None, sid))
     return imported, affected

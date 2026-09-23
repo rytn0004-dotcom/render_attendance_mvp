@@ -76,3 +76,9 @@ LINE／資料庫環境變數沿用目前 V0.4.x，不需要重新建立 PostgreS
 - `出勤學生` = 學生固定簽到識別與通知開關
 - `出勤LINE綁定` = 學生與每一位家長 LINE User ID 的關係
 - `課程提醒` = 原系統獨立通知佇列，不作為出勤時間來源
+
+
+## V0.4.8 修正
+- 自動未到班／未離班通知加入 PostgreSQL row lock 與唯一鍵併發保護，避免背景檢查重複 LINE Push。
+- 管理首頁重新整理不再直接觸發自動通知；背景檢查每 60 秒執行。
+- 修正 PostgreSQL `SELECT DISTINCT ... ORDER BY id` 測試 LINE 查詢錯誤。
