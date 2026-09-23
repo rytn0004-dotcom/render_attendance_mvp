@@ -44,7 +44,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.6")
+app = FastAPI(title="Attendance Test MVP v0.4.7")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -1248,7 +1248,7 @@ def dashboard(_: str = Depends(admin_auth)):
     checks = run_all_checks()
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.4.5</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.4.7</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查：未到 {checks['absent']} 筆、未離班 {checks['missing_checkout']} 筆。系統每 60 秒會再檢查一次。</div>",
     ]
     with db_conn() as conn:
@@ -1847,19 +1847,88 @@ def admin_unbind(student_id: int, binding_id: int, _: str=Depends(admin_auth)):
     return RedirectResponse("/admin/line", status_code=303)
 
 
-@app.post("/admin/test-line/{student_id}")
+@app.post("/admin/test-line/{student_id}", response_class=HTMLResponse)
 def test_line(student_id:int, _: str=Depends(admin_auth)):
-    now=now_local()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM students WHERE id=%s AND active=TRUE", (student_id,))
-            s=cur.fetchone()
-            if not s:
-                raise HTTPException(404,"找不到學生")
-            msg=f"🔔 LINE 連線測試\n學生：{s['name']}\n時間：{now:%H:%M:%S}\n這是一則測試通知。"
-            send_student_line(cur,None,s['id'],msg,"line_test",s['line_user_id'])
-            conn.commit()
-    return RedirectResponse("/admin/line", status_code=303)
+    now = now_local()
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM students WHERE id=%s AND active=TRUE", (student_id,))
+                s = cur.fetchone()
+                if not s:
+                    raise HTTPException(404, "找不到學生")
+
+                cur.execute(
+                    "SELECT line_user_id FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
+                    (student_id,),
+                )
+                recipients = [r["line_user_id"] for r in cur.fetchall() if r["line_user_id"]]
+                if s.get("line_user_id") and s["line_user_id"] not in recipients:
+                    recipients.append(s["line_user_id"])
+
+                if not recipients:
+                    body = (
+                        f"<section><h1>LINE 測試失敗</h1>"
+                        f"<div class='alert danger'>❌ {escape(s['name'])} 目前沒有有效的 LINE User ID。</div>"
+                        f"<a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+                    )
+                    return HTMLResponse(page("LINE 測試失敗", body), status_code=400)
+
+                if LINE_MODE == "live" and not LINE_CHANNEL_ACCESS_TOKEN:
+                    body = (
+                        f"<section><h1>LINE 尚未設定完成</h1>"
+                        f"<div class='alert danger'>❌ Render 尚未設定 LINE_CHANNEL_ACCESS_TOKEN，因此不能進行正式 Push。</div>"
+                        f"<p>目前 LINE 模式：<b>正式發送</b></p>"
+                        f"<a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+                    )
+                    return HTMLResponse(page("LINE 尚未設定完成", body), status_code=400)
+
+                msg = f"🔔 LINE 連線測試\n學生：{s['name']}\n時間：{now:%H:%M:%S}\n這是一則測試通知。"
+                ok = send_student_line(cur, None, s["id"], msg, "line_test", s.get("line_user_id"))
+
+                # 讀取本次測試最後一筆紀錄，讓管理員直接看到 LINE API 回傳原因。
+                cur.execute(
+                    "SELECT status,error_message,recipient FROM notification_logs "
+                    "WHERE notification_type='line_test' ORDER BY id DESC LIMIT 1"
+                )
+                log = cur.fetchone()
+                conn.commit()
+
+                if ok:
+                    detail = "✅ LINE 測試訊息已由系統送出。請立即查看家長 LINE。"
+                    if LINE_MODE != "live":
+                        detail = "🟡 模擬測試已記錄；目前不是正式 LINE Push。"
+                    body = (
+                        f"<section><h1>LINE 測試結果</h1>"
+                        f"<div class='alert success'>{detail}</div>"
+                        f"<p>學生：<b>{escape(s['name'])}</b></p>"
+                        f"<p>收件人：<code>{escape(log['recipient'] if log and log['recipient'] else recipients[0])}</code></p>"
+                        f"<p>狀態：<b>{escape(log['status'] if log else 'sent')}</b></p>"
+                        f"<a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+                    )
+                    return HTMLResponse(page("LINE 測試結果", body))
+
+                error = (log["error_message"] if log else None) or "LINE Push 未成功，請查看 Render Logs。"
+                body = (
+                    f"<section><h1>LINE 測試失敗</h1>"
+                    f"<div class='alert danger'>❌ {escape(error)}</div>"
+                    f"<p>學生：<b>{escape(s['name'])}</b></p>"
+                    f"<p>目前模式：<b>{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</b></p>"
+                    f"<a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+                )
+                return HTMLResponse(page("LINE 測試失敗", body), status_code=502)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # 不再讓按鈕只顯示瀏覽器的 Internal Server Error；直接把可診斷的錯誤留在管理頁。
+        detail = str(exc)[:1000]
+        body = (
+            f"<section><h1>LINE 測試發生系統錯誤</h1>"
+            f"<div class='alert danger'>❌ {escape(detail)}</div>"
+            f"<p>這代表測試流程本身發生例外，尚未能確認 LINE API 是否成功。請將這段錯誤與 Render Logs 一起提供給我。</p>"
+            f"<a class='btn btn2' href='/admin/line'>返回 LINE 綁定</a></section>"
+        )
+        return HTMLResponse(page("LINE 測試系統錯誤", body), status_code=500)
 
 
 # 保留管理員手動輸入 ID 的相容端點，但正式介面不提供此操作。
