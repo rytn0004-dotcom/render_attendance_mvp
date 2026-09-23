@@ -44,7 +44,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.9")
+app = FastAPI(title="Attendance Test MVP v0.5.0")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -328,21 +328,21 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_notification_templates_lookup
                     ON notification_templates(notification_type, student_id, active, created_at DESC);
-                # Compatibility migration for older notification_templates tables.
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'permanent'")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS remaining_uses INTEGER")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS note TEXT")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_by TEXT")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
-                cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
                 CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id);
                 CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
                 CREATE INDEX IF NOT EXISTS idx_attendance_open ON attendance(date, check_out_time);
                 """
             )
+            # Compatibility migration for older notification_templates tables.
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'permanent'")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS remaining_uses INTEGER")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS note TEXT")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_by TEXT")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
+            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
             # Migration for databases created by earlier V0.1 builds.
             cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS parent_notify_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS checkin_enabled BOOLEAN NOT NULL DEFAULT TRUE")
@@ -1287,7 +1287,7 @@ def root(_: str = Depends(admin_auth)):
 def dashboard(_: str = Depends(admin_auth)):
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.4.7</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V0.5.0</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
     ]
     with db_conn() as conn:
@@ -1629,7 +1629,7 @@ def admin_templates(_: str = Depends(admin_auth)):
                              ORDER BY s.name,nt.notification_type,nt.created_at DESC""")
                 overrides=cur.fetchall()
     except Exception as exc:
-        return page("LINE 通知範本錯誤", f"<section><h2>LINE 通知範本目前無法開啟</h2><div class='err'>{escape(str(exc))}</div><p>請重新部署 V0.4.9，系統會自動補齊舊資料庫缺少的通知範本欄位。</p>{admin_nav()}</section>")
+        return page("LINE 通知範本錯誤", f"<section><h2>LINE 通知範本目前無法開啟</h2><div class='err'>{escape(str(exc))}</div><p>請重新部署 V0.5.0，系統會自動補齊舊資料庫缺少的通知範本欄位。</p>{admin_nav()}</section>")
     body.append("<section><h2>預設範本</h2><p class='muted'>可使用變數：{greeting}、{thanks}、{student_name}、{course_name}、{teacher_name}、{scheduled_start}、{scheduled_end}、{check_in_time}、{check_out_time}、{now_time}、{late_minutes}。</p><div style='overflow:auto'><table><tr><th>通知</th><th>範本內容</th><th>操作</th></tr>")
     for r in defaults:
         body.append(f"<tr><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td><td><form method='post' action='/admin/template/default'><input type='hidden' name='notification_type' value='{escape(r['notification_type'])}'><textarea name='template_text' rows='4' style='min-width:520px'>{escape(r['template_text'])}</textarea></td><td><button>儲存預設範本</button></form></td></tr>")
@@ -2606,4 +2606,4 @@ async def line_webhook(request: Request):
 
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.6"})
+    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.5.0"})
