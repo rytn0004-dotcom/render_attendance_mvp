@@ -44,7 +44,7 @@ DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.4.5")
+app = FastAPI(title="Attendance Test MVP v0.4.6")
 security = HTTPBasic()
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -1735,9 +1735,30 @@ def admin_line(request: Request, _: str = Depends(admin_auth)):
             body.append(f"<br>⚠️ 有 {escape(errors)} 筆同步資料需要檢查學生姓名／編號或時間格式。")
         body.append("</section>")
     webhook_url=f"{public_base_url()}/webhook/line"
+    line_missing = []
+    if LINE_MODE == "live":
+        if not LINE_CHANNEL_ACCESS_TOKEN:
+            line_missing.append("LINE_CHANNEL_ACCESS_TOKEN")
+        if not LINE_CHANNEL_SECRET:
+            line_missing.append("LINE_CHANNEL_SECRET")
+        if not LINE_ADMIN_USER_ID:
+            line_missing.append("LINE_ADMIN_USER_ID")
+    if LINE_MODE == "live" and line_missing:
+        line_status = (
+            "<div class='alert' style='background:#fff3cd;border-color:#ffe69c'>"
+            "⚠️ 已切換為正式發送，但 Render 尚缺少："
+            + escape("、".join(line_missing))
+            + "。補齊後再按「測試 LINE」。"
+            "</div>"
+        )
+    elif LINE_MODE == "live":
+        line_status = "<div class='alert success'>✅ LINE 正式發送設定已就緒，可使用「測試 LINE」確認實際 Push。</div>"
+    else:
+        line_status = "<div class='alert'>目前為模擬模式；按「測試 LINE」只會寫入測試紀錄，不會真的傳到家長 LINE。正式測試請將 LINE_MODE 設為 <code>live</code>，並補齊 LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / LINE_ADMIN_USER_ID。</div>"
     body.append(
         f"<section><h2>LINE 連線</h2><p>Webhook URL：<code>{escape(webhook_url)}</code></p>"
         f"<p>目前 LINE 模式：<b>{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</b></p>"
+        f"{line_status}"
         f"<div class='alert'>家長端的 LINE 綁定可以繼續由你原本的 AI 客服處理。這個出勤站不再要求家長另外建立第二套綁定；只要從客服系統／Excel 取得「學生姓名（或學生編號）＋LINE User ID」，匯入這裡即可。</div>"
         f"<p class='mini muted'>LIFF / LINE Login 目前不是出勤簽到的必要條件；未來若要做新的家長自助綁定，再另外啟用即可。</p></section>"
     )
@@ -2474,4 +2495,4 @@ async def line_webhook(request: Request):
 
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.5"})
+    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.4.6"})

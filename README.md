@@ -1,11 +1,11 @@
-# Render 出勤系統 V0.4.5｜實際課程驅動版
+# Render 出勤系統 V0.4.6｜實際課程驅動版
 
 這版是接續 V0.4.4 內測的架構調整：
 
 - **出勤唯一課程來源 = 主總表「實際課程」**。
 - 固定課表 → 已確認調課 → 實際課程的原有流程維持在主系統。
 - 「課程提醒」維持原系統獨立發送，**不會反過來決定出勤時間**。
-- Render 每次由管理員上傳目前總表 `.xlsx` 後，同步「實際課程」「出勤學生」「出勤LINE綁定」。
+- Render 每次由管理員上傳目前總表 `.xlsx` 後，同步「實際課程」「出勤學生」「出勤LINE綁定」。LINE 正式 Push 則由 `LINE_MODE=live` 與 Messaging API Token 控制。
 - 學生 QR 為固定識別碼；教室手機／設備仍需先配對。
 - 家長 LINE 綁定採「一列＝一位學生＋一位家長」，每一位可獨立開關提醒。
 - 今日臨時校正仍可在 Render「實際課程」頁面進行，僅影響指定日期，不改總表。
@@ -30,6 +30,19 @@
 - 分欄：`開始時間` + `下課時間`
 
 如果只提供單一開始時間，仍可記錄到班／離班；但**無法自動判斷「未離班」**，後台會標示缺少下課時間。
+
+## LINE 正式發送設定
+
+這版已將 Render Blueprint 的 `LINE_MODE` 預設為 `live`，但**不會把任何密鑰寫進 ZIP**。部署／更新到現有 Render 服務後，請在 Environment 補齊：
+
+- `LINE_MODE=live`
+- `LINE_CHANNEL_ACCESS_TOKEN`：Messaging API Channel Access Token
+- `LINE_CHANNEL_SECRET`：Messaging API Channel Secret
+- `LINE_ADMIN_USER_ID`：要接收管理員異常／測試通知的 LINE User ID
+
+`LINE_LOGIN_CHANNEL_ID` 與 `LIFF_ID` 仍可保留；它們不是 Push Message 的 Access Token。
+
+如果 `LINE_MODE=live` 但上述任一必要值缺少，後台 `/admin/line` 會直接顯示缺少哪些設定，不會把「正式發送」誤顯示成已可用。
 
 ## Render
 

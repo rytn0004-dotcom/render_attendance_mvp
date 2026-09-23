@@ -13,7 +13,7 @@ services:
           name: attendance-test-db
           property: connectionString
       - key: LINE_MODE
-        value: simulation
+        value: live
       - key: LATE_GRACE_MINUTES
         value: "10"
       - key: CHECKOUT_GRACE_MINUTES
