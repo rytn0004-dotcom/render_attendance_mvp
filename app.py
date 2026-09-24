@@ -11,6 +11,7 @@ import hmac
 import hashlib
 import re
 import base64
+import logging
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
@@ -24,7 +25,13 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-LINE_MODE = os.getenv("LINE_MODE", "simulation").lower()
+APP_VERSION = "0.5.2"
+logger = logging.getLogger("attendance")
+LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
+if LINE_MODE in {"production", "prod", "正式"}:
+    LINE_MODE = "live"
+elif LINE_MODE in {"mock", "test", "testing", "模擬"}:
+    LINE_MODE = "simulation"
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_ADMIN_USER_ID = os.getenv("LINE_ADMIN_USER_ID", "").strip()
@@ -40,12 +47,39 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "test1234")
 DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
+SEED_DEMO_DATA = os.getenv("SEED_DEMO_DATA", "false").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
+NOTIFICATION_RETRY_COOLDOWN_MINUTES = max(1, int(os.getenv("NOTIFICATION_RETRY_COOLDOWN_MINUTES", "15")))
+
+RUNTIME_SETTINGS = {
+    "出勤模組": "啟用",
+    "出勤課程來源": "實際課程",
+    "遲到門檻（分鐘）": DEFAULT_LATE_GRACE_MINUTES if "DEFAULT_LATE_GRACE_MINUTES" in globals() else 10,
+    "未到班通知（分鐘）": DEFAULT_LATE_GRACE_MINUTES,
+    "未離班通知（分鐘）": DEFAULT_CHECKOUT_GRACE_MINUTES,
+    "提前簽到（分鐘）": CHECKIN_EARLY_MINUTES if "CHECKIN_EARLY_MINUTES" in globals() else 60,
+    "重複掃描保護（分鐘）": 10,
+    "教室設備限制": "啟用",
+    "學生 QR": "固定",
+}
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
-app = FastAPI(title="Attendance Test MVP v0.5.0")
+app = FastAPI(title=f"Attendance Test MVP v{APP_VERSION}")
 security = HTTPBasic()
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    error_id = secrets.token_hex(6)
+    logger.exception("Unhandled exception [%s] path=%s", error_id, request.url.path)
+    if request.url.path.startswith("/admin"):
+        detail = escape(str(exc)[:900])
+        return HTMLResponse(
+            page("系統錯誤", f"<section><h1>系統發生錯誤</h1><div class='alert danger'>❌ {detail}</div><p>錯誤編號：<code>{error_id}</code></p><p>程式版本：<b>V{APP_VERSION}</b></p><p><a class='btn btn2' href='/admin/diagnostics'>開啟系統診斷</a> <a class='btn btn2' href='/health'>檢查版本</a></p></section>"),
+            status_code=500,
+            headers={"Cache-Control": "no-store"},
+        )
+    return JSONResponse({"ok": False, "error": "internal_server_error", "error_id": error_id}, status_code=500)
 
 WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -176,6 +210,233 @@ def effective_schedule(cur, course: dict[str, Any], work_date: date) -> dict[str
     return result
 
 
+def ensure_column(cur, table: str, column: str, definition: str) -> None:
+    """Ensure one known schema column exists. Table/column names are hard-coded callers only."""
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=%s AND column_name=%s",
+        (table, column),
+    )
+    if cur.fetchone() is None:
+        cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+
+
+def ensure_notification_template_schema(cur) -> None:
+    """Repair/initialize notification_templates without deleting existing data."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_templates (
+            id BIGSERIAL PRIMARY KEY,
+            notification_type TEXT NOT NULL,
+            student_id BIGINT,
+            template_text TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT 'permanent',
+            remaining_uses INTEGER,
+            expires_at TIMESTAMP,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            note TEXT,
+            created_by TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    columns = {
+        "id": "BIGSERIAL",
+        "notification_type": "TEXT DEFAULT 'check_in'",
+        "student_id": "BIGINT",
+        "template_text": "TEXT NOT NULL DEFAULT ''",
+        "mode": "TEXT NOT NULL DEFAULT 'permanent'",
+        "remaining_uses": "INTEGER",
+        "expires_at": "TIMESTAMP",
+        "active": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "note": "TEXT",
+        "created_by": "TEXT",
+        "created_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    }
+    for column, definition in columns.items():
+        cur.execute(f'ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS "{column}" {definition}')
+    cur.execute("UPDATE notification_templates SET mode='permanent' WHERE mode IS NULL")
+    cur.execute("UPDATE notification_templates SET active=TRUE WHERE active IS NULL")
+    cur.execute("UPDATE notification_templates SET template_text='' WHERE template_text IS NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notification_templates_lookup ON notification_templates(notification_type, student_id, active, created_at DESC)")
+
+
+def ensure_core_compat_schema(cur) -> None:
+    """Non-destructive migrations for schemas created by V0.1-V0.5."""
+    table_columns = {
+        "students": {
+            "parent_notify_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "checkin_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "notify_checkin_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "notify_checkout_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "notify_exception_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
+        "student_line_bindings": {
+            "notify_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        },
+        "courses": {
+            "late_grace_minutes": "INTEGER NOT NULL DEFAULT 10",
+            "checkout_grace_minutes": "INTEGER NOT NULL DEFAULT 15",
+            "actual_course_id": "TEXT",
+            "course_date": "DATE",
+            "source": "TEXT NOT NULL DEFAULT 'legacy'",
+            "source_note": "TEXT",
+        },
+        "attendance": {
+            "late_notified_at": "TIMESTAMP",
+            "absent_notified_at": "TIMESTAMP",
+            "missing_checkout_notified_at": "TIMESTAMP",
+            "last_scan_time": "TIMESTAMP",
+            "manual_note": "TEXT",
+            "adjusted_at": "TIMESTAMP",
+            "adjusted_by": "TEXT",
+            "last_absent_attempt_at": "TIMESTAMP",
+            "last_missing_checkout_attempt_at": "TIMESTAMP",
+        },
+        "line_bind_tokens": {
+            "token_value": "TEXT",
+            "use_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_used_at": "TIMESTAMP",
+        },
+    }
+    for table, columns in table_columns.items():
+        for column, definition in columns.items():
+            cur.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{column}" {definition}')
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_courses_actual_course_id ON courses(actual_course_id) WHERE actual_course_id IS NOT NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_actual_date_student ON courses(course_date, student_id, active)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_open ON attendance(date, check_out_time)")
+
+
+def db_schema_summary(cur) -> dict:
+    wanted = {
+        "notification_templates": ["id","notification_type","student_id","template_text","mode","remaining_uses","expires_at","active","note","created_by","created_at","updated_at"],
+        "students": ["id","student_code","name","qr_token","active","parent_notify_enabled"],
+        "courses": ["id","student_id","course_name","start_time","end_time","actual_course_id","course_date","source","active"],
+        "attendance": ["id","student_id","course_id","date","check_in_time","check_out_time","status","late_notified_at","absent_notified_at","missing_checkout_notified_at"],
+        "student_line_bindings": ["id","student_id","line_user_id","active","notify_enabled"],
+    }
+    result = {}
+    for table, columns in wanted.items():
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table,))
+        existing = {str(r["column_name"]) for r in cur.fetchall()}
+        result[table] = {column: (column in existing) for column in columns}
+    return result
+
+
+def load_runtime_settings(cur) -> None:
+    global RUNTIME_SETTINGS
+    try:
+        cur.execute("SELECT key,value FROM runtime_settings")
+        rows = cur.fetchall()
+    except Exception:
+        return
+    data = dict(RUNTIME_SETTINGS)
+    for row in rows:
+        key = str(row["key"]).strip()
+        value = str(row["value"]).strip()
+        if key:
+            data[key] = value
+    RUNTIME_SETTINGS = data
+
+
+def setting_int(key: str, fallback: int) -> int:
+    try:
+        return max(0, int(str(RUNTIME_SETTINGS.get(key, fallback)).strip()))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def setting_enabled(key: str, fallback: bool = True) -> bool:
+    value = str(RUNTIME_SETTINGS.get(key, "啟用" if fallback else "停用")).strip()
+    return value in {"啟用", "是", "1", "true", "TRUE", "yes", "Y", "y"}
+
+
+def sync_runtime_settings(cur, rows: list[dict[str, Any]]) -> None:
+    allowed = {
+        "出勤模組", "出勤課程來源", "遲到門檻（分鐘）", "未到班通知（分鐘）",
+        "未離班通知（分鐘）", "提前簽到（分鐘）", "重複掃描保護（分鐘）",
+        "教室設備限制", "學生 QR", "LINE 家長提醒", "LINE 資料來源", "總表同步方式", "老師出勤",
+    }
+    for raw in rows:
+        key = str(raw.get("設定項目", "")).strip()
+        value = str(raw.get("目前值", "")).strip()
+        if key not in allowed or value == "":
+            continue
+        cur.execute(
+            "INSERT INTO runtime_settings(key,value,updated_at) VALUES (%s,%s,%s) "
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at",
+            (key, value, now_local()),
+        )
+
+
+def sync_default_templates_from_excel(cur, rows: list[dict[str, Any]]) -> int:
+    imported = 0
+    type_map = {v: k for k, v in TEMPLATE_TYPE_LABELS.items()}
+    for raw in rows:
+        label = str(raw.get("通知類型", "")).strip()
+        ntype = type_map.get(label, label if label in DEFAULT_NOTIFICATION_TEMPLATES else "")
+        text = str(raw.get("預設訊息範本", "")).strip()
+        if not ntype or not text:
+            continue
+        active = _truthy_binding(raw.get("啟用"), True)
+        cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id IS NULL AND active=TRUE", (now_local(), ntype))
+        if active:
+            cur.execute(
+                "INSERT INTO notification_templates(notification_type,student_id,template_text,mode,active,created_by,updated_at) "
+                "VALUES (%s,NULL,%s,'default',TRUE,'EXCEL',%s)",
+                (ntype, text, now_local()),
+            )
+        imported += 1
+    return imported
+
+
+def sync_individual_templates_from_excel(cur, rows: list[dict[str, Any]]) -> int:
+    imported = 0
+    type_map = {v: k for k, v in TEMPLATE_TYPE_LABELS.items()}
+    mode_map = {"永久個別": "permanent", "一次性": "once", "期限內": "until", "預設": "default"}
+    for raw in rows:
+        code = str(raw.get("學生編號", "")).strip()
+        label = str(raw.get("通知類型", "")).strip()
+        text = str(raw.get("個別訊息範本", "")).strip()
+        if not code or not text:
+            continue
+        ntype = type_map.get(label, label if label in DEFAULT_NOTIFICATION_TEMPLATES else "")
+        if not ntype:
+            continue
+        cur.execute("SELECT id FROM students WHERE student_code=%s AND active=TRUE", (code,))
+        st = cur.fetchone()
+        if not st:
+            continue
+        student_id = st["id"]
+        mode = mode_map.get(str(raw.get("套用方式", "")).strip(), "permanent")
+        if mode not in {"permanent", "once", "until", "default"}:
+            continue
+        active = _truthy_binding(raw.get("啟用"), True)
+        exp = None
+        expiry = str(raw.get("有效至", "")).strip()
+        if expiry:
+            try:
+                exp = parse_template_expiry(expiry)
+            except ValueError:
+                continue
+        uses_text = str(raw.get("剩餘次數", "")).strip()
+        try:
+            uses = max(1, int(uses_text)) if mode == "once" and uses_text else (1 if mode == "once" else None)
+        except ValueError:
+            continue
+        cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE notification_type=%s AND student_id=%s AND active=TRUE", (now_local(), ntype, student_id))
+        if active:
+            cur.execute(
+                "INSERT INTO notification_templates(notification_type,student_id,template_text,mode,remaining_uses,expires_at,active,note,created_by,updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,'EXCEL',%s)",
+                (ntype, student_id, text, mode, uses, exp, str(raw.get("備註", "")).strip() or None, now_local()),
+            )
+        imported += 1
+    return imported
+
+
 def init_db() -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -227,6 +488,8 @@ def init_db() -> None:
                     absent_notified_at TIMESTAMP,
                     missing_checkout_notified_at TIMESTAMP,
                     last_scan_time TIMESTAMP,
+                    last_absent_attempt_at TIMESTAMP,
+                    last_missing_checkout_attempt_at TIMESTAMP,
                     manual_note TEXT,
                     adjusted_at TIMESTAMP,
                     adjusted_by TEXT,
@@ -265,10 +528,6 @@ def init_db() -> None:
                     bound_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     bound_by TEXT NOT NULL DEFAULT 'LIFF'
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding
-                    ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE;
-                CREATE INDEX IF NOT EXISTS idx_student_line_user
-                    ON student_line_bindings(line_user_id) WHERE active=TRUE;
                 CREATE TABLE IF NOT EXISTS line_bind_tokens (
                     id BIGSERIAL PRIMARY KEY,
                     student_id BIGINT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -281,8 +540,6 @@ def init_db() -> None:
                     created_by TEXT,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_line_bind_tokens_student
-                    ON line_bind_tokens(student_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS line_message_logs (
                     id BIGSERIAL PRIMARY KEY,
                     event_id TEXT,
@@ -311,12 +568,11 @@ def init_db() -> None:
                     used_at TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_device_pair_tokens_lookup ON device_pair_tokens(token_hash, expires_at);
                 CREATE TABLE IF NOT EXISTS notification_templates (
                     id BIGSERIAL PRIMARY KEY,
                     notification_type TEXT NOT NULL,
                     student_id BIGINT REFERENCES students(id) ON DELETE CASCADE,
-                    template_text TEXT NOT NULL,
+                    template_text TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'permanent',
                     remaining_uses INTEGER,
                     expires_at TIMESTAMP,
@@ -326,55 +582,33 @@ def init_db() -> None:
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_notification_templates_lookup
-                    ON notification_templates(notification_type, student_id, active, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id);
-                CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date);
-                CREATE INDEX IF NOT EXISTS idx_attendance_open ON attendance(date, check_out_time);
+                CREATE TABLE IF NOT EXISTS runtime_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
-            # Compatibility migration for older notification_templates tables.
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'permanent'")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS remaining_uses INTEGER")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS note TEXT")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_by TEXT")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
-            cur.execute("ALTER TABLE notification_templates ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
-            # Migration for databases created by earlier V0.1 builds.
-            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS parent_notify_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS checkin_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_checkin_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_checkout_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE students ADD COLUMN IF NOT EXISTS notify_exception_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE student_line_bindings ADD COLUMN IF NOT EXISTS notify_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS late_grace_minutes INTEGER NOT NULL DEFAULT 10")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS checkout_grace_minutes INTEGER NOT NULL DEFAULT 15")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS actual_course_id TEXT")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS course_date DATE")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'legacy'")
-            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS source_note TEXT")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_courses_actual_course_id ON courses(actual_course_id) WHERE actual_course_id IS NOT NULL")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_actual_date_student ON courses(course_date, student_id, active)")
-            cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS absent_notified_at TIMESTAMP")
-            cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS manual_note TEXT")
-            cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS adjusted_at TIMESTAMP")
-            cur.execute("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS adjusted_by TEXT")
-            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS token_value TEXT")
-            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0")
-            cur.execute("ALTER TABLE line_bind_tokens ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP")
-            cur.execute(
-                "UPDATE courses SET late_grace_minutes=%s WHERE late_grace_minutes IS NULL",
-                (DEFAULT_LATE_GRACE_MINUTES,),
-            )
-            cur.execute(
-                "UPDATE courses SET checkout_grace_minutes=%s WHERE checkout_grace_minutes IS NULL",
-                (DEFAULT_CHECKOUT_GRACE_MINUTES,),
-            )
-            seed_demo_data(cur)
+            ensure_notification_template_schema(cur)
+            ensure_core_compat_schema(cur)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_student_line_user ON student_line_bindings(line_user_id) WHERE active=TRUE")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_line_bind_tokens_student ON line_bind_tokens(student_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_device_pair_tokens_lookup ON device_pair_tokens(token_hash, expires_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_settings_updated ON runtime_settings(updated_at DESC)")
+            cur.execute("UPDATE courses SET late_grace_minutes=%s WHERE late_grace_minutes IS NULL", (DEFAULT_LATE_GRACE_MINUTES,))
+            cur.execute("UPDATE courses SET checkout_grace_minutes=%s WHERE checkout_grace_minutes IS NULL", (DEFAULT_CHECKOUT_GRACE_MINUTES,))
+            if SEED_DEMO_DATA:
+                seed_demo_data(cur)
             seed_notification_templates(cur)
+            for key, value in RUNTIME_SETTINGS.items():
+                cur.execute(
+                    "INSERT INTO runtime_settings(key,value,updated_at) VALUES (%s,%s,%s) ON CONFLICT(key) DO NOTHING",
+                    (key, str(value), now_local()),
+                )
+            load_runtime_settings(cur)
         conn.commit()
 
 
@@ -405,7 +639,7 @@ def seed_demo_data(cur) -> None:
                     student_id, course_name, teacher_name, weekday, start_time, end_time,
                     late_grace_minutes, checkout_grace_minutes, active, actual_course_id,
                     course_date, source, source_note
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,'demo','V0.4.5 測試資料')""",
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,'demo','Demo 測試資料')""",
                 (student_id, "測試課程", "測試老師", work_date.weekday(), start, end,
                  DEFAULT_LATE_GRACE_MINUTES, DEFAULT_CHECKOUT_GRACE_MINUTES, actual_id, work_date),
             )
@@ -486,11 +720,10 @@ def render_notification_template(template_text: str, student: dict[str, Any], co
         "now_time": when.strftime("%H:%M"),
         "late_minutes": str(late_minutes),
     }
-    try:
-        return template_text.format(**values)
-    except KeyError:
-        # 範本有未知變數時，不讓簽到流程整體失敗。
-        return template_text
+    def replace_var(match):
+        key = match.group(1)
+        return values.get(key, match.group(0))
+    return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", replace_var, str(template_text or ""))
 
 
 def consume_one_time_template(cur, template_row: dict[str, Any] | None) -> None:
@@ -550,6 +783,16 @@ def send_student_template_line(cur, attendance_id: int | None, student: dict[str
     if any(results):
         consume_one_time_template(cur, template_row)
     return bool(results) and all(results)
+
+
+def send_admin_template_line(cur, attendance_id: int | None, student: dict[str, Any], course: dict[str, Any] | None,
+                              notification_type: str, check_in_time: datetime | None = None,
+                              check_out_time: datetime | None = None, when: datetime | None = None,
+                              late_minutes: int = 0) -> bool:
+    template_row = get_effective_template(cur, notification_type, None)
+    template_text = template_row["template_text"] if template_row else DEFAULT_NOTIFICATION_TEMPLATES[notification_type]
+    msg = render_notification_template(template_text, student, course, None, check_in_time, check_out_time, when, late_minutes)
+    return send_line(cur, attendance_id, LINE_ADMIN_USER_ID, msg, notification_type)
 
 
 def hash_device_token(token: str) -> str:
@@ -636,7 +879,7 @@ def get_courses_today(cur, student_id: int, work_date: date):
     cur.execute(
         """SELECT * FROM courses
            WHERE student_id=%s AND course_date=%s AND active=TRUE
-             AND actual_course_id IS NOT NULL
+             AND actual_course_id IS NOT NULL AND COALESCE(source, '實際課程')='實際課程'
            ORDER BY start_time, id""",
         (student_id, work_date),
     )
@@ -662,7 +905,7 @@ def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attend
     for c in courses:
         st = parse_hhmm(c["effective_start"], when.date())
         en = parse_hhmm(c["effective_end"], when.date()) if c.get("effective_end") else st
-        early = st - timedelta(minutes=CHECKIN_EARLY_MINUTES)
+        early = st - timedelta(minutes=setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES))
         late_end = en + timedelta(minutes=max(c["checkout_grace_minutes"], 60))
         inside = early <= when <= late_end
         distance = 0 if inside else abs((when - st).total_seconds())
@@ -1050,9 +1293,9 @@ def scan_student(token: str) -> dict[str, Any]:
             scheduled_start = parse_hhmm(course["effective_start"], work_date)
 
             if attendance is None:
-                if when < scheduled_start - timedelta(minutes=CHECKIN_EARLY_MINUTES):
+                if when < scheduled_start - timedelta(minutes=setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES)):
                     conn.commit()
-                    return {"kind": "too_early", "student": student["name"], "course": course["course_name"], "time": iso(when), "message": f"距離課程開始時間過早，請於課前 {CHECKIN_EARLY_MINUTES} 分鐘內再掃描。"}
+                    return {"kind": "too_early", "student": student["name"], "course": course["course_name"], "time": iso(when), "message": f"距離課程開始時間過早，請於課前 {setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES)} 分鐘內再掃描。"}
                 late = max(0, int((when - scheduled_start).total_seconds() // 60))
                 status = "late" if late > course["late_grace_minutes"] else "checked_in"
                 cur.execute(
@@ -1083,9 +1326,9 @@ def scan_student(token: str) -> dict[str, Any]:
                     if when < scheduled_start:
                         conn.commit()
                         return {"kind": "duplicate", "student": student["name"], "message": f"已於 {attendance['check_in_time']:%H:%M} 到班，但目前尚未到課程開始時間，不會視為離班。"}
-                    if (when - attendance["check_in_time"]).total_seconds() < 600:
+                    if (when - attendance["check_in_time"]).total_seconds() < setting_int("重複掃描保護（分鐘）", 10) * 60:
                         conn.commit()
-                        return {"kind": "duplicate", "student": student["name"], "message": f"已於 {attendance['check_in_time']:%H:%M} 到班，10 分鐘內重複掃描不會視為離班。"}
+                        return {"kind": "duplicate", "student": student["name"], "message": f"已於 {attendance['check_in_time']:%H:%M} 到班，{setting_int("重複掃描保護（分鐘）", 10)} 分鐘內重複掃描不會視為離班。"}
                     cur.execute(
                         "UPDATE attendance SET check_out_time=%s,status='completed',last_scan_time=%s,updated_at=%s WHERE id=%s",
                         (when, when, when, attendance_id),
@@ -1099,8 +1342,7 @@ def scan_student(token: str) -> dict[str, Any]:
             final_a = cur.fetchone()
             send_student_template_line(cur, attendance_id, student, course, "check_in", check_in_time=final_a["check_in_time"], when=final_a["check_in_time"], legacy_line_user_id=student["line_user_id"])
             if final_a["late_minutes"] > course["late_grace_minutes"] and not final_a["late_notified_at"]:
-                admin_msg = late_admin_message(student["name"], course["course_name"], course["effective_start"], final_a["check_in_time"], final_a["late_minutes"])
-                sent = send_line(cur, attendance_id, LINE_ADMIN_USER_ID, admin_msg, "late")
+                sent = send_admin_template_line(cur, attendance_id, student, course, "late", check_in_time=final_a["check_in_time"], when=when, late_minutes=final_a["late_minutes"])
                 if sent:
                     cur.execute("UPDATE attendance SET late_notified_at=%s WHERE id=%s", (when, attendance_id))
             # 補到班後，若先前已被判定未到，保留紀錄但不再重複發未到。
@@ -1110,37 +1352,38 @@ def scan_student(token: str) -> dict[str, Any]:
 
 
 def check_scheduled_absences() -> int:
-    """自動判定未到班。
-
-    這裡可能同時被背景檢查與管理頁觸發，因此一定要鎖住 attendance
-    紀錄，並在同一個 transaction 內完成「檢查 -> 發送 -> 標記已通知」，
-    避免兩個 checker 同時看到 NULL 而重複 LINE Push。
-    """
+    """Auto absent check. One worker at a time + retry cooldown after a failed send."""
     now = now_local()
     work_date = now.date()
     changed = 0
     with db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.absent.checker')) AS locked")
+            lock_row = cur.fetchone()
+            if not lock_row or not lock_row["locked"]:
+                return 0
             cur.execute(
                 """
                 SELECT c.*, s.name, s.active AS student_active
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND s.active=TRUE
-                ORDER BY c.start_time
+                WHERE c.course_date=%s AND c.active=TRUE
+                  AND c.actual_course_id IS NOT NULL
+                  AND COALESCE(c.source,'實際課程')='實際課程'
+                  AND s.active=TRUE
+                ORDER BY c.start_time, c.id
                 """,
                 (work_date,),
             )
             courses = cur.fetchall()
+            absent_threshold = setting_int("未到班通知（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
             for course in courses:
                 eff = effective_schedule(cur, course, work_date)
                 if not eff:
                     continue
                 start_dt = parse_hhmm(eff["effective_start"], work_date)
-                notify_at = start_dt + timedelta(minutes=eff["late_grace_minutes"])
+                notify_at = start_dt + timedelta(minutes=absent_threshold)
                 if now < notify_at:
                     continue
-
-                # 唯一鍵為 (student_id, course_id, date)，避免併發時建立重複 attendance。
                 cur.execute(
                     """
                     INSERT INTO attendance (student_id,course_id,date,status,updated_at)
@@ -1151,28 +1394,29 @@ def check_scheduled_absences() -> int:
                     (course["student_id"], course["id"], work_date, now),
                 )
                 inserted = cur.fetchone()
-                if inserted:
-                    aid = inserted["id"]
-                else:
+                aid = inserted["id"] if inserted else None
+                if not aid:
                     cur.execute(
-                        "SELECT * FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s FOR UPDATE",
+                        "SELECT id,check_in_time,absent_notified_at,last_absent_attempt_at FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s FOR UPDATE",
                         (course["student_id"], course["id"], work_date),
                     )
                     a = cur.fetchone()
-                    if not a:
+                    if not a or a["check_in_time"] or a["absent_notified_at"]:
                         continue
-                    if a["check_in_time"] or a["absent_notified_at"]:
+                    last_attempt = a.get("last_absent_attempt_at")
+                    if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                         continue
                     aid = a["id"]
-
-                # 新建立的紀錄也要再鎖一次，確保同一 transaction 內唯一送出。
                 cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE", (aid,))
                 a = cur.fetchone()
                 if not a or a["check_in_time"] or a["absent_notified_at"]:
                     continue
-
-                msg = absent_admin_message(course["name"], course["course_name"], eff["effective_start"], now)
-                sent = send_line(cur, aid, LINE_ADMIN_USER_ID, msg, "absent")
+                last_attempt = a.get("last_absent_attempt_at")
+                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+                    continue
+                cur.execute("UPDATE attendance SET last_absent_attempt_at=%s,updated_at=%s WHERE id=%s", (now, now, aid))
+                student = {"id": course["student_id"], "name": course["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
+                sent = send_admin_template_line(cur, aid, student, eff, "absent", when=now)
                 if sent:
                     cur.execute(
                         "UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s AND absent_notified_at IS NULL",
@@ -1184,24 +1428,32 @@ def check_scheduled_absences() -> int:
 
 
 def check_missing_checkout() -> int:
-    """自動判定未離班，使用 FOR UPDATE SKIP LOCKED 防止重複發送。"""
+    """Auto missing-checkout check. One worker at a time + retry cooldown."""
     now = now_local()
     work_date = now.date()
     changed = 0
     with db_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.missing_checkout.checker')) AS locked")
+            lock_row = cur.fetchone()
+            if not lock_row or not lock_row["locked"]:
+                return 0
             cur.execute(
                 """
                 SELECT a.*, s.name, c.course_name, c.start_time, c.end_time, c.checkout_grace_minutes
                 FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id
                 WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL
                   AND a.missing_checkout_notified_at IS NULL
+                  AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
                 FOR UPDATE OF a SKIP LOCKED
                 """,
                 (work_date,),
             )
             rows = cur.fetchall()
             for row in rows:
+                last_attempt = row.get("last_missing_checkout_attempt_at")
+                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+                    continue
                 cur.execute("SELECT * FROM courses WHERE id=%s", (row["course_id"],))
                 course = cur.fetchone()
                 if not course:
@@ -1212,15 +1464,18 @@ def check_missing_checkout() -> int:
                 end_dt = parse_hhmm(eff["effective_end"], work_date)
                 if now < end_dt + timedelta(minutes=eff["checkout_grace_minutes"]):
                     continue
-                # 再次確認尚未通知，避免同一 transaction 內其他流程已完成通知。
-                cur.execute("SELECT missing_checkout_notified_at, check_out_time FROM attendance WHERE id=%s FOR UPDATE", (row["id"],))
+                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE", (row["id"],))
                 locked = cur.fetchone()
                 if not locked or locked["check_out_time"] or locked["missing_checkout_notified_at"]:
                     continue
-                row = dict(row)
+                last_attempt = locked.get("last_missing_checkout_attempt_at")
+                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+                    continue
+                cur.execute("UPDATE attendance SET last_missing_checkout_attempt_at=%s,updated_at=%s WHERE id=%s", (now, now, row["id"]))
+                row = dict(locked)
                 row["effective_end"] = eff["effective_end"]
-                msg = missing_checkout_message(row, now)
-                sent = send_line(cur, row["id"], LINE_ADMIN_USER_ID, msg, "missing_checkout")
+                student = {"id": row["student_id"], "name": row["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
+                sent = send_admin_template_line(cur, row["id"], student, eff, "missing_checkout", check_in_time=row["check_in_time"], when=now)
                 if sent:
                     cur.execute(
                         "UPDATE attendance SET missing_checkout_notified_at=%s, updated_at=%s WHERE id=%s AND missing_checkout_notified_at IS NULL",
@@ -1236,15 +1491,16 @@ def run_all_checks() -> dict[str, int]:
     try:
         result["absent"] = check_scheduled_absences()
     except Exception:
-        pass
+        logger.exception("自動未到班檢查失敗")
     try:
         result["missing_checkout"] = check_missing_checkout()
     except Exception:
-        pass
+        logger.exception("自動未離班檢查失敗")
     return result
 
 
 async def periodic_checker():
+    logger.info("Starting attendance checker v%s; line_mode=%s; demo_seed=%s", APP_VERSION, LINE_MODE, SEED_DEMO_DATA)
     await asyncio.to_thread(run_all_checks)
     while True:
         await asyncio.sleep(60)
@@ -1287,7 +1543,7 @@ def root(_: str = Depends(admin_auth)):
 def dashboard(_: str = Depends(admin_auth)):
     today = now_local().date()
     body_parts = [
-        f"<div class='top'><div><h1>出勤測試系統 V0.5.0</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        f"<div class='top'><div><h1>出勤測試系統 V{APP_VERSION}</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
     ]
     with db_conn() as conn:
@@ -1310,7 +1566,7 @@ def dashboard(_: str = Depends(admin_auth)):
                 """
                 SELECT c.*, s.name, s.student_code, s.line_user_id
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
                 ORDER BY c.start_time, s.name
                 """,
                 (today,),
@@ -1416,7 +1672,7 @@ def admin_courses(_: str = Depends(admin_auth)):
             cur.execute(
                 """SELECT c.*, s.name, s.student_code
                    FROM courses c JOIN students s ON s.id=c.student_id
-                   WHERE c.active=TRUE AND c.actual_course_id IS NOT NULL AND c.course_date >= %s
+                   WHERE c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' AND c.course_date >= %s
                    ORDER BY c.course_date,c.start_time,s.name LIMIT 300""",
                 (today,),
             )
@@ -1582,8 +1838,8 @@ def manual_absent(course_id: int, _: str = Depends(admin_auth)):
                 aid = cur.fetchone()["id"]
             else:
                 aid = a["id"]
-            msg = absent_admin_message(c["name"], c["course_name"], eff["effective_start"], now)
-            if send_line(cur, aid, LINE_ADMIN_USER_ID, msg, "manual_absent"):
+            student = {"id": c["student_id"], "name": c["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
+            if send_admin_template_line(cur, aid, student, eff, "absent", when=now):
                 cur.execute("UPDATE attendance SET absent_notified_at=%s, status=CASE WHEN check_in_time IS NULL THEN 'absent' ELSE status END, updated_at=%s WHERE id=%s", (now,now,aid))
             conn.commit()
     return RedirectResponse("/admin", status_code=303)
@@ -1606,8 +1862,8 @@ def manual_missing(attendance_id: int, _: str = Depends(admin_auth)):
             if not eff:
                 raise HTTPException(400, "今日課程已取消")
             row = dict(a); row["effective_end"] = eff["effective_end"]
-            msg = missing_checkout_message(row, now)
-            if send_line(cur, attendance_id, LINE_ADMIN_USER_ID, msg, "manual_missing_checkout"):
+            student = {"id": a["student_id"], "name": a["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
+            if send_admin_template_line(cur, attendance_id, student, eff, "missing_checkout", check_in_time=a["check_in_time"], when=now):
                 cur.execute("UPDATE attendance SET missing_checkout_notified_at=%s,updated_at=%s WHERE id=%s", (now,now,attendance_id))
             conn.commit()
     return RedirectResponse("/admin", status_code=303)
@@ -1615,40 +1871,83 @@ def manual_missing(attendance_id: int, _: str = Depends(admin_auth)):
 
 @app.get("/admin/templates", response_class=HTMLResponse)
 def admin_templates(_: str = Depends(admin_auth)):
-    body=[f"<div class='top'><div><h1>LINE 通知範本</h1><div class='muted'>預設範本 + 個別學生覆寫。一次性覆寫送出成功後會自動恢復預設；期限型覆寫到期後自動恢復預設。</div></div>{admin_nav()}</div>"]
+    body = [
+        f"<div class='top'><div><h1>LINE 通知範本</h1><div class='muted'>系統版本：V{APP_VERSION}｜預設範本 + 個別學生覆寫。一次性覆寫送出成功後自動恢復預設；期限型覆寫到期後自動恢復預設。</div></div>{admin_nav()}</div>"
+    ]
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
+                ensure_notification_template_schema(cur)
+                seed_notification_templates(cur)
+                conn.commit()
                 cur.execute("SELECT id,notification_type,template_text FROM notification_templates WHERE student_id IS NULL AND active=TRUE ORDER BY id")
-                defaults=cur.fetchall()
-                cur.execute("SELECT id,student_code,name FROM students WHERE active=TRUE ORDER BY name")
-                students=cur.fetchall()
-                cur.execute("""SELECT nt.id,nt.notification_type,nt.template_text,nt.mode,nt.remaining_uses,nt.expires_at,nt.note,s.student_code,s.name
-                             FROM notification_templates nt JOIN students s ON s.id=nt.student_id
-                             WHERE nt.student_id IS NOT NULL AND nt.active=TRUE
-                             ORDER BY s.name,nt.notification_type,nt.created_at DESC""")
-                overrides=cur.fetchall()
+                defaults = cur.fetchall()
+                cur.execute("SELECT id,student_code,name FROM students WHERE active=TRUE ORDER BY name,id")
+                students = cur.fetchall()
+                cur.execute(
+                    """SELECT nt.id,nt.notification_type,nt.template_text,nt.mode,nt.remaining_uses,nt.expires_at,nt.note,s.student_code,s.name
+                       FROM notification_templates nt JOIN students s ON s.id=nt.student_id
+                       WHERE nt.student_id IS NOT NULL AND nt.active=TRUE
+                       ORDER BY s.name,s.id,nt.notification_type,nt.created_at DESC"""
+                )
+                overrides = cur.fetchall()
     except Exception as exc:
-        return page("LINE 通知範本錯誤", f"<section><h2>LINE 通知範本目前無法開啟</h2><div class='err'>{escape(str(exc))}</div><p>請重新部署 V0.5.0，系統會自動補齊舊資料庫缺少的通知範本欄位。</p>{admin_nav()}</section>")
-    body.append("<section><h2>預設範本</h2><p class='muted'>可使用變數：{greeting}、{thanks}、{student_name}、{course_name}、{teacher_name}、{scheduled_start}、{scheduled_end}、{check_in_time}、{check_out_time}、{now_time}、{late_minutes}。</p><div style='overflow:auto'><table><tr><th>通知</th><th>範本內容</th><th>操作</th></tr>")
+        logger.exception("通知範本頁面失敗")
+        detail = escape(str(exc)[:1200])
+        return page(
+            "LINE 通知範本診斷",
+            f"<section><h1>LINE 通知範本無法開啟</h1><div class='alert danger'>❌ {detail}</div>"
+            f"<p>程式版本：<b>V{APP_VERSION}</b></p><p>這個版本會在開啟本頁時自動修復通知範本表結構；如果仍失敗，請查看 <a href='/admin/diagnostics'>系統診斷</a> 與 Render Logs。</p>"
+            f"<p><a class='btn btn2' href='/admin'>返回管理頁</a> <a class='btn btn2' href='/health'>檢查版本</a> <a class='btn btn2' href='/admin/diagnostics'>系統診斷</a></p></section>"
+        )
+
+    body.append("<section><h2>預設範本</h2><p class='muted'>可使用變數：{greeting}、{thanks}、{student_name}、{student_code}、{course_name}、{teacher_name}、{scheduled_start}、{scheduled_end}、{check_in_time}、{check_out_time}、{now_time}、{late_minutes}。未知變數會原樣保留，不會讓整個出勤流程失敗。</p><div style='overflow:auto'><table><tr><th>通知</th><th>範本內容</th><th>操作</th></tr>")
     for r in defaults:
-        body.append(f"<tr><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td><td><form method='post' action='/admin/template/default'><input type='hidden' name='notification_type' value='{escape(r['notification_type'])}'><textarea name='template_text' rows='4' style='min-width:520px'>{escape(r['template_text'])}</textarea></td><td><button>儲存預設範本</button></form></td></tr>")
+        form_id = f"default_template_{r['id']}"
+        body.append(
+            f"<tr><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td>"
+            f"<td><textarea form='{form_id}' name='template_text' rows='4' style='min-width:520px'>{escape(r['template_text'])}</textarea></td>"
+            f"<td><form id='{form_id}' method='post' action='/admin/template/default'><input type='hidden' name='notification_type' value='{escape(r['notification_type'])}'><button>儲存預設範本</button></form></td></tr>"
+        )
     body.append("</table></div></section>")
-    student_options=''.join(f"<option value='{s['id']}'>{escape(s['name'])}｜{escape(s['student_code'])}</option>" for s in students)
-    type_options=''.join(f"<option value='{k}'>{escape(v)}</option>" for k,v in TEMPLATE_TYPE_LABELS.items())
-    body.append(f"<section><h2>新增／修改個別學生範本</h2><p class='muted'>適合臨時通知。例如：媽媽您好，采璇說日記回去想，先離開教室了，感謝媽媽😊。選「一次性」後，第一次成功送出就自動回復預設範本。</p><form method='post' action='/admin/template/student'><div class='grid'><label>學生<br><select name='student_id'>{student_options}</select></label><label>通知類型<br><select name='notification_type'>{type_options}</select></label><label>套用方式<br><select name='mode'><option value='permanent'>永久個別</option><option value='once'>一次性（送出成功後自動恢復）</option><option value='until'>期限內</option></select></label><label>剩餘次數<br><input type='number' name='remaining_uses' value='1' min='1'></label></div><p>範本內容</p><textarea name='template_text' rows='5' style='width:100%' placeholder='例如：{greeting}，{student_name}說日記回去想，先離開教室了，{thanks}😊'></textarea><p>期限（選填，格式 YYYY-MM-DD HH:MM） <input class='wide' name='expires_at' placeholder='例如 2026-09-20 20:00'>　備註 <input class='wide' name='note' placeholder='例如：今天臨時通知'></p><button>儲存個別範本</button></form></section>")
-    rows=[]
+
+    student_options = ''.join(f"<option value='{s['id']}'>{escape(s['name'])}｜{escape(s['student_code'])}</option>" for s in students)
+    type_options = ''.join(f"<option value='{k}'>{escape(v)}</option>" for k, v in TEMPLATE_TYPE_LABELS.items())
+    body.append(
+        f"<section><h2>新增／修改個別學生範本</h2><p class='muted'>一次性範本第一次成功送出後自動恢復預設。</p>"
+        f"<form method='post' action='/admin/template/student'><div class='grid'>"
+        f"<label>學生<br><select name='student_id' required>{student_options}</select></label>"
+        f"<label>通知類型<br><select name='notification_type' required>{type_options}</select></label>"
+        f"<label>套用方式<br><select name='mode'><option value='permanent'>永久個別</option><option value='once'>一次性（成功送出後自動恢復）</option><option value='until'>期限內</option></select></label>"
+        f"<label>剩餘次數<br><input type='number' name='remaining_uses' value='1' min='1'></label></div>"
+        f"<p>範本內容</p><textarea name='template_text' rows='5' style='width:100%' required placeholder='例如：{{greeting}}，{{student_name}}說今天先離開教室了，{{thanks}}😊'></textarea>"
+        f"<p>期限（選填，格式 YYYY-MM-DD HH:MM） <input class='wide' name='expires_at' placeholder='例如 2026-09-30 20:00'>　備註 <input class='wide' name='note' placeholder='例如：今天臨時通知'></p>"
+        f"<button>儲存個別範本</button></form></section>"
+    )
+
+    rows = []
     for r in overrides:
         expires = r['expires_at'].strftime('%Y-%m-%d %H:%M') if r['expires_at'] else ''
-        mode_label={'permanent':'永久個別','once':'一次性','until':'期限內'}.get(r['mode'],r['mode'])
-        rows.append(f"<tr><td>{escape(r['name'])}<br><span class='muted mini'>{escape(r['student_code'])}</span></td><td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td><td style='white-space:pre-wrap'>{escape(r['template_text'])}</td><td>{mode_label}<br>剩餘：{r['remaining_uses'] if r['remaining_uses'] is not None else '不限'}<br>有效至：{expires or '不限'}</td><td><form method='post' action='/admin/template/{r['id']}/restore'><button class='btn btn2 mini'>恢復預設</button></form></td></tr>")
-    body.append("<section><h2>目前有效的個別範本</h2><div style='overflow:auto'><table><tr><th>學生</th><th>通知</th><th>內容</th><th>規則</th><th>操作</th></tr>"+''.join(rows)+"</table></div></section>")
-    body.append("<section><h2>Excel 管理</h2><p>下載 CSV 後可直接用 Excel 修改。欄位支援：通知類型、學生編號、訊息範本、套用方式、剩餘次數、有效至、啟用、備註。學生編號留白代表修改預設範本。修改後請另存為「CSV UTF-8」再上傳。</p><p><a class='btn btn2' href='/admin/templates/export.csv'>下載通知範本 CSV</a></p><form method='post' action='/admin/templates/import.csv' enctype='multipart/form-data'><input type='file' name='file' accept='.csv,text/csv' required> <button>匯入通知範本 CSV</button></form></section>")
+        mode_label = {'permanent':'永久個別','once':'一次性','until':'期限內','default':'預設'}.get(r['mode'], r['mode'])
+        rows.append(
+            f"<tr><td>{escape(r['name'])}<br><span class='muted mini'>{escape(r['student_code'])}</span></td>"
+            f"<td>{escape(TEMPLATE_TYPE_LABELS.get(r['notification_type'],r['notification_type']))}</td>"
+            f"<td style='white-space:pre-wrap'>{escape(r['template_text'])}</td>"
+            f"<td>{escape(mode_label)}<br>剩餘：{r['remaining_uses'] if r['remaining_uses'] is not None else '不限'}<br>有效至：{expires or '不限'}</td>"
+            f"<td><form method='post' action='/admin/template/{r['id']}/restore'><button class='btn btn2 mini'>恢復預設</button></form></td></tr>"
+        )
+    body.append("<section><h2>目前有效的個別範本</h2><div style='overflow:auto'><table><tr><th>學生</th><th>通知</th><th>內容</th><th>規則</th><th>操作</th></tr>" + ''.join(rows) + "</table></div></section>")
+    body.append("<section><h2>Excel／CSV 管理</h2><p>通知範本仍以總表「出勤通知模板」與「出勤通知個別」為管理來源；此頁可做即時校正。</p><p><a class='btn btn2' href='/admin/templates/export.csv'>下載通知範本 CSV</a></p><form method='post' action='/admin/templates/import.csv' enctype='multipart/form-data'><input type='file' name='file' accept='.csv,text/csv' required> <button>匯入通知範本 CSV</button></form></section>")
     return page("LINE 通知範本", ''.join(body))
 
 
 @app.post("/admin/template/default")
 def save_default_template(notification_type: str=Form(...), template_text: str=Form(...), _: str=Depends(admin_auth)):
+    # 自動修復舊版通知範本表結構。
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            ensure_notification_template_schema(cur)
+            conn.commit()
     if notification_type not in DEFAULT_NOTIFICATION_TEMPLATES:
         raise HTTPException(400,"不支援的通知類型")
     if not template_text.strip():
@@ -1670,6 +1969,11 @@ def parse_template_expiry(value: str) -> datetime | None:
 
 @app.post("/admin/template/student")
 def save_student_template(student_id:int=Form(...), notification_type:str=Form(...), template_text:str=Form(...), mode:str=Form(...), remaining_uses:int=Form(1), expires_at:str=Form(""), note:str=Form(""), _: str=Depends(admin_auth)):
+    # 自動修復舊版通知範本表結構。
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            ensure_notification_template_schema(cur)
+            conn.commit()
     if notification_type not in DEFAULT_NOTIFICATION_TEMPLATES:
         raise HTTPException(400,"不支援的通知類型")
     if mode not in {"permanent","once","until"}:
@@ -1691,6 +1995,11 @@ def save_student_template(student_id:int=Form(...), notification_type:str=Form(.
 
 @app.post("/admin/template/{template_id}/restore")
 def restore_student_template(template_id:int, _: str=Depends(admin_auth)):
+    # 自動修復舊版通知範本表結構。
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            ensure_notification_template_schema(cur)
+            conn.commit()
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE notification_templates SET active=FALSE,updated_at=%s WHERE id=%s AND student_id IS NOT NULL", (now_local(),template_id))
@@ -1700,6 +2009,10 @@ def restore_student_template(template_id:int, _: str=Depends(admin_auth)):
 
 @app.get("/admin/templates/export.csv")
 def export_notification_templates(_: str=Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            ensure_notification_template_schema(cur)
+            conn.commit()
     buf=io.StringIO(); buf.write("\ufeff"); writer=csv.writer(buf)
     writer.writerow(["通知類型","學生編號","學生姓名","訊息範本","套用方式","剩餘次數","有效至","啟用","備註"])
     with db_conn() as conn:
@@ -2111,6 +2424,28 @@ def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set
     return imported, affected
 
 
+def _normalize_excel_time(value: Any) -> str:
+    """Normalize Excel numeric/文字時間 to HH:MM."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        number = float(text)
+        if 0 <= number < 1:
+            total = int(round(number * 24 * 60)) % (24 * 60)
+            return f"{total // 60:02d}:{total % 60:02d}"
+    except (TypeError, ValueError):
+        pass
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", text)
+    if m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mm <= 59:
+            return f"{h:02d}:{mm:02d}"
+    return text
+
+
 def _xlsx_col_index(ref: str) -> int:
     letters = "".join(ch for ch in ref if ch.isalpha())
     n = 0
@@ -2174,9 +2509,11 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
         # 因此不要硬把第 1 列當欄位名稱；改找出包含關鍵欄位的標題列。
         header_idx = 0
         known_headers = {
-            "學生編號", "學生姓名", "姓名", "身分", "學生姓名/關聯（可多位）",
+            "Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源", "固定課表ID", "調課ID", "調課結果", "備註", "學生編號", "學生姓名", "姓名", "身分", "學生姓名/關聯（可多位）",
             "學生姓名/關聯", "LINE User ID", "LINE ID", "LINE_ID", "關係",
-            "家長提醒", "啟用", "簽到識別碼"
+            "家長提醒", "啟用", "簽到識別碼", "下課時間（出勤用）", "開始時間（出勤用）",
+            "通知類型", "預設訊息範本", "個別訊息範本", "套用方式", "剩餘次數", "有效至",
+            "設定項目", "目前值", "用途", "說明"
         }
         best_score = -1
         for i, row in enumerate(matrix[:10]):
@@ -2186,6 +2523,14 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
                 best_score = score
                 header_idx = i
         headers = [matrix[header_idx].get(i, "").strip() for i in range(max_col + 1)]
+        # 支援目前總表「實際課程」把「下課時間（出勤用）」放在上一列標題區的情況。
+        for prior_row in matrix[:header_idx]:
+            for i, value in prior_row.items():
+                label = str(value).strip()
+                if label in known_headers and (i >= len(headers) or not headers[i]):
+                    if i >= len(headers):
+                        headers.extend([""] * (i + 1 - len(headers)))
+                    headers[i] = label
         out = []
         for row in matrix[header_idx + 1:]:
             obj = {headers[i]: row.get(i, "") for i in range(len(headers)) if headers[i]}
@@ -2232,6 +2577,7 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
     errors: list[str] = []
     parsed_rows: list[dict[str, Any]] = []
     dates: set[date] = set()
+    invalid_dates: set[date] = set()
     for i, raw in enumerate(rows, start=2):
         row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
         actual_id = row.get("Course ID", "") or row.get("課程ID", "")
@@ -2239,15 +2585,21 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
         student_code = row.get("學生編號", "") or row.get("學生ID", "")
         student_name = row.get("學生", "") or row.get("學生姓名", "") or row.get("姓名", "")
         time_text = row.get("上課時間", "") or row.get("課程時間", "") or ""
-        start_time = row.get("開始時間", "") or row.get("開始", "") or ""
-        end_time = row.get("下課時間", "") or row.get("結束時間", "") or row.get("結束", "") or ""
+        start_time = row.get("開始時間（出勤用）", "") or row.get("開始時間", "") or row.get("開始", "") or ""
+        end_time = row.get("下課時間（出勤用）", "") or row.get("下課時間", "") or row.get("結束時間", "") or row.get("結束", "") or ""
+        start_time = _normalize_excel_time(start_time)
+        end_time = _normalize_excel_time(end_time)
         if not start_time and time_text:
-            m = re.search(r"(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})", time_text)
+            m = re.search(r"(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})", str(time_text))
             if m:
                 start_time, end_time = m.group(1), m.group(2)
             else:
-                start_time = time_text
+                start_time = _normalize_excel_time(time_text)
+        start_time = _normalize_excel_time(start_time)
+        end_time = _normalize_excel_time(end_time)
         if not actual_id or not course_date or not student_name or not start_time:
+            if course_date:
+                invalid_dates.add(course_date)
             skipped += 1
             if any(row.values()):
                 errors.append(f"第 {i} 列缺少 Course ID／日期／學生／上課時間，已略過。")
@@ -2258,6 +2610,8 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
             if end_time:
                 parse_hhmm(end_time, course_date)
         except ValueError:
+            if course_date:
+                invalid_dates.add(course_date)
             skipped += 1
             errors.append(f"第 {i} 列時間格式錯誤：{start_time}-{end_time}。")
             continue
@@ -2268,6 +2622,8 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
             cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
             matches = cur.fetchall()
         if len(matches) != 1:
+            if course_date:
+                invalid_dates.add(course_date)
             skipped += 1
             errors.append(f"第 {i} 列學生「{student_name}」無法唯一對應（找到 {len(matches)} 位）。")
             continue
@@ -2287,8 +2643,8 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
         dates.add(course_date)
 
     # 以「實際課程」為該日期唯一來源：該日期原本同步進來的課程先停用，再寫入新快照。
-    for d in dates:
-        cur.execute("UPDATE courses SET active=FALSE WHERE actual_course_id IS NOT NULL AND course_date=%s", (d,))
+    for d in dates - invalid_dates:
+        cur.execute("UPDATE courses SET active=FALSE WHERE actual_course_id IS NOT NULL AND COALESCE(source,'實際課程')='實際課程' AND course_date=%s", (d,))
 
     for r in parsed_rows:
         cur.execute("SELECT id FROM courses WHERE actual_course_id=%s", (r["actual_id"],))
@@ -2340,6 +2696,9 @@ async def import_line_master_xlsx(file: UploadFile = File(...), _: str = Depends
         contact_rows = _xlsx_read_sheet(raw, "聯絡人")
         actual_course_rows = _xlsx_read_sheet(raw, "實際課程")
         reminder_rows = _xlsx_read_sheet(raw, "課程提醒")
+        attendance_settings_rows = _xlsx_read_sheet(raw, "出勤設定")
+        attendance_template_rows = _xlsx_read_sheet(raw, "出勤通知模板")
+        attendance_individual_template_rows = _xlsx_read_sheet(raw, "出勤通知個別")
     except Exception as exc:
         raise HTTPException(400, f"讀取 Excel 失敗：{exc}") from exc
 
@@ -2350,6 +2709,12 @@ async def import_line_master_xlsx(file: UploadFile = File(...), _: str = Depends
             _upsert_students_from_excel(cur, student_rows)
             if actual_course_rows:
                 actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
+            if attendance_settings_rows:
+                sync_runtime_settings(cur, attendance_settings_rows)
+            if attendance_template_rows:
+                sync_default_templates_from_excel(cur, attendance_template_rows)
+            if attendance_individual_template_rows:
+                sync_individual_templates_from_excel(cur, attendance_individual_template_rows)
             if binding_rows:
                 binding_imported, _ = _upsert_line_binding_rows(cur, binding_rows)
             # 相容目前 V4 總表的「聯絡人」格式：家長可在「學生姓名/關聯」放多位學生，以「、」分隔。
@@ -2365,9 +2730,11 @@ async def import_line_master_xlsx(file: UploadFile = File(...), _: str = Depends
                     for student_name in [x.strip() for x in related.replace("，", "、").split("、") if x.strip()]:
                         fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
                 binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
+            # 同步完成後把最新出勤設定讀入目前 worker；未來重啟也會從 runtime_settings 恢復。
+            load_runtime_settings(cur)
             conn.commit()
 
-    if actual_imported == 0 and not student_rows and not binding_rows and not contact_rows and not actual_course_rows and not reminder_rows:
+    if actual_imported == 0 and not student_rows and not binding_rows and not contact_rows and not actual_course_rows and not reminder_rows and not attendance_settings_rows and not attendance_template_rows and not attendance_individual_template_rows:
         raise HTTPException(400, "Excel 找不到可同步的資料。請確認包含「實際課程」、「出勤學生」、「出勤LINE綁定」或「聯絡人」工作表。")
 
     msg = f"actual={actual_imported}; skipped={actual_skipped}; binding={binding_imported}"
@@ -2478,7 +2845,8 @@ def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
 
 @app.get("/scan/{token}", response_class=HTMLResponse)
 def scan(token: str, request: Request):
-    require_checkin_device(request)
+    if setting_enabled("教室設備限制", True):
+        require_checkin_device(request)
     result = scan_student(token)
     kind = result.get("kind")
     if kind == "check_in":
@@ -2604,6 +2972,55 @@ async def line_webhook(request: Request):
     return JSONResponse({"ok": True, "events": len(events)})
 
 
+@app.get("/admin/diagnostics", response_class=HTMLResponse)
+def admin_diagnostics(_: str = Depends(admin_auth)):
+    checks = []
+    checks.append(("程式版本", f"V{APP_VERSION}"))
+    checks.append(("LINE 模式", escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))))
+    checks.append(("LINE Access Token", "已設定" if LINE_CHANNEL_ACCESS_TOKEN else "缺少"))
+    checks.append(("LINE Channel Secret", "已設定" if LINE_CHANNEL_SECRET else "缺少"))
+    checks.append(("LINE Admin User ID", "已設定" if LINE_ADMIN_USER_ID else "缺少"))
+    db_error = None
+    schema = {}
+    counts = {}
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                schema = db_schema_summary(cur)
+                for table in ["students","courses","attendance","student_line_bindings","notification_templates","runtime_settings","line_message_logs","notification_logs"]:
+                    try:
+                        cur.execute(f'SELECT COUNT(*) AS c FROM "{table}"')
+                        counts[table] = cur.fetchone()["c"]
+                    except Exception as exc:
+                        counts[table] = f"錯誤：{str(exc)[:160]}"
+    except Exception as exc:
+        db_error = str(exc)[:1000]
+    body = [f"<div class='top'><div><h1>系統診斷</h1><div class='muted'>V{APP_VERSION}｜此頁不顯示任何 Token／Secret 內容</div></div>{admin_nav()}</div>"]
+    body.append("<section><h2>執行環境</h2><table><tr><th>項目</th><th>結果</th></tr>" + ''.join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k,v in checks) + "</table></section>")
+    if db_error:
+        body.append(f"<section><h2>資料庫</h2><div class='alert danger'>❌ {escape(db_error)}</div></section>")
+    else:
+        body.append("<section><h2>資料表欄位檢查</h2><div style='overflow:auto'><table><tr><th>資料表</th><th>必要欄位</th></tr>" + ''.join(
+            f"<tr><td>{escape(t)}</td><td>" + ' '.join(f"<span class={'green' if ok else 'red'}>{escape(c)}：{'OK' if ok else '缺少'}</span>" for c, ok in cols.items()) + "</td></tr>" for t, cols in schema.items()
+        ) + "</table></div></section>")
+        body.append("<section><h2>資料量</h2><table><tr><th>資料表</th><th>筆數</th></tr>" + ''.join(f"<tr><td>{escape(t)}</td><td>{escape(str(c))}</td></tr>" for t,c in counts.items()) + "</table></section>")
+    body.append("<section><h2>版本確認</h2><p>部署這個版本後，<code>/health</code> 應該回傳 <b>0.5.2</b>；若仍看到舊版本或黑底 Internal Server Error，代表目前 Render 服務沒有實際執行這個 build。</p></section>")
+    return page("系統診斷", ''.join(body))
+
+
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True, "line_mode": LINE_MODE, "database": "postgres", "version": "0.5.0"})
+    db_ok = False
+    db_error = None
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                db_ok = True
+    except Exception as exc:
+        db_error = str(exc)[:300]
+    payload = {"ok": db_ok, "line_mode": LINE_MODE, "database": "postgres", "version": APP_VERSION, "build": f"attendance-v{APP_VERSION}-full-audit", "config": {"line_channel_access_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "line_channel_secret": bool(LINE_CHANNEL_SECRET), "line_admin_user_id": bool(LINE_ADMIN_USER_ID)}}
+    if db_error:
+        payload["database_error"] = db_error
+    return JSONResponse(payload, status_code=200 if db_ok else 503, headers={"Cache-Control": "no-store"})
