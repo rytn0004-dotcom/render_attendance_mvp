@@ -30,3 +30,9 @@ Start Command：`uvicorn app:app --host 0.0.0.0 --port $PORT`
 5. 上傳最新版 V2.8.3 總表後，確認「實際課程」不是 0 筆。
 
 不要把任何 LINE Token/Secret 寫進 ZIP。
+
+## 紀錄保留政策
+- `line_message_logs` 與 `notification_logs` 不自動清除。
+- 管理員可從 `/admin/logs` 個別刪除或全部刪除。
+- 個別刪除需二次確認；全部刪除需輸入指定確認文字。
+- 刪除只影響管理後台紀錄，不會撤回 LINE 已送出的訊息，也不會刪除出勤、學生、課程、LINE 綁定或通知範本。

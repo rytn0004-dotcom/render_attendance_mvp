@@ -25,7 +25,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1531,7 +1531,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2157,7 +2157,7 @@ def admin_line(request: Request, _: str = Depends(admin_auth)):
 
     body.append("<section><h2>匯入原本 LINE 客服／總表 Excel 的綁定資料</h2><p>目前總表包含「實際課程」、「出勤學生」與「出勤LINE綁定」等資料。Render 匯入後，出勤的日期／時間唯一依據是「實際課程」；LINE 綁定則使用「出勤LINE綁定」，若該表沒有可用資料才回退讀取「聯絡人」。每一列 LINE 綁定代表「一位學生＋一位家長」。</p><p><b>推薦：</b>直接上傳目前的總表 <code>.xlsx</code>；如果只想匯入綁定，也可上傳 CSV。</p><form method='post' action='/admin/line/import.xlsx' enctype='multipart/form-data'><input type='file' name='file' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required> <button>匯入總表 Excel</button></form><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data' style='margin-top:8px'><input type='file' name='file' accept='.csv,text/csv' required> <button class='btn btn2'>匯入 LINE 綁定 CSV</button></form><p><a class='btn btn2' href='/admin/line/export.csv'>下載目前 LINE 綁定 CSV</a></p><p class='mini muted'>出勤同步會讀取「實際課程」、「出勤學生」、「出勤LINE綁定」。實際課程由固定課表＋已確認調課形成；「課程提醒」仍維持原系統獨立發送，不會改變出勤時間。每位家長的「家長提醒」可個別開關。</p></section>")
 
-    log_table=["<section><h2>最近 LINE 訊息</h2><div style='overflow:auto'><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"]
+    log_table=["<section><h2>最近 LINE 訊息</h2><p class='mini muted'>紀錄會永久保留，除非管理員手動刪除；這裡只顯示最新 80 筆。</p><p><a class='btn btn2' href='/admin/logs'>前往訊息紀錄管理</a></p><div style='overflow:auto'><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"]
     for r in logs:
         dlabel="收到" if r['direction']=='inbound' else "送出"
         mtype={"push":"主動推送","reply":"回覆","text":"文字"}.get(r['message_type'],r['message_type'])
@@ -2166,6 +2166,175 @@ def admin_line(request: Request, _: str = Depends(admin_auth)):
     log_table.append("</table></div></section>")
     body.append("".join(log_table))
     return page("LINE 綁定 / 測試", "".join(body))
+
+
+# ---------- Manual log management ----------
+
+def _log_confirm_page(kind: str, action: str, title: str, detail: str, form_action: str) -> str:
+    phrase = "刪除全部 LINE 訊息紀錄" if kind == "line_all" else "刪除全部出勤通知紀錄" if kind == "notification_all" else "刪除這筆紀錄"
+    extra = ""
+    if kind in {"line_all", "notification_all"}:
+        extra = (
+            f"<p>為避免誤刪，請在下方輸入：<code>{escape(phrase)}</code></p>"
+            f"<input class='wide' name='confirm_text' placeholder='{escape(phrase)}' required>"
+        )
+    else:
+        extra = "<label><input type='checkbox' name='confirm' value='yes' required style='width:auto'> 我確認要刪除此筆紀錄。</label>"
+    body = (
+        f"<section><h1>{escape(title)}</h1>"
+        f"<div class='alert danger'>⚠️ {escape(detail)}</div>"
+        f"<p class='mini muted'>刪除的是管理後台的紀錄，不會撤回已經發送到 LINE 的訊息，也不會刪除學生、課程、出勤紀錄、LINE 綁定或通知範本。</p>"
+        f"<form method='post' action='{escape(form_action)}'>{extra}"
+        f"<div style='margin-top:14px'><button type='submit'>確認刪除</button> <a class='btn btn2' href='/admin/logs'>取消</a></div></form></section>"
+    )
+    return page("確認刪除紀錄", body)
+
+
+@app.get("/admin/logs", response_class=HTMLResponse)
+def admin_logs(_: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM line_message_logs")
+            line_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM notification_logs")
+            notification_count = cur.fetchone()["c"]
+            cur.execute("SELECT * FROM line_message_logs ORDER BY id DESC LIMIT 80")
+            line_logs = cur.fetchall()
+            cur.execute("SELECT * FROM notification_logs ORDER BY id DESC LIMIT 50")
+            notification_logs = cur.fetchall()
+
+    body = [
+        f"<div class='top'><div><h1>訊息紀錄管理</h1><div class='muted'>V{APP_VERSION}｜紀錄不自動清除，只能由管理員手動刪除。</div></div>{admin_nav()}</div>",
+        "<div class='alert'>保留政策：<b>永久保留，直到管理員手動刪除。</b>這裡沒有 30 天自動清理，也不會因為背景程序或重新整理頁面而刪除紀錄。畫面只顯示最近一部分，資料庫仍保留全部紀錄。</div>",
+        f"<section><h2>LINE 訊息紀錄</h2><p>資料庫目前共有 <b>{line_count}</b> 筆；畫面顯示最新 80 筆。</p>"
+        f"<p><a class='btn btn2' href='/admin/logs/line/delete-all-confirm'>刪除全部 LINE 訊息紀錄</a></p>",
+        "<div style='overflow:auto'><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th><th>操作</th></tr>"
+    ]
+    for r in line_logs:
+        dlabel = "收到" if r["direction"] == "inbound" else "送出"
+        mtype = {"push":"主動推送","reply":"回覆","text":"文字"}.get(r["message_type"], r["message_type"])
+        slabel = {"received":"已收到","sent":"已送出","simulated":"模擬送出","failed":"失敗","disabled":"已關閉"}.get(r["status"], r["status"])
+        body.append(
+            f"<tr><td>{r['created_at']}</td><td>{escape(dlabel)}</td><td>{escape(mtype)}</td>"
+            f"<td class='mini'>{escape(r['line_user_id'] or '')}</td><td>{escape(r['message'] or '')}</td>"
+            f"<td>{escape(slabel)}</td><td><a class='btn btn2 mini' href='/admin/logs/line/{r['id']}/delete-confirm'>刪除</a></td></tr>"
+        )
+    body.append("</table></div></section>")
+
+    body.append(
+        f"<section><h2>出勤通知紀錄</h2><p>資料庫目前共有 <b>{notification_count}</b> 筆；畫面顯示最新 50 筆。</p>"
+        f"<p><a class='btn btn2' href='/admin/logs/notification/delete-all-confirm'>刪除全部出勤通知紀錄</a></p>"
+        "<div style='overflow:auto'><table><tr><th>時間</th><th>類型</th><th>學生</th><th>LINE User ID</th><th>狀態</th><th>錯誤</th><th>操作</th></tr>"
+    )
+    for r in notification_logs:
+        body.append(
+            f"<tr><td>{r['created_at']}</td><td>{escape(notification_type_label(r['notification_type']))}</td>"
+            f"<td>{escape(r.get('student_name') or '')}</td><td class='mini'>{escape(r.get('line_user_id') or '')}</td>"
+            f"<td>{escape(notify_status_label(r.get('status')))}</td><td>{escape(r.get('error_message') or '')}</td>"
+            f"<td><a class='btn btn2 mini' href='/admin/logs/notification/{r['id']}/delete-confirm'>刪除</a></td></tr>"
+        )
+    body.append("</table></div></section>")
+    body.append(
+        "<section><h2>刪除規則</h2><ul><li>單筆刪除：先進入確認頁，再由管理員確認。</li><li>全部刪除：必須再輸入指定文字，避免誤刪。</li><li>刪除只影響管理後台的 log，不會撤回 LINE、刪除出勤、學生、課程、LINE 綁定或通知範本。</li></ul></section>"
+    )
+    return page("訊息紀錄管理", "".join(body))
+
+
+@app.get("/admin/logs/line/{log_id}/delete-confirm", response_class=HTMLResponse)
+def confirm_delete_line_log(log_id: int, _: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,created_at,line_user_id,message FROM line_message_logs WHERE id=%s", (log_id,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "找不到 LINE 訊息紀錄")
+    detail = f"將刪除 {row['created_at']} 的 LINE 訊息紀錄；收件人 {row['line_user_id'] or '-'}。"
+    return _log_confirm_page("line_one", "delete", "確認刪除 LINE 訊息紀錄", detail, f"/admin/logs/line/{log_id}/delete")
+
+
+@app.post("/admin/logs/line/{log_id}/delete")
+def delete_line_log(log_id: int, confirm: str = Form(""), _: str = Depends(admin_auth)):
+    if confirm != "yes":
+        raise HTTPException(400, "請先勾選確認")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM line_message_logs WHERE id=%s", (log_id,))
+            deleted = cur.rowcount
+        conn.commit()
+    if not deleted:
+        raise HTTPException(404, "找不到 LINE 訊息紀錄")
+    return RedirectResponse("/admin/logs", status_code=303)
+
+
+@app.get("/admin/logs/line/delete-all-confirm", response_class=HTMLResponse)
+def confirm_delete_all_line_logs(_: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM line_message_logs")
+            count = cur.fetchone()["c"]
+    detail = f"目前共有 {count} 筆 LINE 訊息紀錄。全部刪除後無法從此系統復原。"
+    return _log_confirm_page("line_all", "delete", "確認刪除全部 LINE 訊息紀錄", detail, "/admin/logs/line/delete-all")
+
+
+@app.post("/admin/logs/line/delete-all")
+def delete_all_line_logs(confirm_text: str = Form(""), _: str = Depends(admin_auth)):
+    required = "刪除全部 LINE 訊息紀錄"
+    if confirm_text.strip() != required:
+        raise HTTPException(400, "確認文字不正確，尚未執行刪除")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM line_message_logs")
+            deleted = cur.rowcount
+        conn.commit()
+    return RedirectResponse("/admin/logs", status_code=303)
+
+
+@app.get("/admin/logs/notification/{log_id}/delete-confirm", response_class=HTMLResponse)
+def confirm_delete_notification_log(log_id: int, _: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,created_at,notification_type,student_name,line_user_id,status FROM notification_logs WHERE id=%s", (log_id,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "找不到出勤通知紀錄")
+    detail = f"將刪除 {row['created_at']} 的 {notification_type_label(row['notification_type'])} 紀錄；學生 {row.get('student_name') or '-'}。"
+    return _log_confirm_page("notification_one", "delete", "確認刪除出勤通知紀錄", detail, f"/admin/logs/notification/{log_id}/delete")
+
+
+@app.post("/admin/logs/notification/{log_id}/delete")
+def delete_notification_log(log_id: int, confirm: str = Form(""), _: str = Depends(admin_auth)):
+    if confirm != "yes":
+        raise HTTPException(400, "請先勾選確認")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM notification_logs WHERE id=%s", (log_id,))
+            deleted = cur.rowcount
+        conn.commit()
+    if not deleted:
+        raise HTTPException(404, "找不到出勤通知紀錄")
+    return RedirectResponse("/admin/logs", status_code=303)
+
+
+@app.get("/admin/logs/notification/delete-all-confirm", response_class=HTMLResponse)
+def confirm_delete_all_notification_logs(_: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM notification_logs")
+            count = cur.fetchone()["c"]
+    detail = f"目前共有 {count} 筆出勤通知紀錄。全部刪除後無法從此系統復原。"
+    return _log_confirm_page("notification_all", "delete", "確認刪除全部出勤通知紀錄", detail, "/admin/logs/notification/delete-all")
+
+
+@app.post("/admin/logs/notification/delete-all")
+def delete_all_notification_logs(confirm_text: str = Form(""), _: str = Depends(admin_auth)):
+    required = "刪除全部出勤通知紀錄"
+    if confirm_text.strip() != required:
+        raise HTTPException(400, "確認文字不正確，尚未執行刪除")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM notification_logs")
+        conn.commit()
+    return RedirectResponse("/admin/logs", status_code=303)
 
 
 @app.post("/admin/student/{student_id}/binding-link", response_class=HTMLResponse)
@@ -3004,7 +3173,7 @@ def admin_diagnostics(_: str = Depends(admin_auth)):
             f"<tr><td>{escape(t)}</td><td>" + ' '.join(f"<span class={'green' if ok else 'red'}>{escape(c)}：{'OK' if ok else '缺少'}</span>" for c, ok in cols.items()) + "</td></tr>" for t, cols in schema.items()
         ) + "</table></div></section>")
         body.append("<section><h2>資料量</h2><table><tr><th>資料表</th><th>筆數</th></tr>" + ''.join(f"<tr><td>{escape(t)}</td><td>{escape(str(c))}</td></tr>" for t,c in counts.items()) + "</table></section>")
-    body.append("<section><h2>版本確認</h2><p>部署這個版本後，<code>/health</code> 應該回傳 <b>0.5.2</b>；若仍看到舊版本或黑底 Internal Server Error，代表目前 Render 服務沒有實際執行這個 build。</p></section>")
+    body.append("<section><h2>版本確認</h2><p>部署這個版本後，<code>/health</code> 應該回傳 <b>0.5.3</b>；若仍看到舊版本或黑底 Internal Server Error，代表目前 Render 服務沒有實際執行這個 build。</p></section>")
     return page("系統診斷", ''.join(body))
 
 
@@ -3020,7 +3189,7 @@ def health():
                 db_ok = True
     except Exception as exc:
         db_error = str(exc)[:300]
-    payload = {"ok": db_ok, "line_mode": LINE_MODE, "database": "postgres", "version": APP_VERSION, "build": f"attendance-v{APP_VERSION}-full-audit", "config": {"line_channel_access_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "line_channel_secret": bool(LINE_CHANNEL_SECRET), "line_admin_user_id": bool(LINE_ADMIN_USER_ID)}}
+    payload = {"ok": db_ok, "line_mode": LINE_MODE, "database": "postgres", "version": APP_VERSION, "build": f"attendance-v{APP_VERSION}-manual-log-delete", "config": {"line_channel_access_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "line_channel_secret": bool(LINE_CHANNEL_SECRET), "line_admin_user_id": bool(LINE_ADMIN_USER_ID)}}
     if db_error:
         payload["database_error"] = db_error
     return JSONResponse(payload, status_code=200 if db_ok else 503, headers={"Cache-Control": "no-store"})
