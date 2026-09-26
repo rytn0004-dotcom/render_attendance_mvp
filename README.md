@@ -3,7 +3,7 @@
 本版本在 V0.5.x 基礎上加入「主總表自動同步」。正式運作時不必每次手動把總表上傳到 Render；Render 會從 Google Drive 讀取指定的私有 XLSX，依排程檢查檔案是否更新，更新才同步到 PostgreSQL。
 
 ## 新增功能
-- Google Drive 私有 XLSX 自動同步，預設每 10 分鐘檢查。
+- Google Drive 私有 XLSX／Google 試算表自動同步，預設每 10 分鐘檢查。
 - 啟動時可先同步一次（`MASTER_SYNC_ON_STARTUP=true`）。
 - 使用 Google Drive `fileId` + Service Account；檔案不需要公開。
 - 先取得檔案版本／checksum，未更新就不重匯。
@@ -16,8 +16,8 @@
 ## Google Drive 設定
 1. 在 Google Cloud 建立 Service Account。
 2. 取得 Service Account 的 email。
-3. 將你的正式主總表 XLSX 只分享給這個 Service Account，權限給 Viewer 即可。
-4. 取得該檔案的 `File ID`。
+3. 將你的正式主總表 XLSX 或 Google 試算表只分享給這個 Service Account，權限給 Viewer 即可。
+4. 取得該檔案的 `File ID`（Google 試算表網址 `/spreadsheets/d/` 後面的那段）。
 5. 在 Render 設定：
    - `MASTER_SYNC_ENABLED=true`
    - `MASTER_SYNC_PROVIDER=google_drive`
@@ -31,7 +31,7 @@ Base64 產生方式（Windows PowerShell）：
 產生後只把結果貼到 Render 的 `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`，不要把 JSON 檔或私鑰放進 ZIP。
 
 ## 正式資料流
-你的 V2.8.3 主總表 → Google Drive → Render 自動檢查 → 驗證 XLSX → 同步「實際課程／出勤學生／出勤LINE綁定／出勤通知模板／出勤設定」→ PostgreSQL → QR 出勤與 LINE。
+你的 V2.8.3 主總表 → Google Drive／Google 試算表 → Render 自動檢查 → 匯出/驗證 XLSX → 同步「實際課程／出勤學生／出勤LINE綁定／出勤通知模板／出勤設定」→ PostgreSQL → QR 出勤與 LINE。
 
 ## 安全規則
 - 不把 Token、Secret 或 Service Account JSON 放進 ZIP。

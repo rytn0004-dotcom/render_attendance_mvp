@@ -2923,21 +2923,35 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
         raise RuntimeError("Google Drive 檔案目前禁止下載。")
     name = str(meta.get("name") or "master.xlsx")
     mime = str(meta.get("mimeType") or "")
-    if not name.lower().endswith(".xlsx"):
-        raise RuntimeError(f"Google Drive 指定檔案不是 .xlsx：{name}")
-    size = int(meta.get("size") or 0)
-    if size and size > MASTER_SYNC_MAX_MB * 1024 * 1024:
-        raise RuntimeError(f"總表檔案 {size / 1024 / 1024:.1f} MB 超過上限 {MASTER_SYNC_MAX_MB} MB。")
-    download_resp = session.get(meta_url, params={"alt": "media"}, timeout=60)
-    download_resp.raise_for_status()
-    raw = download_resp.content
+    native_sheet_mime = "application/vnd.google-apps.spreadsheet"
+    if mime == native_sheet_mime:
+        # Google 試算表原生文件：透過 Drive export API 轉成 XLSX，再沿用既有 Excel 解析器。
+        export_url = f"https://www.googleapis.com/drive/v3/files/{GOOGLE_DRIVE_FILE_ID}/export"
+        download_resp = session.get(
+            export_url,
+            params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            timeout=60,
+        )
+        download_resp.raise_for_status()
+        raw = download_resp.content
+        source_name = f"{name}.xlsx"
+    else:
+        if not name.lower().endswith(".xlsx"):
+            raise RuntimeError(f"Google Drive 指定檔案不是支援的 XLSX 或 Google 試算表：{name}（{mime}）")
+        size = int(meta.get("size") or 0)
+        if size and size > MASTER_SYNC_MAX_MB * 1024 * 1024:
+            raise RuntimeError(f"總表檔案 {size / 1024 / 1024:.1f} MB 超過上限 {MASTER_SYNC_MAX_MB} MB。")
+        download_resp = session.get(meta_url, params={"alt": "media"}, timeout=60)
+        download_resp.raise_for_status()
+        raw = download_resp.content
+        source_name = name
     if len(raw) > MASTER_SYNC_MAX_MB * 1024 * 1024:
         raise RuntimeError(f"下載後總表超過上限 {MASTER_SYNC_MAX_MB} MB。")
     checksum = str(meta.get("md5Checksum") or hashlib.md5(raw).hexdigest())
     return raw, {
         "provider": "google_drive",
         "source_key": GOOGLE_DRIVE_FILE_ID,
-        "source_name": name,
+        "source_name": source_name,
         "remote_modified_at": str(meta.get("modifiedTime") or ""),
         "remote_checksum": checksum,
         "mime_type": mime,
