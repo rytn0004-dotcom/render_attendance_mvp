@@ -22,6 +22,20 @@ services:
         value: "60"
       - key: NOTIFICATION_RETRY_COOLDOWN_MINUTES
         value: "15"
+      - key: MASTER_SYNC_ENABLED
+        value: "true"
+      - key: MASTER_SYNC_PROVIDER
+        value: google_drive
+      - key: MASTER_SYNC_INTERVAL_MINUTES
+        value: "10"
+      - key: MASTER_SYNC_ON_STARTUP
+        value: "true"
+      - key: MASTER_SYNC_MAX_MB
+        value: "20"
+      - key: GOOGLE_DRIVE_FILE_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
+        sync: false
       - key: SEED_DEMO_DATA
         value: "false"
       - key: LINE_CHANNEL_ACCESS_TOKEN

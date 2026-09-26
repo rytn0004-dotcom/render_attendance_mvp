@@ -5,3 +5,4 @@ qrcode[pil]>=8.0,<9.0
 requests>=2.32,<3.0
 psycopg[binary]>=3.2,<4.0
 python-multipart>=0.0.20,<1.0
+google-auth>=2.40,<3.0

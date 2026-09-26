@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
+import time
 import io
 import zipfile
 import xml.etree.ElementTree as ET
@@ -19,13 +21,15 @@ from zoneinfo import ZoneInfo
 
 import qrcode
 import requests
+from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.6.0"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -49,6 +53,17 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "test1234")
 DEVICE_COOKIE_NAME = os.getenv("DEVICE_COOKIE_NAME", "attendance_device_token")
 SEED_DEMO_DATA = os.getenv("SEED_DEMO_DATA", "false").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
 NOTIFICATION_RETRY_COOLDOWN_MINUTES = max(1, int(os.getenv("NOTIFICATION_RETRY_COOLDOWN_MINUTES", "15")))
+
+# 主總表自動同步：正式環境建議使用 Google Drive 的私有檔案 + Service Account 讀取。
+MASTER_SYNC_ENABLED = os.getenv("MASTER_SYNC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
+MASTER_SYNC_PROVIDER = os.getenv("MASTER_SYNC_PROVIDER", "google_drive").strip().lower()
+MASTER_SYNC_INTERVAL_MINUTES = max(5, int(os.getenv("MASTER_SYNC_INTERVAL_MINUTES", "10")))
+MASTER_SYNC_ON_STARTUP = os.getenv("MASTER_SYNC_ON_STARTUP", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
+MASTER_SYNC_MAX_MB = max(1, int(os.getenv("MASTER_SYNC_MAX_MB", "20")))
+GOOGLE_DRIVE_FILE_ID = os.getenv("GOOGLE_DRIVE_FILE_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "").strip()
+MASTER_SYNC_LOCK_KEY = "attendance-master-excel-sync-v1"
 
 RUNTIME_SETTINGS = {
     "出勤模組": "啟用",
@@ -568,6 +583,24 @@ def init_db() -> None:
                     used_at TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS master_sync_state (
+                    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                    provider TEXT NOT NULL DEFAULT 'google_drive',
+                    source_key TEXT,
+                    source_name TEXT,
+                    remote_modified_at TEXT,
+                    remote_checksum TEXT,
+                    last_checked_at TIMESTAMP,
+                    last_synced_at TIMESTAMP,
+                    last_success BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_error TEXT,
+                    last_trigger TEXT,
+                    last_actual_imported INTEGER NOT NULL DEFAULT 0,
+                    last_actual_skipped INTEGER NOT NULL DEFAULT 0,
+                    last_binding_imported INTEGER NOT NULL DEFAULT 0,
+                    last_error_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS notification_templates (
                     id BIGSERIAL PRIMARY KEY,
                     notification_type TEXT NOT NULL,
@@ -598,6 +631,7 @@ def init_db() -> None:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_settings_updated ON runtime_settings(updated_at DESC)")
+            cur.execute("INSERT INTO master_sync_state(id,provider,updated_at) VALUES (1,%s,%s) ON CONFLICT(id) DO NOTHING", (MASTER_SYNC_PROVIDER, now_local()))
             cur.execute("UPDATE courses SET late_grace_minutes=%s WHERE late_grace_minutes IS NULL", (DEFAULT_LATE_GRACE_MINUTES,))
             cur.execute("UPDATE courses SET checkout_grace_minutes=%s WHERE checkout_grace_minutes IS NULL", (DEFAULT_CHECKOUT_GRACE_MINUTES,))
             if SEED_DEMO_DATA:
@@ -1511,6 +1545,7 @@ async def periodic_checker():
 async def startup():
     await asyncio.to_thread(init_db)
     asyncio.create_task(periodic_checker())
+    asyncio.create_task(periodic_master_sync())
 
 
 # ---------- HTML helpers ----------
@@ -1531,7 +1566,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2089,6 +2124,19 @@ def admin_line(request: Request, _: str = Depends(admin_auth)):
         if errors and errors != '0':
             body.append(f"<br>⚠️ 有 {escape(errors)} 筆同步資料需要檢查學生姓名／編號或時間格式。")
         body.append("</section>")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            master_state = _get_master_sync_state(cur)
+    sync_configured, sync_config_detail = _master_sync_configured()
+    sync_badge = "✅ 自動同步正常" if master_state.get("last_success") else ("⚠️ 尚未成功同步" if sync_configured else "⚠️ 尚未完成自動同步設定")
+    sync_class = "success" if master_state.get("last_success") else "alert"
+    master_sync_status_html = (
+        f"<section><h2>主總表同步</h2><div class='alert {sync_class}'><b>{escape(sync_badge)}</b>｜{escape(sync_config_detail)}</div>"
+        f"<p>來源：<b>{escape(str(master_state.get('source_name') or '尚未同步'))}</b>｜最後檢查：{escape(str(master_state.get('last_checked_at') or '—'))}｜最後成功：{escape(str(master_state.get('last_synced_at') or '—'))}</p>"
+        f"<p>自動檢查每 <b>{MASTER_SYNC_INTERVAL_MINUTES}</b> 分鐘；手動上傳只作為備援。"
+        f" <a class='btn btn2' href='/admin/master-sync'>查看同步狀態</a></p></section>"
+    )
+    body.append(master_sync_status_html)
     webhook_url=f"{public_base_url()}/webhook/line"
     line_missing = []
     if LINE_MODE == "live":
@@ -2155,7 +2203,7 @@ def admin_line(request: Request, _: str = Depends(admin_auth)):
     table.append("</table></div></section>")
     body.append("".join(table))
 
-    body.append("<section><h2>匯入原本 LINE 客服／總表 Excel 的綁定資料</h2><p>目前總表包含「實際課程」、「出勤學生」與「出勤LINE綁定」等資料。Render 匯入後，出勤的日期／時間唯一依據是「實際課程」；LINE 綁定則使用「出勤LINE綁定」，若該表沒有可用資料才回退讀取「聯絡人」。每一列 LINE 綁定代表「一位學生＋一位家長」。</p><p><b>推薦：</b>直接上傳目前的總表 <code>.xlsx</code>；如果只想匯入綁定，也可上傳 CSV。</p><form method='post' action='/admin/line/import.xlsx' enctype='multipart/form-data'><input type='file' name='file' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required> <button>匯入總表 Excel</button></form><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data' style='margin-top:8px'><input type='file' name='file' accept='.csv,text/csv' required> <button class='btn btn2'>匯入 LINE 綁定 CSV</button></form><p><a class='btn btn2' href='/admin/line/export.csv'>下載目前 LINE 綁定 CSV</a></p><p class='mini muted'>出勤同步會讀取「實際課程」、「出勤學生」、「出勤LINE綁定」。實際課程由固定課表＋已確認調課形成；「課程提醒」仍維持原系統獨立發送，不會改變出勤時間。每位家長的「家長提醒」可個別開關。</p></section>")
+    body.append("<section><h2>總表同步／手動備援</h2><p>正式模式會從 Google Drive 自動同步主總表；這裡的 Excel 上傳保留作為「手動立即更新／緊急備援」。出勤的日期／時間唯一依據是「實際課程」；LINE 綁定使用「出勤LINE綁定」，若該表沒有可用資料才回退讀取「聯絡人」。</p><p><b>自動同步設定：</b>請到「總表同步」確認 Google Drive 檔案與 Service Account 已設定。</p><form method='post' action='/admin/line/import.xlsx' enctype='multipart/form-data'><input type='file' name='file' accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' required> <button>匯入總表 Excel</button></form><form method='post' action='/admin/line/import.csv' enctype='multipart/form-data' style='margin-top:8px'><input type='file' name='file' accept='.csv,text/csv' required> <button class='btn btn2'>匯入 LINE 綁定 CSV</button></form><p><a class='btn btn2' href='/admin/line/export.csv'>下載目前 LINE 綁定 CSV</a></p><p class='mini muted'>出勤同步會讀取「實際課程」、「出勤學生」、「出勤LINE綁定」。實際課程由固定課表＋已確認調課形成；「課程提醒」仍維持原系統獨立發送，不會改變出勤時間。每位家長的「家長提醒」可個別開關。</p></section>")
 
     log_table=["<section><h2>最近 LINE 訊息</h2><p class='mini muted'>紀錄會永久保留，除非管理員手動刪除；這裡只顯示最新 80 筆。</p><p><a class='btn btn2' href='/admin/logs'>前往訊息紀錄管理</a></p><div style='overflow:auto'><table><tr><th>時間</th><th>方向</th><th>類型</th><th>LINE User ID</th><th>訊息</th><th>狀態</th></tr>"]
     for r in logs:
@@ -2838,6 +2886,263 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
     return imported, skipped, errors
 
 
+
+# ---------- Master Excel automatic sync ----------
+
+def _master_sync_credentials():
+    raw = GOOGLE_SERVICE_ACCOUNT_JSON
+    if not raw and GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:
+        import base64 as _b64
+        raw = _b64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.encode("ascii")).decode("utf-8")
+    if not raw:
+        raise RuntimeError("尚未設定 GOOGLE_SERVICE_ACCOUNT_JSON_BASE64（或 GOOGLE_SERVICE_ACCOUNT_JSON）。")
+    try:
+        info = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"Google Service Account JSON 無法解析：{exc}") from exc
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+
+
+def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
+    if not GOOGLE_DRIVE_FILE_ID:
+        raise RuntimeError("尚未設定 GOOGLE_DRIVE_FILE_ID。")
+    creds = _master_sync_credentials()
+    session = AuthorizedSession(creds)
+    meta_url = f"https://www.googleapis.com/drive/v3/files/{GOOGLE_DRIVE_FILE_ID}"
+    meta_resp = session.get(
+        meta_url,
+        params={"fields": "id,name,mimeType,modifiedTime,md5Checksum,size,capabilities(canDownload)"},
+        timeout=30,
+    )
+    meta_resp.raise_for_status()
+    meta = meta_resp.json()
+    if meta.get("capabilities", {}).get("canDownload") is False:
+        raise RuntimeError("Google Drive 檔案目前禁止下載。")
+    name = str(meta.get("name") or "master.xlsx")
+    mime = str(meta.get("mimeType") or "")
+    if not name.lower().endswith(".xlsx"):
+        raise RuntimeError(f"Google Drive 指定檔案不是 .xlsx：{name}")
+    size = int(meta.get("size") or 0)
+    if size and size > MASTER_SYNC_MAX_MB * 1024 * 1024:
+        raise RuntimeError(f"總表檔案 {size / 1024 / 1024:.1f} MB 超過上限 {MASTER_SYNC_MAX_MB} MB。")
+    download_resp = session.get(meta_url, params={"alt": "media"}, timeout=60)
+    download_resp.raise_for_status()
+    raw = download_resp.content
+    if len(raw) > MASTER_SYNC_MAX_MB * 1024 * 1024:
+        raise RuntimeError(f"下載後總表超過上限 {MASTER_SYNC_MAX_MB} MB。")
+    checksum = str(meta.get("md5Checksum") or hashlib.md5(raw).hexdigest())
+    return raw, {
+        "provider": "google_drive",
+        "source_key": GOOGLE_DRIVE_FILE_ID,
+        "source_name": name,
+        "remote_modified_at": str(meta.get("modifiedTime") or ""),
+        "remote_checksum": checksum,
+        "mime_type": mime,
+    }
+
+
+def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
+    if not raw.startswith(b"PK"):
+        raise RuntimeError("主總表不是有效的 .xlsx 檔案。")
+    names = {
+        "出勤學生": "出勤學生",
+        "出勤LINE綁定": "出勤LINE綁定",
+        "聯絡人": "聯絡人",
+        "實際課程": "實際課程",
+        "課程提醒": "課程提醒",
+        "出勤設定": "出勤設定",
+        "出勤通知模板": "出勤通知模板",
+        "出勤通知個別": "出勤通知個別",
+    }
+    out = {}
+    for key, sheet in names.items():
+        out[key] = _xlsx_read_sheet(raw, sheet)
+    # 正式總表至少要有出勤學生與實際課程；缺少這兩張通常代表拿錯檔案，不自動覆蓋目前資料。
+    if not out["出勤學生"] and not out["實際課程"]:
+        raise RuntimeError("總表至少必須包含可讀取的「出勤學生」或「實際課程」資料。")
+    return out
+
+
+def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    student_rows = sheets.get("出勤學生", [])
+    binding_rows = sheets.get("出勤LINE綁定", [])
+    contact_rows = sheets.get("聯絡人", [])
+    actual_course_rows = sheets.get("實際課程", [])
+    attendance_settings_rows = sheets.get("出勤設定", [])
+    attendance_template_rows = sheets.get("出勤通知模板", [])
+    attendance_individual_template_rows = sheets.get("出勤通知個別", [])
+
+    actual_imported = actual_skipped = binding_imported = 0
+    errors: list[str] = []
+    _upsert_students_from_excel(cur, student_rows)
+    if actual_course_rows:
+        actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
+        # 自動同步的安全門檻：如果原檔有實際課程資料，但一筆都無法有效解析，不覆蓋目前線上資料。
+        if actual_imported == 0:
+            raise RuntimeError("總表「實際課程」有資料，但本次沒有任何一筆成功解析；為避免清掉可用資料，本次同步已取消。")
+    if attendance_settings_rows:
+        sync_runtime_settings(cur, attendance_settings_rows)
+    if attendance_template_rows:
+        sync_default_templates_from_excel(cur, attendance_template_rows)
+    if attendance_individual_template_rows:
+        sync_individual_templates_from_excel(cur, attendance_individual_template_rows)
+    if binding_rows:
+        binding_imported, _ = _upsert_line_binding_rows(cur, binding_rows)
+    if binding_imported == 0 and contact_rows:
+        fallback_rows = []
+        for r in contact_rows:
+            role = str(r.get("身分", "")).strip()
+            line_id = str(r.get("LINE User ID", "") or r.get("LINE ID", "") or r.get("LINE_ID", "")).strip()
+            person = str(r.get("姓名", "")).strip()
+            related = str(r.get("學生姓名/關聯（可多位）", "") or r.get("學生姓名/關聯", "")).strip()
+            if role != "家長" or not line_id or not related:
+                continue
+            for student_name in [x.strip() for x in related.replace("，", "、").split("、") if x.strip()]:
+                fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
+        binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
+    load_runtime_settings(cur)
+    return {
+        "actual_imported": actual_imported,
+        "actual_skipped": actual_skipped,
+        "binding_imported": binding_imported,
+        "errors": errors,
+    }
+
+
+def _get_master_sync_state(cur) -> dict[str, Any]:
+    cur.execute("SELECT * FROM master_sync_state WHERE id=1")
+    row = cur.fetchone()
+    return dict(row) if row else {}
+
+
+def _master_sync_configured() -> tuple[bool, str]:
+    if not MASTER_SYNC_ENABLED:
+        return False, "自動同步已關閉（MASTER_SYNC_ENABLED=false）"
+    if MASTER_SYNC_PROVIDER != "google_drive":
+        return False, f"目前不支援的同步來源：{MASTER_SYNC_PROVIDER}"
+    if not GOOGLE_DRIVE_FILE_ID:
+        return False, "缺少 GOOGLE_DRIVE_FILE_ID"
+    if not (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64):
+        return False, "缺少 GOOGLE_SERVICE_ACCOUNT_JSON_BASE64（或 GOOGLE_SERVICE_ACCOUNT_JSON）"
+    return True, "已設定"
+
+
+def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
+    configured, config_detail = _master_sync_configured()
+    result = {"status": "disabled", "detail": config_detail}
+    if not configured:
+        return result
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", (MASTER_SYNC_LOCK_KEY,))
+            if not cur.fetchone()["locked"]:
+                return {"status": "locked", "detail": "另一個 worker 正在同步"}
+            try:
+                cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
+                conn.commit()
+                try:
+                    raw, meta = _download_master_from_google_drive()
+                except Exception as exc:
+                    cur.execute("UPDATE master_sync_state SET last_success=FALSE,last_error=%s,last_trigger=%s,updated_at=%s WHERE id=1", (str(exc)[:2000], trigger, now_local()))
+                    conn.commit()
+                    logger.exception("Master Excel sync download failed")
+                    return {"status": "failed", "detail": str(exc)[:1000]}
+
+                cur.execute("SELECT remote_modified_at,remote_checksum,last_success FROM master_sync_state WHERE id=1")
+                state = cur.fetchone() or {}
+                if meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                    cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,last_error=NULL,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
+                    conn.commit()
+                    return {"status": "unchanged", "source_name": meta.get("source_name"), "detail": "主總表沒有更新"}
+
+                try:
+                    sheets = _load_master_workbook_sheets(raw)
+                    summary = _apply_master_sync(cur, sheets)
+                    cur.execute("""UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,
+                        last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger=%s,
+                        last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                        (meta.get("provider"), meta.get("source_key"), meta.get("source_name"), meta.get("remote_modified_at"), meta.get("remote_checksum"),
+                         now_local(), now_local(), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                    conn.commit()
+                    logger.info("Master Excel sync success: %s", summary)
+                    return {"status": "synced", "source_name": meta.get("source_name"), **summary}
+                except Exception as exc:
+                    conn.rollback()
+                    cur.execute("UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,last_success=FALSE,last_error=%s,last_trigger=%s,updated_at=%s WHERE id=1",
+                                (meta.get("provider"), meta.get("source_key"), meta.get("source_name"), meta.get("remote_modified_at"), meta.get("remote_checksum"), str(exc)[:2000], trigger, now_local()))
+                    conn.commit()
+                    logger.exception("Master Excel sync apply failed")
+                    return {"status": "failed", "source_name": meta.get("source_name"), "detail": str(exc)[:1000]}
+            finally:
+                try:
+                    cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (MASTER_SYNC_LOCK_KEY,))
+                except Exception:
+                    pass
+
+
+async def periodic_master_sync():
+    if MASTER_SYNC_ENABLED and MASTER_SYNC_ON_STARTUP:
+        await asyncio.sleep(5)
+        await asyncio.to_thread(master_sync_once, "startup")
+    while True:
+        await asyncio.sleep(MASTER_SYNC_INTERVAL_MINUTES * 60)
+        if MASTER_SYNC_ENABLED:
+            await asyncio.to_thread(master_sync_once, "scheduled")
+
+
+@app.get("/admin/master-sync", response_class=HTMLResponse)
+def admin_master_sync(_: str = Depends(admin_auth)):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            state = _get_master_sync_state(cur)
+    configured, config_detail = _master_sync_configured()
+    status_label = {True:"正常", False:"未完成"}.get(bool(state.get("last_success")), "尚未同步") if state else "尚未同步"
+    color = "success" if state.get("last_success") else "alert"
+    body = [f"<div class='top'><div><h1>主總表自動同步</h1><div class='muted'>V{APP_VERSION}｜主總表放在 Google Drive，Render 自動檢查更新；手動同步保留為備援。</div></div>{admin_nav()}</div>"]
+    body.append(f"<section><h2>同步狀態</h2><div class='alert {color}'><b>{escape(status_label)}</b>｜{escape(config_detail)}</div><table>"
+                f"<tr><th>同步來源</th><td>{escape(str(state.get('source_name') or '尚未同步'))}</td></tr>"
+                f"<tr><th>最後檢查</th><td>{escape(str(state.get('last_checked_at') or '—'))}</td></tr>"
+                f"<tr><th>最後成功同步</th><td>{escape(str(state.get('last_synced_at') or '—'))}</td></tr>"
+                f"<tr><th>來源最後修改</th><td>{escape(str(state.get('remote_modified_at') or '—'))}</td></tr>"
+                f"<tr><th>實際課程</th><td>{escape(str(state.get('last_actual_imported') or 0))} 筆</td></tr>"
+                f"<tr><th>LINE 綁定</th><td>{escape(str(state.get('last_binding_imported') or 0))} 筆</td></tr>"
+                f"<tr><th>上次錯誤</th><td>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
+                f"<p><b>自動檢查間隔：</b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</p>"
+                f"<form method='post' action='/admin/master-sync/now'><button>立即檢查並同步</button></form></section>")
+    body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p></section>")
+    return page("主總表自動同步", ''.join(body))
+
+
+@app.post("/admin/master-sync/now")
+def admin_master_sync_now(_: str = Depends(admin_auth)):
+    result = master_sync_once("manual")
+    return RedirectResponse(f"/admin/master-sync?status={result.get('status')}", status_code=303)
+
+def sync_master_excel_manual(raw: bytes) -> dict[str, Any]:
+    if not raw.startswith(b"PK"):
+        raise HTTPException(400, "這不是有效的 .xlsx 檔案。")
+    sheets = _load_master_workbook_sheets(raw)
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", (MASTER_SYNC_LOCK_KEY,))
+            if not cur.fetchone()["locked"]:
+                raise HTTPException(409, "目前正有自動同步正在執行，請稍後再試。")
+            try:
+                summary = _apply_master_sync(cur, sheets)
+                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                            ("管理員手動上傳總表", now_local(), now_local(), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                conn.commit()
+                return summary
+            finally:
+                try:
+                    cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (MASTER_SYNC_LOCK_KEY,))
+                except Exception:
+                    pass
+
+
 @app.post("/admin/line/import.csv")
 async def import_line_bindings(file: UploadFile = File(...), _: str = Depends(admin_auth)):
     raw = await file.read()
@@ -2857,59 +3162,16 @@ async def import_line_bindings(file: UploadFile = File(...), _: str = Depends(ad
 @app.post("/admin/line/import.xlsx")
 async def import_line_master_xlsx(file: UploadFile = File(...), _: str = Depends(admin_auth)):
     raw = await file.read()
-    if not raw.startswith(b"PK"):
-        raise HTTPException(400, "這不是有效的 .xlsx 檔案。")
     try:
-        student_rows = _xlsx_read_sheet(raw, "出勤學生")
-        binding_rows = _xlsx_read_sheet(raw, "出勤LINE綁定")
-        contact_rows = _xlsx_read_sheet(raw, "聯絡人")
-        actual_course_rows = _xlsx_read_sheet(raw, "實際課程")
-        reminder_rows = _xlsx_read_sheet(raw, "課程提醒")
-        attendance_settings_rows = _xlsx_read_sheet(raw, "出勤設定")
-        attendance_template_rows = _xlsx_read_sheet(raw, "出勤通知模板")
-        attendance_individual_template_rows = _xlsx_read_sheet(raw, "出勤通知個別")
+        result = sync_master_excel_manual(raw)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(400, f"讀取 Excel 失敗：{exc}") from exc
-
-    actual_imported = actual_skipped = binding_imported = 0
-    errors: list[str] = []
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            _upsert_students_from_excel(cur, student_rows)
-            if actual_course_rows:
-                actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
-            if attendance_settings_rows:
-                sync_runtime_settings(cur, attendance_settings_rows)
-            if attendance_template_rows:
-                sync_default_templates_from_excel(cur, attendance_template_rows)
-            if attendance_individual_template_rows:
-                sync_individual_templates_from_excel(cur, attendance_individual_template_rows)
-            if binding_rows:
-                binding_imported, _ = _upsert_line_binding_rows(cur, binding_rows)
-            # 相容目前 V4 總表的「聯絡人」格式：家長可在「學生姓名/關聯」放多位學生，以「、」分隔。
-            if binding_imported == 0 and contact_rows:
-                fallback_rows = []
-                for r in contact_rows:
-                    role = str(r.get("身分", "")).strip()
-                    line_id = str(r.get("LINE User ID", "") or r.get("LINE ID", "") or r.get("LINE_ID", "")).strip()
-                    person = str(r.get("姓名", "")).strip()
-                    related = str(r.get("學生姓名/關聯（可多位）", "") or r.get("學生姓名/關聯", "")).strip()
-                    if role != "家長" or not line_id or not related:
-                        continue
-                    for student_name in [x.strip() for x in related.replace("，", "、").split("、") if x.strip()]:
-                        fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
-                binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
-            # 同步完成後把最新出勤設定讀入目前 worker；未來重啟也會從 runtime_settings 恢復。
-            load_runtime_settings(cur)
-            conn.commit()
-
-    if actual_imported == 0 and not student_rows and not binding_rows and not contact_rows and not actual_course_rows and not reminder_rows and not attendance_settings_rows and not attendance_template_rows and not attendance_individual_template_rows:
-        raise HTTPException(400, "Excel 找不到可同步的資料。請確認包含「實際課程」、「出勤學生」、「出勤LINE綁定」或「聯絡人」工作表。")
-
-    msg = f"actual={actual_imported}; skipped={actual_skipped}; binding={binding_imported}"
-    if errors:
-        msg += "&errors=" + str(len(errors))
-    return RedirectResponse(f"/admin/line?imported={binding_imported}&actual_imported={actual_imported}&actual_skipped={actual_skipped}&errors={len(errors)}&source=xlsx", status_code=303)
+        raise HTTPException(400, f"總表同步失敗：{exc}") from exc
+    return RedirectResponse(
+        f"/admin/line?imported={result['binding_imported']}&actual_imported={result['actual_imported']}&actual_skipped={result['actual_skipped']}&errors={len(result['errors'])}&source=xlsx",
+        status_code=303,
+    )
 
 
 @app.post("/admin/student/{student_id}/binding/{binding_id}/toggle-notify")
@@ -3156,7 +3418,7 @@ def admin_diagnostics(_: str = Depends(admin_auth)):
         with db_conn() as conn:
             with conn.cursor() as cur:
                 schema = db_schema_summary(cur)
-                for table in ["students","courses","attendance","student_line_bindings","notification_templates","runtime_settings","line_message_logs","notification_logs"]:
+                for table in ["students","courses","attendance","student_line_bindings","notification_templates","runtime_settings","line_message_logs","notification_logs","master_sync_state"]:
                     try:
                         cur.execute(f'SELECT COUNT(*) AS c FROM "{table}"')
                         counts[table] = cur.fetchone()["c"]
@@ -3173,7 +3435,8 @@ def admin_diagnostics(_: str = Depends(admin_auth)):
             f"<tr><td>{escape(t)}</td><td>" + ' '.join(f"<span class={'green' if ok else 'red'}>{escape(c)}：{'OK' if ok else '缺少'}</span>" for c, ok in cols.items()) + "</td></tr>" for t, cols in schema.items()
         ) + "</table></div></section>")
         body.append("<section><h2>資料量</h2><table><tr><th>資料表</th><th>筆數</th></tr>" + ''.join(f"<tr><td>{escape(t)}</td><td>{escape(str(c))}</td></tr>" for t,c in counts.items()) + "</table></section>")
-    body.append("<section><h2>版本確認</h2><p>部署這個版本後，<code>/health</code> 應該回傳 <b>0.5.3</b>；若仍看到舊版本或黑底 Internal Server Error，代表目前 Render 服務沒有實際執行這個 build。</p></section>")
+    body.append(f"<section><h2>主總表自動同步</h2><p>啟用：<b>{'是' if MASTER_SYNC_ENABLED else '否'}</b>｜來源：<b>{escape(MASTER_SYNC_PROVIDER)}</b>｜間隔：<b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</b></p></section>")
+    body.append(f"<section><h2>版本確認</h2><p>部署這個版本後，<code>/health</code> 應該回傳 <b>{APP_VERSION}</b>；若仍看到舊版本或黑底 Internal Server Error，代表目前 Render 服務沒有實際執行這個 build。</p></section>")
     return page("系統診斷", ''.join(body))
 
 
@@ -3189,7 +3452,7 @@ def health():
                 db_ok = True
     except Exception as exc:
         db_error = str(exc)[:300]
-    payload = {"ok": db_ok, "line_mode": LINE_MODE, "database": "postgres", "version": APP_VERSION, "build": f"attendance-v{APP_VERSION}-manual-log-delete", "config": {"line_channel_access_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "line_channel_secret": bool(LINE_CHANNEL_SECRET), "line_admin_user_id": bool(LINE_ADMIN_USER_ID)}}
+    payload = {"ok": db_ok, "line_mode": LINE_MODE, "database": "postgres", "version": APP_VERSION, "build": f"attendance-v{APP_VERSION}-auto-master-sync", "config": {"line_channel_access_token": bool(LINE_CHANNEL_ACCESS_TOKEN), "line_channel_secret": bool(LINE_CHANNEL_SECRET), "line_admin_user_id": bool(LINE_ADMIN_USER_ID), "master_sync_enabled": MASTER_SYNC_ENABLED, "master_sync_provider": MASTER_SYNC_PROVIDER, "google_drive_file_id": bool(GOOGLE_DRIVE_FILE_ID), "google_service_account": bool(GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64)}}
     if db_error:
         payload["database_error"] = db_error
     return JSONResponse(payload, status_code=200 if db_ok else 503, headers={"Cache-Control": "no-store"})

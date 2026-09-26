@@ -1,37 +1,56 @@
-# Render 出勤系統 V0.5.2｜完整篩查修正版
+# Render 出勤系統 V0.6.0｜主總表自動同步版
 
-本版本以 V0.5.1 full-audit 為基礎，針對目前 Render `/admin/templates` 持續 500、Excel「實際課程」同步、LINE 測試與自動異常提醒做完整檢查與修正。
+本版本在 V0.5.x 基礎上加入「主總表自動同步」。正式運作時不必每次手動把總表上傳到 Render；Render 會從 Google Drive 讀取指定的私有 XLSX，依排程檢查檔案是否更新，更新才同步到 PostgreSQL。
 
-## 本版重點
-- `/admin/templates` 開啟時自動修復舊版 `notification_templates` 表結構。
-- 即使資料庫版本很舊，也會補齊必要欄位，不刪除既有範本。
-- 增加 `/admin/diagnostics`，可直接檢查資料表、欄位、筆數與 LINE 設定是否存在。
-- `/health` 顯示 V0.5.2 與 LINE 設定是否存在，並禁止快取，方便確認 Render 是否真的跑到最新 build。
-- 全站管理頁未處理例外會顯示可診斷頁面與錯誤編號，不再只出現黑底 `Internal Server Error`。
-- `實際課程` Excel parser 支援正式欄位 `Course ID／課程日期／上課時間／學生／課程／老師`，並支援 `下課時間（出勤用）` 在上一列標題區的格式。
-- 若某日期 Excel 有部分資料格式錯誤，不會先把該日期舊實際課程全部停用，避免半份資料覆蓋。
-- 出勤課程查詢只接受 `source='實際課程'`，demo/舊 legacy 課程不再混入。
-- 自動未到班／未離班檢查加入 PostgreSQL advisory lock、row lock 與失敗重試冷卻，避免多 worker 或 LINE 暫時失敗造成刷屏。
-- `SEED_DEMO_DATA` 預設 false，不會在正式環境自動生成測試學生與測試課程。
-- 通知範本變數改為安全替換，未知變數不會讓出勤流程崩潰。
-- 正式 LINE Push 設定名稱維持 `LINE_CHANNEL_ACCESS_TOKEN`、`LINE_CHANNEL_SECRET`、`LINE_ADMIN_USER_ID`。
+## 新增功能
+- Google Drive 私有 XLSX 自動同步，預設每 10 分鐘檢查。
+- 啟動時可先同步一次（`MASTER_SYNC_ON_STARTUP=true`）。
+- 使用 Google Drive `fileId` + Service Account；檔案不需要公開。
+- 先取得檔案版本／checksum，未更新就不重匯。
+- 同步失敗保留上一份可用資料，不直接清空目前出勤資料。
+- PostgreSQL advisory lock 防止多 worker 同時同步。
+- `/admin/master-sync` 可查看最後檢查、最後成功、來源版本、課程／LINE 綁定數量與錯誤。
+- `立即檢查並同步` 是手動備援，不取代自動同步。
+- 原本 `/admin/line` 的 Excel 上傳仍保留，作為緊急備援。
 
-## Render 更新
+## Google Drive 設定
+1. 在 Google Cloud 建立 Service Account。
+2. 取得 Service Account 的 email。
+3. 將你的正式主總表 XLSX 只分享給這個 Service Account，權限給 Viewer 即可。
+4. 取得該檔案的 `File ID`。
+5. 在 Render 設定：
+   - `MASTER_SYNC_ENABLED=true`
+   - `MASTER_SYNC_PROVIDER=google_drive`
+   - `MASTER_SYNC_INTERVAL_MINUTES=10`
+   - `GOOGLE_DRIVE_FILE_ID=<你的檔案ID>`
+   - `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=<Service Account JSON 的 Base64>`
+
+Base64 產生方式（Windows PowerShell）：
+`[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\service-account.json"))`
+
+產生後只把結果貼到 Render 的 `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`，不要把 JSON 檔或私鑰放進 ZIP。
+
+## 正式資料流
+你的 V2.8.3 主總表 → Google Drive → Render 自動檢查 → 驗證 XLSX → 同步「實際課程／出勤學生／出勤LINE綁定／出勤通知模板／出勤設定」→ PostgreSQL → QR 出勤與 LINE。
+
+## 安全規則
+- 不把 Token、Secret 或 Service Account JSON 放進 ZIP。
+- 同步來源驗證失敗或整份「實際課程」無法解析時，不覆蓋目前可用資料。
+- 建議只分享主總表給本服務專用 Service Account，不要設為「知道連結的任何人可查看」。
+
+## Render
 Build Command：`pip install -r requirements.txt`
 Start Command：`uvicorn app:app --host 0.0.0.0 --port $PORT`
+Health Check：`/health`
 
-請使用目前 Render 服務既有的 `DATABASE_URL`，不要建立第二個 PostgreSQL。
-
-部署後請依序檢查：
-1. `/health` 必須顯示 `version=0.5.2`。
-2. `/admin/diagnostics` 檢查 `notification_templates` 與其他資料表欄位是否完整。
-3. `/admin/templates` 可以正常開啟。
-4. `/admin/line` 的「測試 LINE」保持正常。
-5. 上傳最新版 V2.8.3 總表後，確認「實際課程」不是 0 筆。
-
-不要把任何 LINE Token/Secret 寫進 ZIP。
+部署後建議先檢查：
+1. `/health` → `version=0.6.0`。
+2. `/admin/master-sync` → 顯示自動同步設定。
+3. 第一次同步成功後，查看「實際課程」是否有未來課程。
+4. LINE 測試維持正常。
 
 ## 紀錄保留政策
+
 - `line_message_logs` 與 `notification_logs` 不自動清除。
 - 管理員可從 `/admin/logs` 個別刪除或全部刪除。
 - 個別刪除需二次確認；全部刪除需輸入指定確認文字。
