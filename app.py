@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -2951,6 +2951,35 @@ def _decode_service_account_json(raw: str) -> dict[str, Any]:
         raise ValueError("不是有效的 Service Account JSON 或 Base64 JSON") from exc
 
 
+def _master_sync_credential_identity(creds) -> str:
+    """Return only the non-secret Service Account identity for diagnostics."""
+    return str(getattr(creds, "service_account_email", "") or "")
+
+def _google_response_error(resp, operation: str) -> RuntimeError:
+    """Preserve Google's useful error details without exposing credentials."""
+    try:
+        payload = resp.json()
+        err = payload.get("error", payload) if isinstance(payload, dict) else payload
+        if isinstance(err, dict):
+            code = err.get("code", resp.status_code)
+            status = err.get("status", "")
+            message = err.get("message", "")
+            details = err.get("errors") or err.get("details") or []
+            reason = ""
+            if isinstance(details, list):
+                reasons = []
+                for item in details:
+                    if isinstance(item, dict) and item.get("reason"):
+                        reasons.append(str(item.get("reason")))
+                if reasons:
+                    reason = "；reason=" + ",".join(dict.fromkeys(reasons))
+            detail = f"HTTP {code}" + (f" {status}" if status else "") + (f"：{message}" if message else "") + reason
+        else:
+            detail = f"HTTP {resp.status_code}：{str(err)[:500]}"
+    except Exception:
+        detail = f"HTTP {resp.status_code}：{resp.text[:500]}"
+    return RuntimeError(f"Google Drive {operation} 失敗：{detail}")
+
 def _master_sync_credentials():
     # Read the current environment at call time as well as the startup snapshot.
     # This makes the function easier to diagnose and avoids relying solely on
@@ -2986,6 +3015,12 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
     if not GOOGLE_DRIVE_FILE_ID:
         raise RuntimeError("尚未設定 GOOGLE_DRIVE_FILE_ID。")
     creds = _master_sync_credentials()
+    service_account_email = _master_sync_credential_identity(creds)
+    logger.info(
+        "Google Drive sync request: service_account=%s file_id=%s",
+        service_account_email or "(unknown)",
+        GOOGLE_DRIVE_FILE_ID,
+    )
     session = AuthorizedSession(creds)
     meta_url = f"https://www.googleapis.com/drive/v3/files/{GOOGLE_DRIVE_FILE_ID}"
     meta_resp = session.get(
@@ -2993,8 +3028,17 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
         params={"fields": "id,name,mimeType,modifiedTime,md5Checksum,size,capabilities(canDownload)"},
         timeout=30,
     )
-    meta_resp.raise_for_status()
+    if not meta_resp.ok:
+        raise _google_response_error(meta_resp, "讀取檔案資訊")
     meta = meta_resp.json()
+    logger.info(
+        "Google Drive file metadata: service_account=%s file_id=%s name=%s mimeType=%s canDownload=%s",
+        service_account_email or "(unknown)",
+        meta.get("id", GOOGLE_DRIVE_FILE_ID),
+        meta.get("name", ""),
+        meta.get("mimeType", ""),
+        meta.get("capabilities", {}).get("canDownload"),
+    )
     if meta.get("capabilities", {}).get("canDownload") is False:
         raise RuntimeError("Google Drive 檔案目前禁止下載。")
     name = str(meta.get("name") or "master.xlsx")
@@ -3008,7 +3052,8 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
             params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
             timeout=60,
         )
-        download_resp.raise_for_status()
+        if not download_resp.ok:
+            raise _google_response_error(download_resp, "匯出 Google 試算表")
         raw = download_resp.content
         source_name = f"{name}.xlsx"
     else:
@@ -3018,7 +3063,8 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
         if size and size > MASTER_SYNC_MAX_MB * 1024 * 1024:
             raise RuntimeError(f"總表檔案 {size / 1024 / 1024:.1f} MB 超過上限 {MASTER_SYNC_MAX_MB} MB。")
         download_resp = session.get(meta_url, params={"alt": "media"}, timeout=60)
-        download_resp.raise_for_status()
+        if not download_resp.ok:
+            raise _google_response_error(download_resp, "下載 XLSX")
         raw = download_resp.content
         source_name = name
     if len(raw) > MASTER_SYNC_MAX_MB * 1024 * 1024:
