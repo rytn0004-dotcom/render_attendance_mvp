@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -56,7 +56,10 @@ NOTIFICATION_RETRY_COOLDOWN_MINUTES = max(1, int(os.getenv("NOTIFICATION_RETRY_C
 
 # 主總表自動同步：正式環境建議使用 Google Drive 的私有檔案 + Service Account 讀取。
 MASTER_SYNC_ENABLED = os.getenv("MASTER_SYNC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
-MASTER_SYNC_PROVIDER = os.getenv("MASTER_SYNC_PROVIDER", "google_drive").strip().lower()
+MASTER_SYNC_PROVIDER_RAW = os.getenv("MASTER_SYNC_PROVIDER", "google_drive").strip().lower()
+# "google_sheets" is a user-facing alias; the implementation reads through
+# Google Drive and supports both native Google Sheets and private XLSX files.
+MASTER_SYNC_PROVIDER = "google_drive" if MASTER_SYNC_PROVIDER_RAW == "google_sheets" else MASTER_SYNC_PROVIDER_RAW
 MASTER_SYNC_INTERVAL_MINUTES = max(5, int(os.getenv("MASTER_SYNC_INTERVAL_MINUTES", "10")))
 MASTER_SYNC_ON_STARTUP = os.getenv("MASTER_SYNC_ON_STARTUP", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
 MASTER_SYNC_MAX_MB = max(1, int(os.getenv("MASTER_SYNC_MAX_MB", "20")))
@@ -2889,21 +2892,94 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
 
 # ---------- Master Excel automatic sync ----------
 
-def _master_sync_credentials():
-    raw = GOOGLE_SERVICE_ACCOUNT_JSON
-    if not raw and GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:
-        import base64 as _b64
-        raw = _b64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.encode("ascii")).decode("utf-8")
-    if not raw:
-        raise RuntimeError("尚未設定 GOOGLE_SERVICE_ACCOUNT_JSON_BASE64（或 GOOGLE_SERVICE_ACCOUNT_JSON）。")
+def _decode_service_account_json(raw: str) -> dict[str, Any]:
+    """Parse a Service Account credential from JSON, quoted JSON, or Base64.
+
+    Render environment variables are plain strings, so users may accidentally
+    paste the JSON into the Base64 variable (or vice versa).  Accept both
+    forms and do not expose the credential contents in errors/logs.
+    """
+    value = (raw or "").strip().lstrip("\ufeff")
+    if not value:
+        raise ValueError("內容為空")
+
+    def parse_json(text: str) -> dict[str, Any]:
+        text = text.strip().lstrip("\ufeff")
+        obj = json.loads(text)
+        # Accept JSON stored as a JSON string, e.g. quoted/escaped JSON.
+        if isinstance(obj, str):
+            obj = json.loads(obj)
+        if not isinstance(obj, dict):
+            raise ValueError("JSON 根節點不是物件")
+        required = ("type", "project_id", "private_key", "client_email")
+        missing = [key for key in required if not str(obj.get(key) or "").strip()]
+        if missing:
+            raise ValueError("缺少必要欄位：" + ", ".join(missing))
+        if str(obj.get("type")).strip() != "service_account":
+            raise ValueError("type 不是 service_account")
+        # Some copy/paste paths double-escape private_key newlines.
+        if isinstance(obj.get("private_key"), str):
+            obj["private_key"] = obj["private_key"].replace("\\n", "\n")
+        return obj
+
+    # First try the value exactly as supplied. This supports raw JSON and also
+    # catches JSON that was accidentally pasted into the *_BASE64 variable.
     try:
-        info = json.loads(raw)
+        return parse_json(value)
+    except Exception:
+        pass
+
+    # Some deployment UIs preserve shell-style escaping such as {\"type\":...}.
+    # Try that form before treating the value as Base64.
+    try:
+        if value.startswith("{") and "\\\"" in value:
+            return parse_json(value.replace("\\\"", "\""))
+    except Exception:
+        pass
+
+    # Then try standard or URL-safe Base64 with optional missing padding.
+    try:
+        compact = re.sub(r"\s+", "", value).strip('\"\'')
+        padded = compact + ("=" * (-len(compact) % 4))
+        try:
+            decoded_bytes = base64.b64decode(padded.encode("ascii"), validate=True)
+        except Exception:
+            decoded_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+        decoded = decoded_bytes.decode("utf-8-sig")
+        return parse_json(decoded)
     except Exception as exc:
-        raise RuntimeError(f"Google Service Account JSON 無法解析：{exc}") from exc
-    return service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
+        raise ValueError("不是有效的 Service Account JSON 或 Base64 JSON") from exc
+
+
+def _master_sync_credentials():
+    # Read the current environment at call time as well as the startup snapshot.
+    # This makes the function easier to diagnose and avoids relying solely on
+    # module-import-time values in long-lived workers.
+    candidates = [
+        ("GOOGLE_SERVICE_ACCOUNT_JSON", os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()),
+        ("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "").strip()),
+        ("GOOGLE_SERVICE_ACCOUNT_JSON", GOOGLE_SERVICE_ACCOUNT_JSON),
+        ("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", GOOGLE_SERVICE_ACCOUNT_JSON_BASE64),
+    ]
+    seen: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    for source, value in candidates:
+        if not value or (source, value) in seen:
+            continue
+        seen.add((source, value))
+        try:
+            info = _decode_service_account_json(value)
+            logger.info("Google Service Account credentials parsed from %s", source)
+            return service_account.Credentials.from_service_account_info(
+                info,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"],
+            )
+        except Exception as exc:
+            errors.append(f"{source}: {str(exc)[:180]}")
+
+    if not seen:
+        raise RuntimeError("尚未設定 GOOGLE_SERVICE_ACCOUNT_JSON_BASE64（或 GOOGLE_SERVICE_ACCOUNT_JSON）。")
+    raise RuntimeError("Google Service Account JSON 無法解析；已嘗試可用的 JSON／Base64 設定，但都不是有效的 Service Account 憑證。")
 
 
 def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:

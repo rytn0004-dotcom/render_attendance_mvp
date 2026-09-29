@@ -1,4 +1,4 @@
-# Render 出勤系統 V0.6.0｜主總表自動同步版
+# Render 出勤系統 V0.6.1｜主總表自動同步修正版
 
 本版本在 V0.5.x 基礎上加入「主總表自動同步」。正式運作時不必每次手動把總表上傳到 Render；Render 會從 Google Drive 讀取指定的私有 XLSX，依排程檢查檔案是否更新，更新才同步到 PostgreSQL。
 
@@ -6,6 +6,7 @@
 - Google Drive 私有 XLSX／Google 試算表自動同步，預設每 10 分鐘檢查。
 - 啟動時可先同步一次（`MASTER_SYNC_ON_STARTUP=true`）。
 - 使用 Google Drive `fileId` + Service Account；檔案不需要公開。
+- V0.6.1 修正 Service Account 憑證解析：JSON／Base64 可互相 fallback，也兼容誤貼格式與 `google_sheets` 設定別名。
 - 先取得檔案版本／checksum，未更新就不重匯。
 - 同步失敗保留上一份可用資料，不直接清空目前出勤資料。
 - PostgreSQL advisory lock 防止多 worker 同時同步。
@@ -44,7 +45,7 @@ Start Command：`uvicorn app:app --host 0.0.0.0 --port $PORT`
 Health Check：`/health`
 
 部署後建議先檢查：
-1. `/health` → `version=0.6.0`。
+1. `/health` → `version=0.6.1`。
 2. `/admin/master-sync` → 顯示自動同步設定。
 3. 第一次同步成功後，查看「實際課程」是否有未來課程。
 4. LINE 測試維持正常。
