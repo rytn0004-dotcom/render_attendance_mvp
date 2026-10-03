@@ -1651,11 +1651,11 @@ def dashboard(_: str = Depends(admin_auth)):
             f"<td>{bind_text}</td>"
             f"<td><span class='{ 'green' if s.get('parent_notify_enabled', True) else 'gray' }'>家長提醒：{notify_label}</span>"
             f"<form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/toggle-parent-notify'><button class='btn btn2 mini'>{'關閉家長提醒' if s.get('parent_notify_enabled', True) else '開啟家長提醒'}</button></form></td>"
-            delete_btn = ""
-            if str(s.get("student_code") or "").upper().startswith("STU-"):
-                delete_btn = f"<form style='margin-top:6px' method='post' action='/admin/student/{s["id"]}/delete-test' onsubmit='return confirm(&quot;確定刪除測試學生？這會一併刪除其出勤、課程、LINE 綁定與通知範本資料，無法復原。&quot;)'><button class='btn btn2 mini'>刪除測試學生</button></form>"
-            f"<td>{test_btn}{delete_btn}</td></tr>"
-        )
+            + (
+                f"<td>{test_btn}<form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/delete-test' onsubmit='return confirm(&quot;確定刪除測試學生？這會一併刪除其出勤、課程、LINE 綁定與通知範本資料，無法復原。&quot;)'><button class='btn btn2 mini'>刪除測試學生</button></form></td>"
+                if str(s.get("student_code") or "").upper().startswith("STU-")
+                else f"<td>{test_btn}</td>"
+            )        )
     body_parts.append("<section><h2>學生 QR / 家長 LINE</h2><p class='muted mini'>學生 QR 是永久識別碼：日常不會變，只有管理員主動重新產生才會更新。家長 LINE 不由學生手機綁定，而是從既有 LINE 客服／Excel 的 LINE User ID 與學生姓名（或學生編號）建立關聯。</p><table><tr><th>學生</th><th>編號</th><th>學生 QR</th><th>已綁定 LINE</th><th>家長提醒</th><th>測試</th></tr>" + "".join(qr_rows) + "</table></section>")
 
     roster_rows = []
