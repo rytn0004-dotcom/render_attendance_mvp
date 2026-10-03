@@ -2738,13 +2738,33 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
             "通知類型", "預設訊息範本", "個別訊息範本", "套用方式", "剩餘次數", "有效至",
             "設定項目", "目前值", "用途", "說明"
         }
+        # 不再限制標題只能出現在前 10 列。總表有些工作表在正式欄位前會有較長的說明／標題區，
+        # 若硬限制前 10 列，可能把資料列誤當成標題，最後造成例如「出勤學生」讀取 0 筆。
+        # 依工作表用途提高標題辨識精準度，並掃描整張工作表。
+        preferred_headers = {
+            "出勤學生": {"學生編號", "學生姓名", "姓名", "簽到識別碼", "簽到啟用", "到班通知", "離班通知", "異常通知"},
+            "出勤LINE綁定": {"學生編號", "學生姓名", "LINE User ID", "LINE ID", "LINE_ID", "關係", "家長提醒", "啟用"},
+            "聯絡人": {"姓名", "身分", "LINE User ID", "LINE ID", "學生姓名/關聯（可多位）", "學生姓名/關聯"},
+            "實際課程": {"Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源"},
+        }.get(target_name, set())
+
         best_score = -1
-        for i, row in enumerate(matrix[:10]):
+        best_required = 0
+        for i, row in enumerate(matrix):
             vals = {str(v).strip() for v in row.values() if str(v).strip()}
-            score = len(vals & known_headers)
-            if score > best_score and score >= 2:
+            preferred_score = len(vals & preferred_headers) if preferred_headers else 0
+            generic_score = len(vals & known_headers)
+            # 同分時優先選用途相關欄位較多的列；至少命中 2 個已知欄位才視為標題。
+            score = preferred_score * 10 + generic_score
+            if generic_score >= 2 and score > best_score:
                 best_score = score
+                best_required = generic_score
                 header_idx = i
+
+        if best_score < 0:
+            logger.warning("Excel sheet %s 找不到可辨識的標題列；共讀取 %s 列。", target_name, len(matrix))
+            return []
+
         headers = [matrix[header_idx].get(i, "").strip() for i in range(max_col + 1)]
         # 支援目前總表「實際課程」把「下課時間（出勤用）」放在上一列標題區的情況。
         for prior_row in matrix[:header_idx]:
