@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1818,6 +1818,7 @@ def admin_courses(_: str = Depends(admin_auth)):
             grouped = {}
             for c in rows:
                 grouped.setdefault(c["course_date"], []).append(c)
+            body.append("<form method='post' action='/admin/courses/overrides'><p><button class='btn' type='submit'>💾 一次儲存全部今天校正</button></p>")
             for d, items in grouped.items():
                 body.append(f"<section><h2>{d:%Y-%m-%d}　{WEEKDAYS[d.weekday()]}</h2><div style='overflow:auto'><table><tr><th>學生</th><th>Course ID</th><th>課程</th><th>老師</th><th>來源時間</th><th>今日校正</th></tr>")
                 for c in items:
@@ -1829,19 +1830,22 @@ def admin_courses(_: str = Depends(admin_auth)):
                     warning = "<br><span class='red mini'>⚠️ 缺少下課時間：無法自動判定未離班</span>" if not effective_end else ""
                     body.append(
                         f"<tr><td><b>{escape(c['name'])}</b><br><span class='mini muted'>{escape(c['student_code'])}</span></td>"
-                        f"<td class='mini'>{escape(c['actual_course_id'])}</td>"
-                        f"<td>{escape(c['course_name'])}</td><td>{escape(c['teacher_name'] or '')}</td>"
-                        f"<td>{escape(effective_start)}-{escape(end_display)}{warning}</td>"
-                        f"<td><form method='post' action='/admin/course/{c['id']}/override'>"
-                        f"<input type='date' name='work_date' value='{d:%Y-%m-%d}' style='width:145px' readonly> "
-                        f"<input type='time' name='start_time' value='{escape(effective_start)}'> "
+                        f"<td class='mini'>{escape(c['actual_course_id'])}"
+                        f"<input type='hidden' name='course_id' value='{c['id']}'>"
+                        f"<input type='hidden' name='work_date' value='{d:%Y-%m-%d}'>"
+                        f"</td>"
+                        f"<td>{escape(c['course_name'] or '')}</td><td>{escape(c['teacher_name'] or '')}</td>"
+                        f"<td>{escape(effective_start or '')}-{escape(end_display)}{warning}</td>"
+                        f"<td>"
+                        f"<input type='time' name='start_time' value='{escape(effective_start or '')}'> "
                         f"<input type='time' name='end_time' value='{escape(effective_end or '')}'> "
                         f"<input class='wide' name='note' value='{escape((ov['note'] or '') if ov else '', quote=True)}' placeholder='臨時校正原因'> "
-                        f"<label><input type='checkbox' name='cancelled' value='1' {'checked' if ov and ov['cancelled'] else ''}> 取消</label> "
-                        f"<button class='btn btn2 mini'>儲存今天校正</button></form>"
-                        f"<div class='mini muted'>目前有效時間：{escape(effective_start)}-{escape(end_display)}</div></td></tr>"
+                        f"<label><input type='checkbox' name='cancelled_{c['id']}' value='1' {'checked' if ov and ov['cancelled'] else ''}> 取消</label> "
+                        f"</td></tr>"
                     )
                 body.append("</table></div></section>")
+            if rows:
+                body.append("<p><button class='btn' type='submit'>💾 一次儲存全部今天校正</button></p></form>")
     if len(rows) == 0:
         body.append("<section class='alert'>目前沒有已同步的未來「實際課程」。請到「LINE 綁定 / 測試」上傳最新總表 Excel。</section>")
     return page("實際課程", "".join(body))
@@ -1857,6 +1861,55 @@ def update_course(course_id: int, weekday: int = Form(...), start_time: str = Fo
                 """,
                 (weekday, start_time, end_time, max(0, late_grace_minutes), max(1, checkout_grace_minutes), course_name.strip(), teacher_name.strip() or None, course_id),
             )
+            conn.commit()
+    return RedirectResponse("/admin/courses", status_code=303)
+
+
+@app.post("/admin/courses/overrides")
+async def save_overrides_bulk(request: Request, _: str = Depends(admin_auth)):
+    form = await request.form()
+    course_ids = form.getlist("course_id")
+    work_dates = form.getlist("work_date")
+    start_times = form.getlist("start_time")
+    end_times = form.getlist("end_time")
+    notes = form.getlist("note")
+    if not (len(course_ids) == len(work_dates) == len(start_times) == len(end_times) == len(notes)):
+        raise HTTPException(400, "校正資料欄位數量不一致，請重新整理後再試。")
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for i, raw_course_id in enumerate(course_ids):
+                try:
+                    course_id = int(raw_course_id)
+                    target_date = datetime.strptime(str(work_dates[i]), "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    raise HTTPException(400, "校正資料格式不正確。")
+                start_time = str(start_times[i] or "").strip()
+                end_time = str(end_times[i] or "").strip()
+                note = str(notes[i] or "").strip()
+                cancelled = form.get(f"cancelled_{course_id}") == "1"
+
+                if end_time:
+                    if not start_time:
+                        raise HTTPException(400, f"課程 {course_id} 有下課時間但缺少上課時間。")
+                    if parse_hhmm(start_time, target_date) >= parse_hhmm(end_time, target_date):
+                        raise HTTPException(400, f"課程 {course_id} 的結束時間必須晚於開始時間。")
+
+                cur.execute(
+                    "SELECT id FROM courses WHERE id=%s AND active=TRUE AND actual_course_id IS NOT NULL AND COALESCE(source,'實際課程')='實際課程'",
+                    (course_id,),
+                )
+                if not cur.fetchone():
+                    raise HTTPException(400, f"找不到可校正的實際課程：{course_id}")
+
+                cur.execute(
+                    """
+                    INSERT INTO schedule_overrides(course_id,work_date,start_time,end_time,cancelled,note)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,work_date) DO UPDATE SET start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,cancelled=EXCLUDED.cancelled,note=EXCLUDED.note
+                    """,
+                    (course_id, target_date, start_time or None, end_time or None, cancelled, note or None),
+                )
             conn.commit()
     return RedirectResponse("/admin/courses", status_code=303)
 
