@@ -1601,7 +1601,8 @@ def dashboard(_: str = Depends(admin_auth)):
         f"<form method='post' action='/admin/notifications/admin'><button class='btn {'btn2' if admin_global else ''}'>管理員通知：{'啟用中（點此關閉）' if admin_global else '已關閉（點此開啟）'}</button></form>"
         f"</div>"
         f"<p class='mini muted'>管理員 LINE User ID 請在 Render 的 LINE_ADMIN_USER_ID 設定；可填多位，以逗號、分號、空白或換行分隔。</p></section>"
-    )    body_parts = [
+    )
+    body_parts = [
         f"<div class='top'><div><h1>出勤測試系統 V{APP_VERSION}</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         "<script>setInterval(function(){if(!document.hidden){location.reload();}},5000);</script>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
