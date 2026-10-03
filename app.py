@@ -1555,6 +1555,7 @@ def dashboard(_: str = Depends(admin_auth)):
     today = now_local().date()
     body_parts = [
         f"<div class='top'><div><h1>出勤測試系統 V{APP_VERSION}</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
+        "<script>setInterval(function(){if(!document.hidden){location.reload();}},5000);</script>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
     ]
     with db_conn() as conn:
@@ -1572,6 +1573,17 @@ def dashboard(_: str = Depends(admin_auth)):
 
             cur.execute("SELECT * FROM students WHERE active=TRUE ORDER BY id")
             students = cur.fetchall()
+
+            # 一次載入所有有效 LINE 綁定，避免首頁每位學生各開一個 DB connection。
+            # 學生數量增加後，這個 N+1 查詢會讓 /admin 明顯變慢。
+            cur.execute(
+                "SELECT id,student_id,line_user_id,display_name,relation,bound_at "
+                "FROM student_line_bindings WHERE active=TRUE ORDER BY student_id,id"
+            )
+            binding_rows = cur.fetchall()
+            bindings_by_student = {}
+            for b in binding_rows:
+                bindings_by_student.setdefault(b["student_id"], []).append(b)
 
             cur.execute(
                 """
@@ -1604,13 +1616,8 @@ def dashboard(_: str = Depends(admin_auth)):
 
     qr_rows = []
     for s in students:
-        with db_conn() as c2:
-            with c2.cursor() as ccur:
-                ccur.execute(
-                    "SELECT id,line_user_id,display_name,relation,bound_at FROM student_line_bindings WHERE student_id=%s AND active=TRUE ORDER BY id",
-                    (s["id"],),
-                )
-                binds = ccur.fetchall()
+        # 綁定資料已在上面的單次查詢中載入，不再為每位學生建立新的 DB connection。
+        binds = bindings_by_student.get(s["id"], [])
         bind_text = "<br>".join(
             f"{escape(b['display_name'] or 'LINE 使用者')}｜{escape(b['relation'])}｜{escape(b['line_user_id'])} <form style='display:inline' method='post' action='/admin/student/{s['id']}/binding/{b['id']}/unbind'><button class='btn btn2 mini'>解除</button></form>"
             for b in binds
@@ -3545,7 +3552,11 @@ def qr(student_code: str):
         raise HTTPException(404, "找不到學生")
     img = qrcode.make(f"{public_base_url()}/scan/{row['qr_token']}")
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
-    return StreamingResponse(buf, media_type="image/png")
+    return StreamingResponse(
+        buf,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 @app.post("/admin/student/{student_id}/delete-test")
 def delete_test_student(student_id: int, _: str = Depends(admin_auth)):
