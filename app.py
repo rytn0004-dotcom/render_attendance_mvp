@@ -14,6 +14,7 @@ import hashlib
 import re
 import base64
 import logging
+from functools import lru_cache
 from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any
@@ -29,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.9"
+APP_VERSION = "0.7.0"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1646,18 +1647,32 @@ def dashboard(_: str = Depends(admin_auth)):
             )
             roster_raw = cur.fetchall()
             roster = []
-            for c in roster_raw:
-                eff = effective_schedule(cur, c, today)
-                if not eff:
-                    continue
-                cur.execute("SELECT * FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s", (c["student_id"], c["id"], today))
-                a = cur.fetchone()
-                item = dict(c)
-                item["effective_start"] = eff["effective_start"]
-                item["effective_end"] = eff["effective_end"]
-                item["override_note"] = eff.get("override_note", "")
-                item["attendance"] = a
-                roster.append(item)
+            if roster_raw:
+                course_ids = [c["id"] for c in roster_raw]
+                placeholders = ",".join(["%s"] * len(course_ids))
+                cur.execute(
+                    f"SELECT * FROM schedule_overrides WHERE work_date=%s AND course_id IN ({placeholders})",
+                    (today, *course_ids),
+                )
+                overrides = {r["course_id"]: r for r in cur.fetchall()}
+                cur.execute(
+                    f"SELECT * FROM attendance WHERE date=%s AND course_id IN ({placeholders})",
+                    (today, *course_ids),
+                )
+                attendance_by_course = {(a["student_id"], a["course_id"]): a for a in cur.fetchall()}
+                for c in roster_raw:
+                    ov = overrides.get(c["id"])
+                    if ov and ov["cancelled"]:
+                        continue
+                    item = dict(c)
+                    item["effective_start"] = ov["start_time"] if ov and ov["start_time"] else c["start_time"]
+                    item["effective_end"] = ov["end_time"] if ov and ov["end_time"] else c["end_time"]
+                    item["override_note"] = ov["note"] if ov else ""
+                    item["override_id"] = ov["id"] if ov else None
+                    item["late_grace_minutes"] = c["late_grace_minutes"]
+                    item["checkout_grace_minutes"] = c["checkout_grace_minutes"]
+                    item["attendance"] = attendance_by_course.get((c["student_id"], c["id"]))
+                    roster.append(item)
 
             cur.execute("SELECT * FROM notification_logs ORDER BY id DESC LIMIT 30")
             notifications = cur.fetchall()
@@ -3644,6 +3659,14 @@ async def liff_bind(payload: dict[str, Any]):
     return bind_liff_user(token, id_token, relation)
 
 
+@lru_cache(maxsize=512)
+def cached_qr_png(scan_url: str) -> bytes:
+    img = qrcode.make(scan_url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @app.get("/qr/{student_code}.png")
 def qr(student_code: str):
     with db_conn() as conn:
@@ -3652,12 +3675,11 @@ def qr(student_code: str):
             row = cur.fetchone()
     if not row:
         raise HTTPException(404, "找不到學生")
-    img = qrcode.make(f"{public_base_url()}/scan/{row['qr_token']}")
-    buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
+    data = cached_qr_png(f"{public_base_url()}/scan/{row['qr_token']}")
     return StreamingResponse(
-        buf,
+        io.BytesIO(data),
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
     )
 
 @app.post("/admin/student/{student_id}/delete-test")
