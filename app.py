@@ -1836,7 +1836,7 @@ def admin_courses(_: str = Depends(admin_auth)):
                         f"<input type='date' name='work_date' value='{d:%Y-%m-%d}' style='width:145px' readonly> "
                         f"<input type='time' name='start_time' value='{escape(effective_start)}'> "
                         f"<input type='time' name='end_time' value='{escape(effective_end or '')}'> "
-                        f"<input class='wide' name='note' value='{escape((ov['note'] if ov else ''), quote=True)}' placeholder='臨時校正原因'> "
+                        f"<input class='wide' name='note' value='{escape((ov['note'] or '') if ov else '', quote=True)}' placeholder='臨時校正原因'> "
                         f"<label><input type='checkbox' name='cancelled' value='1' {'checked' if ov and ov['cancelled'] else ''}> 取消</label> "
                         f"<button class='btn btn2 mini'>儲存今天校正</button></form>"
                         f"<div class='mini muted'>目前有效時間：{escape(effective_start)}-{escape(end_display)}</div></td></tr>"
