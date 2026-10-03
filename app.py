@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.6"
+APP_VERSION = "0.6.7"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -774,6 +774,10 @@ def consume_one_time_template(cur, template_row: dict[str, Any] | None) -> None:
         cur.execute("UPDATE notification_templates SET remaining_uses=remaining_uses-1,updated_at=%s WHERE id=%s", (now_local(), template_row["id"]))
 
 
+def configured_admin_line_user_id() -> str:
+    return str(RUNTIME_SETTINGS.get("LINE 管理員 User ID", "") or "").strip() or LINE_ADMIN_USER_ID
+
+
 def active_line_bindings(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[dict[str, Any]]:
     cur.execute(
         "SELECT id,line_user_id,display_name,relation,notify_enabled FROM student_line_bindings WHERE student_id=%s AND active=TRUE AND notify_enabled=TRUE ORDER BY id",
@@ -829,7 +833,7 @@ def send_admin_template_line(cur, attendance_id: int | None, student: dict[str, 
     template_row = get_effective_template(cur, notification_type, None)
     template_text = template_row["template_text"] if template_row else DEFAULT_NOTIFICATION_TEMPLATES[notification_type]
     msg = render_notification_template(template_text, student, course, None, check_in_time, check_out_time, when, late_minutes)
-    return send_line(cur, attendance_id, LINE_ADMIN_USER_ID, msg, notification_type)
+    return send_line(cur, attendance_id, configured_admin_line_user_id(), msg, notification_type)
 
 
 def hash_device_token(token: str) -> str:
@@ -1389,136 +1393,105 @@ def scan_student(token: str) -> dict[str, Any]:
 
 
 def check_scheduled_absences() -> int:
-    """Auto absent check. One worker at a time + retry cooldown after a failed send."""
+    """Auto absent check. Consolidate due absent alerts into one admin push."""
     now = now_local()
     work_date = now.date()
+    pending = []
     changed = 0
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.absent.checker')) AS locked")
-            lock_row = cur.fetchone()
-            if not lock_row or not lock_row["locked"]:
+            if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute(
-                """
-                SELECT c.*, s.name, s.active AS student_active
-                FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE
-                  AND c.actual_course_id IS NOT NULL
-                  AND COALESCE(c.source,'實際課程')='實際課程'
-                  AND s.active=TRUE
-                ORDER BY c.start_time, c.id
-                """,
-                (work_date,),
-            )
-            courses = cur.fetchall()
-            absent_threshold = setting_int("未到班通知（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
-            for course in courses:
+            cur.execute("SELECT c.*, s.name, s.active AS student_active FROM courses c JOIN students s ON s.id=c.student_id WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' AND s.active=TRUE ORDER BY c.start_time,c.id", (work_date,))
+            threshold = setting_int("未到班通知（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
+            for course in cur.fetchall():
                 eff = effective_schedule(cur, course, work_date)
                 if not eff:
                     continue
-                start_dt = parse_hhmm(eff["effective_start"], work_date)
-                notify_at = start_dt + timedelta(minutes=absent_threshold)
-                if now < notify_at:
+                if now < parse_hhmm(eff["effective_start"], work_date) + timedelta(minutes=threshold):
                     continue
-                cur.execute(
-                    """
-                    INSERT INTO attendance (student_id,course_id,date,status,updated_at)
-                    VALUES (%s,%s,%s,'absent',%s)
-                    ON CONFLICT (student_id,course_id,date) DO NOTHING
-                    RETURNING id
-                    """,
-                    (course["student_id"], course["id"], work_date, now),
-                )
+                cur.execute("INSERT INTO attendance(student_id,course_id,date,status,updated_at) VALUES (%s,%s,%s,'absent',%s) ON CONFLICT(student_id,course_id,date) DO NOTHING RETURNING id", (course["student_id"],course["id"],work_date,now))
                 inserted = cur.fetchone()
                 aid = inserted["id"] if inserted else None
                 if not aid:
-                    cur.execute(
-                        "SELECT id,check_in_time,absent_notified_at,last_absent_attempt_at FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s FOR UPDATE",
-                        (course["student_id"], course["id"], work_date),
-                    )
+                    cur.execute("SELECT * FROM attendance WHERE student_id=%s AND course_id=%s AND date=%s FOR UPDATE", (course["student_id"],course["id"],work_date))
                     a = cur.fetchone()
                     if not a or a["check_in_time"] or a["absent_notified_at"]:
                         continue
-                    last_attempt = a.get("last_absent_attempt_at")
-                    if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+                    if a.get("last_absent_attempt_at") and now-a["last_absent_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                         continue
                     aid = a["id"]
-                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE", (aid,))
-                a = cur.fetchone()
+                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE",(aid,))
+                a=cur.fetchone()
                 if not a or a["check_in_time"] or a["absent_notified_at"]:
                     continue
-                last_attempt = a.get("last_absent_attempt_at")
-                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+                if a.get("last_absent_attempt_at") and now-a["last_absent_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
-                cur.execute("UPDATE attendance SET last_absent_attempt_at=%s,updated_at=%s WHERE id=%s", (now, now, aid))
-                student = {"id": course["student_id"], "name": course["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
-                sent = send_admin_template_line(cur, aid, student, eff, "absent", when=now)
-                if sent:
-                    cur.execute(
-                        "UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s AND absent_notified_at IS NULL",
-                        (now, now, aid),
-                    )
-                    changed += cur.rowcount
+                cur.execute("UPDATE attendance SET last_absent_attempt_at=%s,updated_at=%s WHERE id=%s",(now,now,aid))
+                msg=absent_admin_message(course["name"],eff.get("course_name") or "未命名課程",eff["effective_start"],now)
+                pending.append((aid,"absent",msg))
+            if pending:
+                recipient=configured_admin_line_user_id()
+                if not recipient:
+                    ok=False
+                elif LINE_MODE != "live":
+                    ok=send_line(cur,None,recipient,"📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending)),"absent")
+                else:
+                    batch="📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending))
+                    if len(batch)>4900: batch=batch[:4860]+"\n…（其餘請查看管理後台）"
+                    ok=send_line(cur,None,recipient,batch,"absent")
+                for aid,ntype,msg in pending:
+                    log_notification(cur,aid,ntype,recipient or None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
+                if ok:
+                    for aid,_,_ in pending:
+                        cur.execute("UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s AND absent_notified_at IS NULL",(now,now,aid))
+                        changed += cur.rowcount
             conn.commit()
     return changed
 
 
 def check_missing_checkout() -> int:
-    """Auto missing-checkout check. One worker at a time + retry cooldown."""
-    now = now_local()
-    work_date = now.date()
-    changed = 0
+    """Auto missing-checkout check. Consolidate due alerts into one admin push."""
+    now=now_local()
+    work_date=now.date()
+    pending=[]
+    changed=0
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.missing_checkout.checker')) AS locked")
-            lock_row = cur.fetchone()
-            if not lock_row or not lock_row["locked"]:
+            if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute(
-                """
-                SELECT a.*, s.name, c.course_name, c.start_time, c.end_time, c.checkout_grace_minutes
-                FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id
-                WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL
-                  AND a.missing_checkout_notified_at IS NULL
-                  AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
-                FOR UPDATE OF a SKIP LOCKED
-                """,
-                (work_date,),
-            )
-            rows = cur.fetchall()
-            for row in rows:
-                last_attempt = row.get("last_missing_checkout_attempt_at")
-                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
+            cur.execute("SELECT a.*,s.name,c.course_name,c.start_time,c.end_time,c.checkout_grace_minutes FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL AND a.missing_checkout_notified_at IS NULL AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' FOR UPDATE OF a SKIP LOCKED",(work_date,))
+            for row in cur.fetchall():
+                if row.get("last_missing_checkout_attempt_at") and now-row["last_missing_checkout_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
-                cur.execute("SELECT * FROM courses WHERE id=%s", (row["course_id"],))
-                course = cur.fetchone()
-                if not course:
+                cur.execute("SELECT * FROM courses WHERE id=%s",(row["course_id"],))
+                course=cur.fetchone()
+                if not course: continue
+                eff=effective_schedule(cur,course,work_date)
+                if not eff or not eff.get("effective_end") or now < parse_hhmm(eff["effective_end"],work_date)+timedelta(minutes=eff["checkout_grace_minutes"]):
                     continue
-                eff = effective_schedule(cur, course, work_date)
-                if not eff or not eff.get("effective_end"):
+                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE",(row["id"],))
+                a=cur.fetchone()
+                if not a or a["check_out_time"] or a["missing_checkout_notified_at"]:
                     continue
-                end_dt = parse_hhmm(eff["effective_end"], work_date)
-                if now < end_dt + timedelta(minutes=eff["checkout_grace_minutes"]):
+                if a.get("last_missing_checkout_attempt_at") and now-a["last_missing_checkout_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
-                cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE", (row["id"],))
-                locked = cur.fetchone()
-                if not locked or locked["check_out_time"] or locked["missing_checkout_notified_at"]:
-                    continue
-                last_attempt = locked.get("last_missing_checkout_attempt_at")
-                if last_attempt and now - last_attempt < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
-                    continue
-                cur.execute("UPDATE attendance SET last_missing_checkout_attempt_at=%s,updated_at=%s WHERE id=%s", (now, now, row["id"]))
-                row = dict(locked)
-                row["effective_end"] = eff["effective_end"]
-                student = {"id": row["student_id"], "name": row["name"], "line_user_id": None, "parent_notify_enabled": True, "notify_exception_enabled": True}
-                sent = send_admin_template_line(cur, row["id"], student, eff, "missing_checkout", check_in_time=row["check_in_time"], when=now)
-                if sent:
-                    cur.execute(
-                        "UPDATE attendance SET missing_checkout_notified_at=%s, updated_at=%s WHERE id=%s AND missing_checkout_notified_at IS NULL",
-                        (now, now, row["id"]),
-                    )
-                    changed += cur.rowcount
+                cur.execute("UPDATE attendance SET last_missing_checkout_attempt_at=%s,updated_at=%s WHERE id=%s",(now,now,row["id"]))
+                msg=missing_checkout_message({"name":row["name"],"course_name":eff.get("course_name") or "未命名課程","check_in_time":a["check_in_time"],"effective_end":eff["effective_end"]},now)
+                pending.append((row["id"],"missing_checkout",msg))
+            if pending:
+                recipient=configured_admin_line_user_id()
+                batch="📋 今日未離班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending))
+                if len(batch)>4900: batch=batch[:4860]+"\n…（其餘請查看管理後台）"
+                ok=send_line(cur,None,recipient,batch,"missing_checkout") if recipient else False
+                for aid,ntype,msg in pending:
+                    log_notification(cur,aid,ntype,recipient or None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
+                if ok:
+                    for aid,_,_ in pending:
+                        cur.execute("UPDATE attendance SET missing_checkout_notified_at=%s,updated_at=%s WHERE id=%s AND missing_checkout_notified_at IS NULL",(now,now,aid))
+                        changed += cur.rowcount
             conn.commit()
     return changed
 
