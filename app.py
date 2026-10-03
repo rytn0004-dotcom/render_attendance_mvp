@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.4"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1651,7 +1651,10 @@ def dashboard(_: str = Depends(admin_auth)):
             f"<td>{bind_text}</td>"
             f"<td><span class='{ 'green' if s.get('parent_notify_enabled', True) else 'gray' }'>家長提醒：{notify_label}</span>"
             f"<form style='margin-top:6px' method='post' action='/admin/student/{s['id']}/toggle-parent-notify'><button class='btn btn2 mini'>{'關閉家長提醒' if s.get('parent_notify_enabled', True) else '開啟家長提醒'}</button></form></td>"
-            f"<td>{test_btn}</td></tr>"
+            delete_btn = ""
+            if str(s.get("student_code") or "").upper().startswith("STU-"):
+                delete_btn = f"<form style='margin-top:6px' method='post' action='/admin/student/{s["id"]}/delete-test' onsubmit='return confirm(&quot;確定刪除測試學生？這會一併刪除其出勤、課程、LINE 綁定與通知範本資料，無法復原。&quot;)'><button class='btn btn2 mini'>刪除測試學生</button></form>"
+            f"<td>{test_btn}{delete_btn}</td></tr>"
         )
     body_parts.append("<section><h2>學生 QR / 家長 LINE</h2><p class='muted mini'>學生 QR 是永久識別碼：日常不會變，只有管理員主動重新產生才會更新。家長 LINE 不由學生手機綁定，而是從既有 LINE 客服／Excel 的 LINE User ID 與學生姓名（或學生編號）建立關聯。</p><table><tr><th>學生</th><th>編號</th><th>學生 QR</th><th>已綁定 LINE</th><th>家長提醒</th><th>測試</th></tr>" + "".join(qr_rows) + "</table></section>")
 
@@ -3211,12 +3214,30 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
 
     actual_imported = actual_skipped = binding_imported = 0
     errors: list[str] = []
+    cur.execute("SELECT COUNT(*) AS c FROM students WHERE active=TRUE")
+    student_count_before = cur.fetchone()["c"]
     _upsert_students_from_excel(cur, student_rows)
+    cur.execute("SELECT COUNT(*) AS c FROM students WHERE active=TRUE")
+    student_count_after = cur.fetchone()["c"]
+    logger.info(
+        "Master sync sheet counts: 出勤學生=%s, 實際課程=%s, 出勤LINE綁定=%s; active_students_before=%s after=%s",
+        len(student_rows), len(actual_course_rows), len(binding_rows), student_count_before, student_count_after
+    )
     if actual_course_rows:
         actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
+        logger.info(
+            "Master sync actual-course parse: imported=%s skipped=%s errors=%s sample_errors=%s",
+            actual_imported, actual_skipped, len(errors), errors[:20]
+        )
         # 自動同步的安全門檻：如果原檔有實際課程資料，但一筆都無法有效解析，不覆蓋目前線上資料。
         if actual_imported == 0:
-            raise RuntimeError("總表「實際課程」有資料，但本次沒有任何一筆成功解析；為避免清掉可用資料，本次同步已取消。")
+            detail = "；".join(errors[:12]) if errors else "沒有產生逐列錯誤資訊"
+            raise RuntimeError(
+                "總表「實際課程」有資料，但本次沒有任何一筆成功解析；"
+                f"出勤學生讀取 {len(student_rows)} 筆、同步後啟用學生 {student_count_after} 筆；"
+                f"實際課程讀取 {len(actual_course_rows)} 筆、跳過 {actual_skipped} 筆。"
+                f"原因：{detail}"
+            )
     if attendance_settings_rows:
         sync_runtime_settings(cur, attendance_settings_rows)
     if attendance_template_rows:
@@ -3341,9 +3362,9 @@ def admin_master_sync(_: str = Depends(admin_auth)):
                 f"<tr><th>最後檢查</th><td>{escape(str(state.get('last_checked_at') or '—'))}</td></tr>"
                 f"<tr><th>最後成功同步</th><td>{escape(str(state.get('last_synced_at') or '—'))}</td></tr>"
                 f"<tr><th>來源最後修改</th><td>{escape(str(state.get('remote_modified_at') or '—'))}</td></tr>"
-                f"<tr><th>實際課程</th><td>{escape(str(state.get('last_actual_imported') or 0))} 筆</td></tr>"
+                f"<tr><th>實際課程</th><td>{escape(str(state.get('last_actual_imported') or 0))} 筆（跳過 {escape(str(state.get('last_actual_skipped') or 0))} 筆）</td></tr>"
                 f"<tr><th>LINE 綁定</th><td>{escape(str(state.get('last_binding_imported') or 0))} 筆</td></tr>"
-                f"<tr><th>上次錯誤</th><td>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
+                f"<tr><th>上次錯誤</th><td style='white-space:pre-wrap'>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
                 f"<p><b>自動檢查間隔：</b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</p>"
                 f"<form method='post' action='/admin/master-sync/now'><button>立即檢查並同步</button></form></section>")
     body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p></section>")
@@ -3495,6 +3516,35 @@ def qr(student_code: str):
     img = qrcode.make(f"{public_base_url()}/scan/{row['qr_token']}")
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
+
+@app.post("/admin/student/{student_id}/delete-test")
+def delete_test_student(student_id: int, _: str = Depends(admin_auth)):
+    """Hard-delete only test-coded students (STU-*)."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,student_code FROM students WHERE id=%s", (student_id,))
+            student = cur.fetchone()
+            if not student:
+                raise HTTPException(404, "找不到學生")
+            code = str(student["student_code"] or "").strip().upper()
+            if not code.startswith("STU-"):
+                raise HTTPException(400, "為避免誤刪正式學生，只允許刪除學生編號以 STU- 開頭的測試資料。")
+            cur.execute("DELETE FROM attendance WHERE student_id=%s", (student_id,))
+            cur.execute("DELETE FROM schedule_overrides WHERE course_id IN (SELECT id FROM courses WHERE student_id=%s)", (student_id,))
+            cur.execute("DELETE FROM courses WHERE student_id=%s", (student_id,))
+            cur.execute("DELETE FROM student_line_bindings WHERE student_id=%s", (student_id,))
+            try:
+                cur.execute("DELETE FROM notification_templates WHERE student_id=%s", (student_id,))
+            except Exception:
+                pass
+            try:
+                cur.execute("DELETE FROM line_bind_tokens WHERE student_id=%s", (student_id,))
+            except Exception:
+                pass
+            cur.execute("DELETE FROM students WHERE id=%s", (student_id,))
+            conn.commit()
+    return RedirectResponse("/admin", status_code=303)
+
 
 @app.post("/admin/student/{student_id}/qr-regenerate")
 def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
