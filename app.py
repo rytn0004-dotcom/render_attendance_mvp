@@ -1818,7 +1818,7 @@ def admin_courses(_: str = Depends(admin_auth)):
             grouped = {}
             for c in rows:
                 grouped.setdefault(c["course_date"], []).append(c)
-            body.append("<form method='post' action='/admin/courses/overrides'><p><button class='btn' type='submit'>💾 一次儲存全部今天校正</button></p>")
+            body.append("<form method='post' action='/admin/courses/overrides'><p><button class='btn' type='submit'>💾 一次儲存全部校正</button></p>")
             for d, items in grouped.items():
                 body.append(f"<section><h2>{d:%Y-%m-%d}　{WEEKDAYS[d.weekday()]}</h2><div style='overflow:auto'><table><tr><th>學生</th><th>Course ID</th><th>課程</th><th>老師</th><th>來源時間</th><th>今日校正</th></tr>")
                 for c in items:
@@ -1845,7 +1845,7 @@ def admin_courses(_: str = Depends(admin_auth)):
                     )
                 body.append("</table></div></section>")
             if rows:
-                body.append("<p><button class='btn' type='submit'>💾 一次儲存全部今天校正</button></p></form>")
+                body.append("<p><button class='btn' type='submit'>💾 一次儲存全部校正</button></p></form>")
     if len(rows) == 0:
         body.append("<section class='alert'>目前沒有已同步的未來「實際課程」。請到「LINE 綁定 / 測試」上傳最新總表 Excel。</section>")
     return page("實際課程", "".join(body))
