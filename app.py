@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -2792,39 +2792,87 @@ def _weekday_index(value: Any, fallback: date) -> int:
 
 
 def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[int, int, list[str]]:
+    """Import the master-sheet 實際課程 snapshot.
+
+    The master sheet is intentionally allowed to keep only the start time in
+    「上課時間」.  If the end time is embedded in 「備註」, e.g.
+    「原時段 16:30-19:30」, extract it automatically.
+
+    Group lessons may contain multiple students in one row, e.g.
+    「葉依柔、陳翊森」.  Each student gets an independent attendance course,
+    while the original Course ID is retained as the base identifier and a
+    deterministic student suffix is added only when needed to satisfy the
+    unique actual_course_id index.
+    """
     imported = 0
     skipped = 0
     errors: list[str] = []
     parsed_rows: list[dict[str, Any]] = []
     dates: set[date] = set()
     invalid_dates: set[date] = set()
+
+    def split_student_names(value: str) -> list[str]:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        # GPT整理課表常用「、」；同時容許逗號、頓號及換行。
+        parts = re.split(r"[、，,；;／/\\n]+", text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def extract_end_time_from_note(note: str) -> tuple[str, str]:
+        """Return (start, end) from 原時段/時段 text when present."""
+        text = str(note or "")
+        # 優先抓「原時段 16:30-19:30」，也容許 ～、至、到、全形符號。
+        patterns = [
+            r"(?:原時段|原時間|時段|課程時間)\s*[:：]?\s*(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})",
+            r"(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                return _normalize_excel_time(m.group(1)), _normalize_excel_time(m.group(2))
+        return "", ""
+
     for i, raw in enumerate(rows, start=2):
         row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
         actual_id = row.get("Course ID", "") or row.get("課程ID", "")
         course_date = _parse_excel_date_value(row.get("課程日期") or row.get("日期"))
-        student_code = row.get("學生編號", "") or row.get("學生ID", "")
-        student_name = row.get("學生", "") or row.get("學生姓名", "") or row.get("姓名", "")
+        student_text = row.get("學生", "") or row.get("學生姓名", "") or row.get("姓名", "")
         time_text = row.get("上課時間", "") or row.get("課程時間", "") or ""
+        note_text = row.get("備註", "") or ""
+
         start_time = row.get("開始時間（出勤用）", "") or row.get("開始時間", "") or row.get("開始", "") or ""
         end_time = row.get("下課時間（出勤用）", "") or row.get("下課時間", "") or row.get("結束時間", "") or row.get("結束", "") or ""
         start_time = _normalize_excel_time(start_time)
         end_time = _normalize_excel_time(end_time)
+
         if not start_time and time_text:
             m = re.search(r"(\d{1,2}:\d{2})\s*[-~～—–至到]\s*(\d{1,2}:\d{2})", str(time_text))
             if m:
                 start_time, end_time = m.group(1), m.group(2)
             else:
                 start_time = _normalize_excel_time(time_text)
+
+        # 目前總表把完整時段放在備註，例如「原時段 17:00-19:00」。
+        # 若欄位本身沒有下課時間，就從備註補上；欄位本身有值則優先保留。
+        note_start, note_end = extract_end_time_from_note(note_text)
+        if not start_time and note_start:
+            start_time = note_start
+        if not end_time and note_end:
+            end_time = note_end
+
         start_time = _normalize_excel_time(start_time)
         end_time = _normalize_excel_time(end_time)
-        if not actual_id or not course_date or not student_name or not start_time:
+
+        student_names = split_student_names(student_text)
+        if not actual_id or not course_date or not student_names or not start_time:
             if course_date:
                 invalid_dates.add(course_date)
             skipped += 1
             if any(row.values()):
                 errors.append(f"第 {i} 列缺少 Course ID／日期／學生／上課時間，已略過。")
             continue
-        # 若「上課時間」只有開始時間，仍可建立到班課程；離班/未離班判斷會在後台標記缺少下課時間。
+
         try:
             parse_hhmm(start_time, course_date)
             if end_time:
@@ -2835,36 +2883,78 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
             skipped += 1
             errors.append(f"第 {i} 列時間格式錯誤：{start_time}-{end_time}。")
             continue
-        if student_code:
-            cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (student_code,))
-            matches = cur.fetchall()
-        else:
-            cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
-            matches = cur.fetchall()
-        if len(matches) != 1:
-            if course_date:
+
+        # 一列多人課拆成多筆獨立簽到課程。
+        for student_index, student_name in enumerate(student_names, start=1):
+            student_code = ""
+            # 優先使用整列的學生編號；若多人課沒有學生編號，改用姓名唯一對應。
+            raw_student_code = row.get("學生編號", "") or row.get("學生ID", "")
+            if len(student_names) == 1:
+                student_code = raw_student_code
+
+            if student_code:
+                cur.execute(
+                    "SELECT id,name FROM students WHERE student_code=%s AND active=TRUE",
+                    (student_code,),
+                )
+                matches = cur.fetchall()
+            else:
+                cur.execute(
+                    "SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id",
+                    (student_name,),
+                )
+                matches = cur.fetchall()
+
+            if len(matches) != 1:
                 invalid_dates.add(course_date)
-            skipped += 1
-            errors.append(f"第 {i} 列學生「{student_name}」無法唯一對應（找到 {len(matches)} 位）。")
-            continue
-        student_id = matches[0]["id"]
-        parsed_rows.append({
-            "actual_id": actual_id,
-            "course_date": course_date,
-            "student_id": student_id,
-            "student_name": student_name,
-            "weekday": _weekday_index(row.get("星期"), course_date),
-            "start_time": start_time,
-            "end_time": end_time,
-            "course_name": row.get("課程", "") or "未命名課程",
-            "teacher_name": row.get("老師", ""),
-            "source_note": "；".join([x for x in [row.get("來源", ""), row.get("固定課表ID", ""), row.get("調課ID", ""), row.get("調課結果", ""), row.get("備註", "")] if x]),
-        })
-        dates.add(course_date)
+                skipped += 1
+                errors.append(
+                    f"第 {i} 列學生「{student_name}」無法唯一對應（找到 {len(matches)} 位）。"
+                )
+                continue
+
+            student_id = matches[0]["id"]
+            # 保留原 Course ID；多人課為每位學生產生穩定、可重複同步的子 ID。
+            normalized_actual_id = (
+                actual_id
+                if len(student_names) == 1
+                else f"{actual_id}__S{student_id}"
+            )
+
+            parsed_rows.append({
+                "actual_id": normalized_actual_id,
+                "base_actual_id": actual_id,
+                "course_date": course_date,
+                "student_id": student_id,
+                "student_name": student_name,
+                "weekday": _weekday_index(row.get("星期"), course_date),
+                "start_time": start_time,
+                "end_time": end_time,
+                "course_name": row.get("課程", "") or "未命名課程",
+                "teacher_name": row.get("老師", ""),
+                "source_note": "；".join(
+                    [
+                        x
+                        for x in [
+                            row.get("來源", ""),
+                            row.get("固定課表ID", ""),
+                            row.get("調課ID", ""),
+                            row.get("調課結果", ""),
+                            note_text,
+                        ]
+                        if x
+                    ]
+                ),
+            })
+            dates.add(course_date)
 
     # 以「實際課程」為該日期唯一來源：該日期原本同步進來的課程先停用，再寫入新快照。
     for d in dates - invalid_dates:
-        cur.execute("UPDATE courses SET active=FALSE WHERE actual_course_id IS NOT NULL AND COALESCE(source,'實際課程')='實際課程' AND course_date=%s", (d,))
+        cur.execute(
+            "UPDATE courses SET active=FALSE WHERE actual_course_id IS NOT NULL "
+            "AND COALESCE(source,'實際課程')='實際課程' AND course_date=%s",
+            (d,),
+        )
 
     for r in parsed_rows:
         cur.execute("SELECT id FROM courses WHERE actual_course_id=%s", (r["actual_id"],))
@@ -2874,20 +2964,28 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
                 """UPDATE courses SET student_id=%s,course_name=%s,teacher_name=%s,weekday=%s,start_time=%s,end_time=%s,
                    late_grace_minutes=%s,checkout_grace_minutes=%s,active=TRUE,course_date=%s,source='實際課程',source_note=%s
                    WHERE id=%s""",
-                (r["student_id"],r["course_name"],r["teacher_name"] or None,r["weekday"],r["start_time"],r["end_time"],
-                 DEFAULT_LATE_GRACE_MINUTES,DEFAULT_CHECKOUT_GRACE_MINUTES,r["course_date"],r["source_note"] or None,existing["id"]),
+                (
+                    r["student_id"], r["course_name"], r["teacher_name"] or None, r["weekday"],
+                    r["start_time"], r["end_time"], DEFAULT_LATE_GRACE_MINUTES,
+                    DEFAULT_CHECKOUT_GRACE_MINUTES, r["course_date"], r["source_note"] or None,
+                    existing["id"],
+                ),
             )
         else:
             cur.execute(
                 """INSERT INTO courses(student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,
                    active,actual_course_id,course_date,source,source_note)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,'實際課程',%s)""",
-                (r["student_id"],r["course_name"],r["teacher_name"] or None,r["weekday"],r["start_time"],r["end_time"],
-                 DEFAULT_LATE_GRACE_MINUTES,DEFAULT_CHECKOUT_GRACE_MINUTES,r["actual_id"],r["course_date"],r["source_note"] or None),
+                (
+                    r["student_id"], r["course_name"], r["teacher_name"] or None, r["weekday"],
+                    r["start_time"], r["end_time"], DEFAULT_LATE_GRACE_MINUTES,
+                    DEFAULT_CHECKOUT_GRACE_MINUTES, r["actual_id"], r["course_date"],
+                    r["source_note"] or None,
+                ),
             )
         imported += 1
-    return imported, skipped, errors
 
+    return imported, skipped, errors
 
 
 # ---------- Master Excel automatic sync ----------
