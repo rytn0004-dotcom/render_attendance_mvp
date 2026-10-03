@@ -375,7 +375,7 @@ def sync_runtime_settings(cur, rows: list[dict[str, Any]]) -> None:
     allowed = {
         "出勤模組", "出勤課程來源", "遲到門檻（分鐘）", "未到班通知（分鐘）",
         "未離班通知（分鐘）", "提前簽到（分鐘）", "重複掃描保護（分鐘）",
-        "教室設備限制", "學生 QR", "LINE 家長提醒", "LINE 管理員提醒", "LINE 管理員 User ID", "LINE 資料來源", "總表同步方式", "老師出勤",
+        "教室設備限制", "學生 QR", "LINE 家長提醒", "LINE 管理員提醒", "LINE 資料來源", "總表同步方式", "老師出勤",
     }
     for raw in rows:
         key = str(raw.get("設定項目", "")).strip()
@@ -774,8 +774,19 @@ def consume_one_time_template(cur, template_row: dict[str, Any] | None) -> None:
         cur.execute("UPDATE notification_templates SET remaining_uses=remaining_uses-1,updated_at=%s WHERE id=%s", (now_local(), template_row["id"]))
 
 
+def configured_admin_line_user_ids() -> list[str]:
+    """Read one or more admin LINE User IDs from Render LINE_ADMIN_USER_ID.
+    Accepts comma, semicolon, whitespace, or newline separated IDs.
+    """
+    raw = str(LINE_ADMIN_USER_ID or "").strip()
+    ids = [x.strip() for x in re.split(r"[,;\s]+", raw) if x.strip()]
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(ids))
+
+
 def configured_admin_line_user_id() -> str:
-    return str(RUNTIME_SETTINGS.get("LINE 管理員 User ID", "") or "").strip() or LINE_ADMIN_USER_ID
+    ids = configured_admin_line_user_ids()
+    return ids[0] if ids else ""
 
 
 def active_line_bindings(cur, student_id: int, legacy_line_user_id: str | None = None) -> list[dict[str, Any]]:
@@ -837,16 +848,18 @@ def send_admin_template_line(cur, attendance_id: int | None, student: dict[str, 
                               notification_type: str, check_in_time: datetime | None = None,
                               check_out_time: datetime | None = None, when: datetime | None = None,
                               late_minutes: int = 0) -> bool:
-    if not setting_enabled("LINE 管理員提醒", True):
-        template_row = get_effective_template(cur, notification_type, None)
-        template_text = template_row["template_text"] if template_row else DEFAULT_NOTIFICATION_TEMPLATES[notification_type]
-        msg = render_notification_template(template_text, student, course, None, check_in_time, check_out_time, when, late_minutes)
-        log_notification(cur, attendance_id, notification_type, None, msg, LINE_MODE, "disabled", "全域管理員 LINE 通知已由管理員關閉")
-        return False
     template_row = get_effective_template(cur, notification_type, None)
     template_text = template_row["template_text"] if template_row else DEFAULT_NOTIFICATION_TEMPLATES[notification_type]
     msg = render_notification_template(template_text, student, course, None, check_in_time, check_out_time, when, late_minutes)
-    return send_line(cur, attendance_id, configured_admin_line_user_id(), msg, notification_type)
+    if not setting_enabled("LINE 管理員提醒", True):
+        log_notification(cur, attendance_id, notification_type, None, msg, LINE_MODE, "disabled", "全域管理員 LINE 通知已由管理員關閉")
+        return False
+    recipients = configured_admin_line_user_ids()
+    if not recipients:
+        log_notification(cur, attendance_id, notification_type, None, msg, LINE_MODE, "failed", "未設定 LINE_ADMIN_USER_ID")
+        return False
+    results = [send_line(cur, attendance_id, recipient, msg, notification_type) for recipient in recipients]
+    return any(results) and all(results)
 
 
 def hash_device_token(token: str) -> str:
@@ -1450,17 +1463,13 @@ def check_scheduled_absences() -> int:
                         log_notification(cur,aid,ntype,None,msg,LINE_MODE,"disabled","全域管理員 LINE 通知已由管理員關閉")
                     conn.commit()
                     return 0
-                recipient=configured_admin_line_user_id()
-                if not recipient:
-                    ok=False
-                elif LINE_MODE != "live":
-                    ok=send_line(cur,None,recipient,"📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending)),"absent")
-                else:
-                    batch="📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending))
-                    if len(batch)>4900: batch=batch[:4860]+"\n…（其餘請查看管理後台）"
-                    ok=send_line(cur,None,recipient,batch,"absent")
+                recipients=configured_admin_line_user_ids()
+                batch="📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending))
+                if len(batch)>4900: batch=batch[:4860]+"\n…（其餘請查看管理後台）"
+                results=[send_line(cur,None,recipient,batch,"absent") for recipient in recipients] if recipients else []
+                ok=bool(results) and all(results)
                 for aid,ntype,msg in pending:
-                    log_notification(cur,aid,ntype,recipient or None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
+                    log_notification(cur,aid,ntype,",".join(recipients) if recipients else None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
                 if ok:
                     for aid,_,_ in pending:
                         cur.execute("UPDATE attendance SET absent_notified_at=%s,status='absent',updated_at=%s WHERE id=%s AND absent_notified_at IS NULL",(now,now,aid))
@@ -1505,12 +1514,13 @@ def check_missing_checkout() -> int:
                         log_notification(cur,aid,ntype,None,msg,LINE_MODE,"disabled","全域管理員 LINE 通知已由管理員關閉")
                     conn.commit()
                     return 0
-                recipient=configured_admin_line_user_id()
+                recipients=configured_admin_line_user_ids()
                 batch="📋 今日未離班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending))
-                if len(batch)>4900: batch=batch[:4860]+"\n…（其餘請查看管理後台）"
-                ok=send_line(cur,None,recipient,batch,"missing_checkout") if recipient else False
+                if len(batch)>4900: batch=batch[:4860]+"\n…（其餘查看管理後台）"
+                results=[send_line(cur,None,recipient,batch,"missing_checkout") for recipient in recipients] if recipients else []
+                ok=bool(results) and all(results)
                 for aid,ntype,msg in pending:
-                    log_notification(cur,aid,ntype,recipient or None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
+                    log_notification(cur,aid,ntype,",".join(recipients) if recipients else None,msg,LINE_MODE,"sent" if ok else "failed",None if ok else "管理員彙整提醒發送失敗")
                 if ok:
                     for aid,_,_ in pending:
                         cur.execute("UPDATE attendance SET missing_checkout_notified_at=%s,updated_at=%s WHERE id=%s AND missing_checkout_notified_at IS NULL",(now,now,aid))
@@ -1581,7 +1591,6 @@ def dashboard(_: str = Depends(admin_auth)):
             load_runtime_settings(cur)
             parent_global = setting_enabled("LINE 家長提醒", True)
             admin_global = setting_enabled("LINE 管理員提醒", True)
-            admin_user = configured_admin_line_user_id()
     notice_class = "success" if parent_global and admin_global else "danger"
     notice_text = "家長＋管理員通知目前均啟用" if parent_global and admin_global else "⚠️ 有通知已關閉，關閉的通知不會發送"
     emergency_panel = (
@@ -1591,12 +1600,8 @@ def dashboard(_: str = Depends(admin_auth)):
         f"<form method='post' action='/admin/notifications/parent'><button class='btn {'btn2' if parent_global else ''}'>家長通知：{'啟用中（點此關閉）' if parent_global else '已關閉（點此開啟）'}</button></form>"
         f"<form method='post' action='/admin/notifications/admin'><button class='btn {'btn2' if admin_global else ''}'>管理員通知：{'啟用中（點此關閉）' if admin_global else '已關閉（點此開啟）'}</button></form>"
         f"</div>"
-        f"<p class='mini muted'>這是全域開關。即使學生已綁定 LINE 且個別提醒為啟用，關閉家長通知後也不會發送；管理員通知同理。</p>"
-        f"<form method='post' action='/admin/notifications/admin-user' style='margin-top:10px'>"
-        f"<label>管理員 LINE User ID：</label><input name='line_user_id' value='{escape(admin_user, quote=True)}' placeholder='Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' style='width:330px'> "
-        f"<button class='btn btn2 mini'>儲存管理員 ID</button></form></section>"
-    )
-    body_parts = [
+        f"<p class='mini muted'>管理員 LINE User ID 請在 Render 的 LINE_ADMIN_USER_ID 設定；可填多位，以逗號、分號、空白或換行分隔。</p></section>"
+    )    body_parts = [
         f"<div class='top'><div><h1>出勤測試系統 V{APP_VERSION}</h1><div class='muted'>Render 隔離測試站｜LINE：{escape(LINE_MODE_LABELS.get(LINE_MODE, LINE_MODE))}</div></div>{admin_nav()}</div>",
         "<script>setInterval(function(){if(!document.hidden){location.reload();}},5000);</script>",
         f"<div class='alert'>今天：{today:%Y-%m-%d}　自動檢查由背景程序每 60 秒執行一次；重新整理此頁面不會重複觸發 LINE 提醒。</div>",
@@ -1775,21 +1780,6 @@ def toggle_global_admin_notification(_: str = Depends(admin_auth)):
             conn.commit()
     return RedirectResponse("/admin", status_code=303)
 
-
-@app.post("/admin/notifications/admin-user")
-def update_admin_notification_user(line_user_id: str = Form(""), _: str = Depends(admin_auth)):
-    value = line_user_id.strip()
-    if value and not re.fullmatch(r"U[0-9a-fA-F]{32}", value):
-        raise HTTPException(400, "LINE User ID 格式應為 U 開頭的 32 位英數字。")
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO runtime_settings(key,value,updated_at) VALUES (%s,%s,%s) "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at",
-                ("LINE 管理員 User ID", value, now_local()),
-            )
-            conn.commit()
-    return RedirectResponse("/admin", status_code=303)
 
 
 @app.get("/admin/courses", response_class=HTMLResponse)
