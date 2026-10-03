@@ -1451,6 +1451,7 @@ def check_scheduled_absences() -> int:
                     conn.commit()
                     return 0
                 recipient=configured_admin_line_user_id()
+                if not recipient:
                     ok=False
                 elif LINE_MODE != "live":
                     ok=send_line(cur,None,recipient,"📋 今日未到班提醒（%s）\n\n%s" % (now.strftime("%H:%M"),"\n".join("• "+ " ".join(m.splitlines()).replace("🔴 ","",1) for _,_,m in pending)),"absent")
