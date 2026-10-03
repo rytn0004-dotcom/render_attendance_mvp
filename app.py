@@ -3258,9 +3258,13 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 if not student_name or student_name in seen_names:
                     continue
                 seen_names.add(student_name)
+                # 「實際課程」沒有學生編號時，建立穩定的系統學生編號。
+                # 這樣 _upsert_students_from_excel 不會因為缺少「學生編號」而略過學生，
+                # 同時同一姓名每次同步都會得到相同編號，不會重複建立學生。
+                stable_code = "ACTUAL-" + hashlib.sha1(student_name.encode("utf-8")).hexdigest()[:12].upper()
                 derived_rows.append({
                     "學生姓名": student_name,
-                    "學生編號": str(raw.get("學生編號", "") or raw.get("學生ID", "")).strip(),
+                    "學生編號": str(raw.get("學生編號", "") or raw.get("學生ID", "")).strip() or stable_code,
                 })
         student_source = derived_rows
         student_source_name = "實際課程→學生"
