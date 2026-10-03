@@ -29,7 +29,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.6.4"
+APP_VERSION = "0.6.6"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -3217,9 +3217,15 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
     out = {}
     for key, sheet in names.items():
         out[key] = _xlsx_read_sheet(raw, sheet)
-    # 正式總表至少要有出勤學生與實際課程；缺少這兩張通常代表拿錯檔案，不自動覆蓋目前資料。
-    if not out["出勤學生"] and not out["實際課程"]:
-        raise RuntimeError("總表至少必須包含可讀取的「出勤學生」或「實際課程」資料。")
+    # 目前正式總表沒有「出勤學生」工作表；學生名單直接由「實際課程」建立。
+    # 因此「實際課程」是出勤同步的必要來源，其他工作表都是輔助資料。
+    if not out["實際課程"]:
+        raise RuntimeError("總表沒有可讀取的「實際課程」資料；目前版本以「實際課程」作為出勤學生與課程的主要來源。")
+    logger.info(
+        "Master workbook sheets loaded: 實際課程=%s, 出勤LINE綁定=%s, 聯絡人=%s, 出勤設定=%s, 出勤通知模板=%s, 出勤通知個別=%s",
+        len(out["實際課程"]), len(out["出勤LINE綁定"]), len(out["聯絡人"]),
+        len(out["出勤設定"]), len(out["出勤通知模板"]), len(out["出勤通知個別"])
+    )
     return out
 
 
@@ -3236,12 +3242,39 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
     errors: list[str] = []
     cur.execute("SELECT COUNT(*) AS c FROM students WHERE active=TRUE")
     student_count_before = cur.fetchone()["c"]
-    _upsert_students_from_excel(cur, student_rows)
+
+    # 正式總表沒有「出勤學生」工作表：
+    # 先從「實際課程」的「學生」欄建立學生，再解析課程。
+    # 若未來總表恢復「出勤學生」，仍保留原本的欄位同步邏輯。
+    student_source = student_rows
+    student_source_name = "出勤學生"
+    if not student_source:
+        derived_rows = []
+        seen_names = set()
+        for raw in actual_course_rows:
+            name_text = str(raw.get("學生", "") or raw.get("學生姓名", "") or raw.get("姓名", "")).strip()
+            for student_name in re.split(r"[、，,；;／/\\n]+", name_text):
+                student_name = student_name.strip()
+                if not student_name or student_name in seen_names:
+                    continue
+                seen_names.add(student_name)
+                derived_rows.append({
+                    "學生姓名": student_name,
+                    "學生編號": str(raw.get("學生編號", "") or raw.get("學生ID", "")).strip(),
+                })
+        student_source = derived_rows
+        student_source_name = "實際課程→學生"
+        logger.info(
+            "Master sync: no 出勤學生 sheet; deriving students from 實際課程「學生」欄, derived_unique_students=%s, sample=%s",
+            len(derived_rows), [r.get("學生姓名") for r in derived_rows[:20]]
+        )
+
+    _upsert_students_from_excel(cur, student_source)
     cur.execute("SELECT COUNT(*) AS c FROM students WHERE active=TRUE")
     student_count_after = cur.fetchone()["c"]
     logger.info(
-        "Master sync sheet counts: 出勤學生=%s, 實際課程=%s, 出勤LINE綁定=%s; active_students_before=%s after=%s",
-        len(student_rows), len(actual_course_rows), len(binding_rows), student_count_before, student_count_after
+        "Master sync sheet counts: 出勤學生=%s, student_source=%s, 實際課程=%s, 出勤LINE綁定=%s; active_students_before=%s after=%s",
+        len(student_rows), student_source_name, len(actual_course_rows), len(binding_rows), student_count_before, student_count_after
     )
     if actual_course_rows:
         actual_imported, actual_skipped, errors = _upsert_actual_courses_from_excel(cur, actual_course_rows)
@@ -3254,7 +3287,7 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
             detail = "；".join(errors[:12]) if errors else "沒有產生逐列錯誤資訊"
             raise RuntimeError(
                 "總表「實際課程」有資料，但本次沒有任何一筆成功解析；"
-                f"出勤學生讀取 {len(student_rows)} 筆、同步後啟用學生 {student_count_after} 筆；"
+                f"學生來源 {student_source_name}、讀取 {len(student_source)} 筆、同步後啟用學生 {student_count_after} 筆；"
                 f"實際課程讀取 {len(actual_course_rows)} 筆、跳過 {actual_skipped} 筆。"
                 f"原因：{detail}"
             )
