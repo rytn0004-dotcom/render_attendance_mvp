@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.2"
+APP_VERSION = "0.7.3"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -2704,6 +2704,7 @@ def export_line_bindings(_: str = Depends(admin_auth)):
 # 目前已確認「翊森」是團班使用的正確名稱，因此將舊寫法「陳翊森」統一視為同一位學生。
 STUDENT_NAME_ALIASES = {
     "陳翊森": "翊森",
+    "依柔": "葉依柔",
 }
 
 
