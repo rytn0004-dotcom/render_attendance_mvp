@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.6"
+APP_VERSION = "0.7.7"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1577,7 +1577,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/tomorrow'>明日簽到表</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1745,6 +1745,99 @@ def dashboard(_: str = Depends(admin_auth)):
         logs.append(f"<div style='padding:8px 0;border-bottom:1px solid #eee'><b>{n['created_at']:%m-%d %H:%M:%S}</b>｜{escape(notification_type_label(n['notification_type']))}｜{escape(notify_status_label(n['status']))}<br>{escape(n['message'])}{('<br><span class=muted>錯誤：'+escape(n['error_message'])+'</span>') if n['error_message'] else ''}</div>")
     body_parts.append("<section><h2>最近通知紀錄</h2>" + ("".join(logs) or "尚無通知紀錄") + "</section>")
     return page("出勤測試系統", "".join(body_parts))
+
+
+
+@app.get("/admin/tomorrow", response_class=HTMLResponse)
+def admin_tomorrow_roster(_: str = Depends(admin_auth)):
+    """Read-only preview of the next day's active actual-course roster."""
+    target_date = now_local().date() + timedelta(days=1)
+    body = [
+        f"<div class='top'><div><h1>明日簽到表</h1><div class='muted'>V{APP_VERSION}｜依目前已同步的「實際課程」產生，只供提前核對。</div></div>{admin_nav()}</div>",
+        f"<div class='alert'>預覽日期：<b>{target_date:%Y-%m-%d}　{WEEKDAYS[target_date.weekday()]}</b><br>這是唯讀預覽：不會建立或修改出勤紀錄、不會發送 LINE 通知，也不會變更學生 QR。若剛更新 Excel，請先確認「總表同步」頁顯示同步成功。</div>",
+    ]
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.*, s.name, s.student_code
+                FROM courses c JOIN students s ON s.id=c.student_id
+                WHERE c.course_date=%s AND c.active=TRUE
+                  AND c.actual_course_id IS NOT NULL
+                  AND COALESCE(c.source,'實際課程')='實際課程'
+                ORDER BY c.start_time, s.name, c.id
+                """,
+                (target_date,),
+            )
+            course_rows = cur.fetchall()
+            display_rows = []
+            cancelled_count = 0
+            if course_rows:
+                course_ids = [c["id"] for c in course_rows]
+                placeholders = ",".join(["%s"] * len(course_ids))
+                cur.execute(
+                    f"SELECT * FROM schedule_overrides WHERE work_date=%s AND course_id IN ({placeholders})",
+                    (target_date, *course_ids),
+                )
+                overrides = {r["course_id"]: r for r in cur.fetchall()}
+                for course in course_rows:
+                    override = overrides.get(course["id"])
+                    if override and override.get("cancelled"):
+                        cancelled_count += 1
+                        continue
+                    item = dict(course)
+                    item["effective_start"] = (
+                        override.get("start_time") if override and override.get("start_time")
+                        else course.get("start_time")
+                    )
+                    item["effective_end"] = (
+                        override.get("end_time") if override and override.get("end_time")
+                        else course.get("end_time")
+                    )
+                    item["override_note"] = override.get("note") if override else ""
+                    display_rows.append(item)
+
+    def _preview_time(value):
+        if value is None or value == "":
+            return "—"
+        if hasattr(value, "strftime"):
+            return value.strftime("%H:%M")
+        match = re.match(r"^(\d{1,2}:\d{2})", str(value).strip())
+        return match.group(1) if match else str(value)
+
+    display_rows.sort(key=lambda item: (_preview_time(item.get("effective_start")), str(item.get("name") or "")))
+    body.append(
+        f"<section><h2>明日名單</h2><p>共 <b>{len(display_rows)}</b> 筆學生課程；已略過 <b>{cancelled_count}</b> 筆明日已取消的校正課程。</p>"
+    )
+    if display_rows:
+        rows_html = []
+        for item in display_rows:
+            course_id = escape(str(item.get("actual_course_id") or "—"))
+            student_name = escape(str(item.get("name") or "未命名學生"))
+            student_code = escape(str(item.get("student_code") or "—"))
+            course_name = escape(str(item.get("course_name") or "未命名課程"))
+            teacher_name = escape(str(item.get("teacher_name") or "—"))
+            start_time = escape(_preview_time(item.get("effective_start")))
+            end_time = escape(_preview_time(item.get("effective_end")))
+            note = escape(str(item.get("override_note") or "—"))
+            rows_html.append(
+                f"<tr><td>{student_name}<br><span class='muted mini'>{student_code}</span></td>"
+                f"<td>{course_id}</td><td>{course_name}</td><td>{teacher_name}</td>"
+                f"<td><b>{start_time}–{end_time}</b></td><td>{note}</td></tr>"
+            )
+        body.append(
+            "<div style='overflow:auto'><table><tr><th>學生／編號</th><th>Course ID</th><th>課程</th><th>老師</th><th>預計簽到時段</th><th>明日校正備註</th></tr>"
+            + "".join(rows_html) + "</table></div>"
+        )
+    else:
+        body.append(
+            "<div class='alert'>目前查不到明日有效的「實際課程」。請先確認總表同步成功，並檢查來源資料是否已有明日課程。</div>"
+        )
+    body.append("</section>")
+    body.append(
+        "<section><h2>核對提醒</h2><p>本頁只讀取目前資料庫中的明日有效課程，並套用明日的取消／時間校正；不會預先建立簽到紀錄。若名單或時段不正確，請回到來源總表修正並重新同步，不要在此頁直接修改。</p></section>"
+    )
+    return page("明日簽到表", "".join(body))
 
 
 @app.post("/admin/notifications/toggle")
