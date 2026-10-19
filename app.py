@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.3"
+APP_VERSION = "0.7.4"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -2700,17 +2700,98 @@ def export_line_bindings(_: str = Depends(admin_auth)):
     return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=line_bindings.csv"})
 
 
-# 學生姓名標準化：總表可能同時出現正式姓名與課表簡稱。
-# 目前已確認「翊森」是團班使用的正確名稱，因此將舊寫法「陳翊森」統一視為同一位學生。
+# 學生姓名／課程識別規則：統一總表中的簡稱、合併姓名與特殊課程標籤。
+# 同一人姓名：陳翊森、翊森；依柔、葉依柔。
+# 「雙翁」代表兩位學生，必須拆成兩筆獨立課程／簽到資料。
+# 「昀瑄國文體驗課」代表學生昀瑄，課程是「國文體驗課」。
 STUDENT_NAME_ALIASES = {
     "陳翊森": "翊森",
     "依柔": "葉依柔",
+    "昀瑄國文體驗課": "昀瑄",
+}
+
+STUDENT_GROUP_NAME_ALIASES = {
+    "雙翁": ("褕安", "褕嫺"),
+    "褕安褕嫺": ("褕安", "褕嫺"),
+    "褕安 褕嫺": ("褕安", "褕嫺"),
+    # 生物團班的兩位學生有時會用空白連在同一格。
+    "翊森 依柔": ("翊森", "葉依柔"),
+    "依柔 翊森": ("葉依柔", "翊森"),
+    "翊森 葉依柔": ("翊森", "葉依柔"),
+    "葉依柔 翊森": ("葉依柔", "翊森"),
+}
+
+STUDENT_COURSE_IDENTITY_ALIASES = {
+    "昀瑄國文體驗課": {
+        "students": ("昀瑄",),
+        "course_name": "國文體驗課",
+    },
+}
+
+# 若來源列的「課程」是生物團班且學生欄空白，仍建立兩位學生各自的簽到課程。
+COURSE_STUDENT_GROUP_RULES = {
+    "生物團班": ("翊森", "葉依柔"),
 }
 
 
+def _normalized_identity_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\u3000", " ")).strip()
+
+
 def _canonical_student_name(value: Any) -> str:
-    name = str(value or "").strip()
+    name = _normalized_identity_text(value)
+    course_alias = STUDENT_COURSE_IDENTITY_ALIASES.get(name)
+    if course_alias:
+        return course_alias["students"][0]
     return STUDENT_NAME_ALIASES.get(name, name)
+
+
+def _expand_student_names_from_text(value: Any) -> list[str]:
+    """Convert a source name cell into one or more canonical student names."""
+    text = _normalized_identity_text(value)
+    if not text:
+        return []
+
+    def expand_piece(piece: str) -> list[str]:
+        piece = _normalized_identity_text(piece)
+        if not piece:
+            return []
+        if piece in STUDENT_GROUP_NAME_ALIASES:
+            names = STUDENT_GROUP_NAME_ALIASES[piece]
+        elif piece in STUDENT_COURSE_IDENTITY_ALIASES:
+            names = STUDENT_COURSE_IDENTITY_ALIASES[piece]["students"]
+        else:
+            names = (_canonical_student_name(piece),)
+        return [_canonical_student_name(name) for name in names if _canonical_student_name(name)]
+
+    # 先識別整格的組合名稱，避免把「翊森 依柔」錯當成一位學生。
+    if text in STUDENT_GROUP_NAME_ALIASES or text in STUDENT_COURSE_IDENTITY_ALIASES:
+        parts = [text]
+    else:
+        parts = re.split(r"[、，,；;／/]+|\n+", text)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        for name in expand_piece(part):
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+    return result
+
+
+def _student_names_for_course(student_text: Any, course_name: Any = "") -> list[str]:
+    source_name = _normalized_identity_text(student_text)
+    course = _normalized_identity_text(course_name)
+    # 若來源把課程名稱誤放在學生欄，依已確認規則拆回真正學生名單。
+    if source_name == course and course in COURSE_STUDENT_GROUP_RULES:
+        source_name = ""
+    if not source_name and course in STUDENT_COURSE_IDENTITY_ALIASES:
+        source_name = course
+    names = _expand_student_names_from_text(source_name)
+    if names:
+        return names
+    return [_canonical_student_name(name) for name in COURSE_STUDENT_GROUP_RULES.get(course, ())]
 
 
 def _merge_student_name_aliases(cur) -> int:
@@ -2777,7 +2858,7 @@ def _normalize_binding_row(raw_row: dict[str, Any]) -> dict[str, str]:
     row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw_row.items()}
     return {
         "student_code": row.get("學生編號", "") or row.get("學生ID", "") or row.get("student_code", ""),
-        "student_name": row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", ""),
+        "student_name": _canonical_student_name(row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", "")),
         "line_user_id": row.get("LINE User ID", "") or row.get("LINE ID", "") or row.get("LINE_ID", "") or row.get("line_user_id", ""),
         "display_name": row.get("LINE 顯示名稱", "") or row.get("LINE顯示名稱", "") or "",
         "relation": row.get("關係", "") or row.get("家長關係", "") or "家長/監護人",
@@ -2790,34 +2871,43 @@ def _upsert_students_from_excel(cur, rows: list[dict[str, Any]]) -> set[int]:
     affected: set[int] = set()
     for raw in rows:
         row = {str(k).strip(): (str(v).strip() if v is not None else "") for k, v in raw.items()}
-        code = row.get("學生編號", "") or row.get("學生ID", "") or row.get("student_code", "")
-        name = _canonical_student_name(row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", ""))
-        qr_token = row.get("簽到識別碼", "") or row.get("QR Token", "") or row.get("qr_token", "")
-        if not code or not name:
+        source_name = row.get("學生姓名", "") or row.get("姓名", "") or row.get("name", "")
+        names = _expand_student_names_from_text(source_name)
+        source_code = row.get("學生編號", "") or row.get("學生ID", "") or row.get("student_code", "")
+        source_qr_token = row.get("簽到識別碼", "") or row.get("QR Token", "") or row.get("qr_token", "")
+        if not source_code or not names:
             continue
-        cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
-        student = cur.fetchone()
-        if student:
-            sid = student["id"]
-            if qr_token:
-                cur.execute(
-                    "UPDATE students SET name=%s,qr_token=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
-                    (name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
-                )
-            else:
-                cur.execute(
-                    "UPDATE students SET name=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
-                    (name, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
-                )
-        else:
-            if not qr_token:
-                qr_token = f"ATT-{secrets.token_urlsafe(12)}"
-            cur.execute(
-                "INSERT INTO students(student_code,name,qr_token,checkin_enabled,notify_checkin_enabled,notify_checkout_enabled,notify_exception_enabled) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                (code, name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True)),
+
+        for name in names:
+            # 如果來源名稱代表多位學生，不能把同一個學生編號或 QR Token 分配給所有人。
+            multi_student_source = len(names) > 1
+            code = source_code if not multi_student_source else (
+                "ACTUAL-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:12].upper()
             )
-            sid = cur.fetchone()["id"]
-        affected.add(sid)
+            qr_token = source_qr_token if not multi_student_source else ""
+            cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
+            student = cur.fetchone()
+            if student:
+                sid = student["id"]
+                if qr_token:
+                    cur.execute(
+                        "UPDATE students SET name=%s,qr_token=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
+                        (name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE students SET name=%s,checkin_enabled=%s,notify_checkin_enabled=%s,notify_checkout_enabled=%s,notify_exception_enabled=%s WHERE id=%s",
+                        (name, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True), sid),
+                    )
+            else:
+                if not qr_token:
+                    qr_token = f"ATT-{secrets.token_urlsafe(12)}"
+                cur.execute(
+                    "INSERT INTO students(student_code,name,qr_token,checkin_enabled,notify_checkin_enabled,notify_checkout_enabled,notify_exception_enabled) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (code, name, qr_token, _truthy_binding(row.get("簽到啟用"), True), _truthy_binding(row.get("到班通知"), True), _truthy_binding(row.get("離班通知"), True), _truthy_binding(row.get("異常通知"), True)),
+                )
+                sid = cur.fetchone()["id"]
+            affected.add(sid)
     return affected
 
 
@@ -2828,30 +2918,41 @@ def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set
         row = _normalize_binding_row(raw_row)
         if not row["line_user_id"] or (not row["student_code"] and not row["student_name"]):
             continue
+
+        # 有明確學生編號時依編號綁定單一學生；否則套用姓名／多人別名規則。
         if row["student_code"]:
             cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (row["student_code"],))
+            target_students = cur.fetchall()
         else:
-            cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (row["student_name"],))
-        matches = cur.fetchall()
-        if len(matches) != 1:
-            continue
-        student = matches[0]
-        active = row["active"] == "是"
-        notify = row["notify"] == "是"
-        cur.execute("SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s", (student["id"], row["line_user_id"]))
-        existing = cur.fetchone()
-        if existing:
-            cur.execute(
-                "UPDATE student_line_bindings SET display_name=%s,relation=%s,active=%s,notify_enabled=%s WHERE id=%s",
-                (row["display_name"] or None, row["relation"], active, notify, existing["id"]),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,notify_enabled,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,%s,'EXCEL')",
-                (student["id"], row["line_user_id"], row["display_name"] or None, row["relation"], active, notify, now_local()),
-            )
-        affected.add(student["id"])
-        imported += 1
+            target_students = []
+            for student_name in _expand_student_names_from_text(row["student_name"]):
+                cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
+                target_students.extend(cur.fetchall())
+
+        unique_targets = {item["id"]: item for item in target_students}
+        for student in unique_targets.values():
+            if row["student_code"]:
+                cur.execute("SELECT COUNT(*) AS c FROM students WHERE student_code=%s AND active=TRUE", (row["student_code"],))
+                if cur.fetchone()["c"] != 1:
+                    continue
+            student_id = student["id"]
+            active = row["active"] == "是"
+            notify = row["notify"] == "是"
+            cur.execute("SELECT id FROM student_line_bindings WHERE student_id=%s AND line_user_id=%s", (student_id, row["line_user_id"]))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    "UPDATE student_line_bindings SET display_name=%s,relation=%s,active=%s,notify_enabled=%s WHERE id=%s",
+                    (row["display_name"] or None, row["relation"], active, notify, existing["id"]),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,notify_enabled,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,%s,'EXCEL')",
+                    (student_id, row["display_name"] or None, row["relation"], active, notify, now_local()),
+                )
+            affected.add(student_id)
+            imported += 1
+
     for sid in affected:
         cur.execute(
             "SELECT EXISTS(SELECT 1 FROM student_line_bindings WHERE student_id=%s AND active=TRUE AND notify_enabled=TRUE) AS enabled",
@@ -3052,14 +3153,6 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
     dates: set[date] = set()
     invalid_dates: set[date] = set()
 
-    def split_student_names(value: str) -> list[str]:
-        text = str(value or "").strip()
-        if not text:
-            return []
-        # GPT整理課表常用「、」；同時容許逗號、頓號及換行。
-        parts = re.split(r"[、，,；;／/\\n]+", text)
-        return [p.strip() for p in parts if p.strip()]
-
     def extract_end_time_from_note(note: str) -> tuple[str, str]:
         """Return (start, end) from 原時段/時段 text when present."""
         text = str(note or "")
@@ -3081,6 +3174,18 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
         student_text = row.get("學生", "") or row.get("學生姓名", "") or row.get("姓名", "")
         time_text = row.get("上課時間", "") or row.get("課程時間", "") or ""
         note_text = row.get("備註", "") or ""
+        source_course_name = _normalized_identity_text(row.get("課程", ""))
+        identity_label = _normalized_identity_text(student_text)
+        if identity_label not in STUDENT_COURSE_IDENTITY_ALIASES and source_course_name in STUDENT_COURSE_IDENTITY_ALIASES:
+            identity_label = source_course_name
+            if not student_text:
+                student_text = identity_label
+        course_identity_rule = STUDENT_COURSE_IDENTITY_ALIASES.get(identity_label)
+        course_name = source_course_name
+        if course_identity_rule and (not course_name or course_name in {identity_label, "未命名課程"}):
+            course_name = course_identity_rule["course_name"]
+        if not course_name:
+            course_name = "未命名課程"
 
         start_time = row.get("開始時間（出勤用）", "") or row.get("開始時間", "") or row.get("開始", "") or ""
         end_time = row.get("下課時間（出勤用）", "") or row.get("下課時間", "") or row.get("結束時間", "") or row.get("結束", "") or ""
@@ -3105,7 +3210,7 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
         start_time = _normalize_excel_time(start_time)
         end_time = _normalize_excel_time(end_time)
 
-        student_names = [_canonical_student_name(x) for x in split_student_names(student_text)]
+        student_names = _student_names_for_course(student_text, course_name)
         if not actual_id or not course_date or not student_names or not start_time:
             if course_date:
                 invalid_dates.add(course_date)
@@ -3171,7 +3276,7 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
                 "weekday": _weekday_index(row.get("星期"), course_date),
                 "start_time": start_time,
                 "end_time": end_time,
-                "course_name": row.get("課程", "") or "未命名課程",
+                "course_name": course_name,
                 "teacher_name": row.get("老師", ""),
                 "source_note": "；".join(
                     [
@@ -3471,18 +3576,20 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
         seen_names = set()
         for raw in actual_course_rows:
             name_text = str(raw.get("學生", "") or raw.get("學生姓名", "") or raw.get("姓名", "")).strip()
-            for student_name in re.split(r"[、，,；;／/\\n]+", name_text):
-                student_name = student_name.strip()
+            course_text = str(raw.get("課程", "") or "").strip()
+            student_names = _student_names_for_course(name_text, course_text)
+            raw_student_code = str(raw.get("學生編號", "") or raw.get("學生ID", "") or "").strip()
+            for student_name in student_names:
+                student_name = _canonical_student_name(student_name)
                 if not student_name or student_name in seen_names:
                     continue
                 seen_names.add(student_name)
-                # 「實際課程」沒有學生編號時，建立穩定的系統學生編號。
-                # 這樣 _upsert_students_from_excel 不會因為缺少「學生編號」而略過學生，
-                # 同時同一姓名每次同步都會得到相同編號，不會重複建立學生。
+                # 多人／組合名稱不能共用同一個學生編號；每位學生都使用自己的穩定編號。
+                use_source_code = raw_student_code if len(student_names) == 1 else ""
                 stable_code = "ACTUAL-" + hashlib.sha1(student_name.encode("utf-8")).hexdigest()[:12].upper()
                 derived_rows.append({
-                    "學生姓名": _canonical_student_name(student_name),
-                    "學生編號": str(raw.get("學生編號", "") or raw.get("學生ID", "")).strip() or stable_code,
+                    "學生姓名": student_name,
+                    "學生編號": use_source_code or stable_code,
                 })
         student_source = derived_rows
         student_source_name = "實際課程→學生"
@@ -3513,6 +3620,23 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 f"實際課程讀取 {len(actual_course_rows)} 筆、跳過 {actual_skipped} 筆。"
                 f"原因：{detail}"
             )
+    # 若舊同步曾把組合姓名當成單一學生，且新個別學生已建立、舊紀錄已無啟用課程，
+    # 將舊組合名設為停用；歷史簽到紀錄保留，不會刪除。
+    for composite_name, intended_names in STUDENT_GROUP_NAME_ALIASES.items():
+        cur.execute("SELECT id FROM students WHERE name=%s AND active=TRUE ORDER BY id", (composite_name,))
+        for composite_student in cur.fetchall():
+            all_targets_exist = True
+            for intended_name in intended_names:
+                cur.execute("SELECT 1 FROM students WHERE name=%s AND active=TRUE LIMIT 1", (_canonical_student_name(intended_name),))
+                if not cur.fetchone():
+                    all_targets_exist = False
+                    break
+            if not all_targets_exist:
+                continue
+            cur.execute("SELECT 1 FROM courses WHERE student_id=%s AND active=TRUE LIMIT 1", (composite_student["id"],))
+            if not cur.fetchone():
+                cur.execute("UPDATE students SET active=FALSE WHERE id=%s", (composite_student["id"],))
+
     if attendance_settings_rows:
         sync_runtime_settings(cur, attendance_settings_rows)
     if attendance_template_rows:
