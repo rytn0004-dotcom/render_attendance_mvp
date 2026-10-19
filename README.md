@@ -1,9 +1,13 @@
-# Render 出勤系統 V0.6.1｜主總表自動同步修正版
+# Render 出勤系統 V0.7.4｜人物識別規則與主總表自動同步修正版
 
 本版本在 V0.5.x 基礎上加入「主總表自動同步」。正式運作時不必每次手動把總表上傳到 Render；Render 會從 Google Drive 讀取指定的私有 XLSX，依排程檢查檔案是否更新，更新才同步到 PostgreSQL。
 
 ## 新增功能
 - Google Drive 私有 XLSX／Google 試算表自動同步，預設每 10 分鐘檢查。
+- 學生姓名標準化：陳翊森→翊森、依柔→葉依柔。
+- 生物團班對應翊森與葉依柔；如來源省略學生姓名，依此規則產生兩人的獨立簽到課程。
+- 「雙翁」拆分為褕安與褕嫺，兩人各自建立課程／簽到紀錄，家庭 LINE 綁定別名可對應兩位學生。
+- 「昀瑄國文體驗課」解析為學生昀瑄、課程「國文體驗課」。
 - 啟動時可先同步一次（`MASTER_SYNC_ON_STARTUP=true`）。
 - 使用 Google Drive `fileId` + Service Account；檔案不需要公開。
 - V0.6.1 修正 Service Account 憑證解析：JSON／Base64 可互相 fallback，也兼容誤貼格式與 `google_sheets` 設定別名。
