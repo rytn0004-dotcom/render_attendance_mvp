@@ -3189,13 +3189,14 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
         note_text = row.get("備註", "") or ""
         source_course_name = _normalized_identity_text(row.get("課程", ""))
         identity_label = _normalized_identity_text(student_text)
-        if identity_label not in STUDENT_COURSE_IDENTITY_ALIASES and source_course_name in STUDENT_COURSE_IDENTITY_ALIASES:
+        if source_course_name in STUDENT_COURSE_IDENTITY_ALIASES:
+            # 課程欄本身用了「學生＋課程」合併標籤時，以該明確規則還原學生與課程。
             identity_label = source_course_name
-            if not student_text:
-                student_text = identity_label
+            student_text = identity_label
         course_identity_rule = STUDENT_COURSE_IDENTITY_ALIASES.get(identity_label)
         course_name = source_course_name
-        if course_identity_rule and (not course_name or course_name in {identity_label, "未命名課程"}):
+        if course_identity_rule:
+            # 合併標籤明確包含體驗課名稱，應優先於泛稱「國文」。
             course_name = course_identity_rule["course_name"]
         if not course_name:
             course_name = "未命名課程"
