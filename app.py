@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.5"
+APP_VERSION = "0.7.6"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -2711,6 +2711,7 @@ STUDENT_NAME_ALIASES = {
 }
 
 STUDENT_GROUP_NAME_ALIASES = {
+    "生物團班": ("翊森", "葉依柔"),
     "雙翁": ("褕安", "褕嫺"),
     "褕安褕嫺": ("褕安", "褕嫺"),
     "褕安 褕嫺": ("褕安", "褕嫺"),
@@ -3307,6 +3308,33 @@ def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[
                 ),
             })
             dates.add(course_date)
+
+    # 同一學生、同一天、同老師、同課程、同時段若由來源重複列出，只保留一筆。
+    # Course ID 不同不代表一定是不同課程；這裡用課程身分去重，避免團班名冊重複點名。
+    unique_rows: list[dict[str, Any]] = []
+    seen_course_identity: set[tuple[Any, ...]] = set()
+    duplicate_rows = 0
+    for item in parsed_rows:
+        identity = (
+            item["course_date"],
+            item["student_id"],
+            _normalized_identity_text(item["course_name"]),
+            _normalized_identity_text(item.get("teacher_name", "")),
+            _normalize_excel_time(item["start_time"]),
+            _normalize_excel_time(item.get("end_time", "")),
+        )
+        if identity in seen_course_identity:
+            duplicate_rows += 1
+            continue
+        seen_course_identity.add(identity)
+        unique_rows.append(item)
+    if duplicate_rows:
+        skipped += duplicate_rows
+        logger.warning(
+            "Master sync: suppressed %s duplicate course rows by student/date/course/teacher/time identity",
+            duplicate_rows,
+        )
+    parsed_rows = unique_rows
 
     # 以「實際課程」為該日期唯一來源：該日期原本同步進來的課程先停用，再寫入新快照。
     for d in dates - invalid_dates:
