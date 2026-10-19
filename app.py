@@ -2887,6 +2887,13 @@ def _upsert_students_from_excel(cur, rows: list[dict[str, Any]]) -> set[int]:
             qr_token = source_qr_token if not multi_student_source else ""
             cur.execute("SELECT id FROM students WHERE student_code=%s", (code,))
             student = cur.fetchone()
+            if not student:
+                # 舊資料可能使用自訂 student_code；若標準姓名只有一筆，沿用既有學生與 QR，
+                # 避免姓名別名合併後又建立第二筆同名學生。
+                cur.execute("SELECT id FROM students WHERE name=%s AND active=TRUE ORDER BY id", (name,))
+                name_matches = cur.fetchall()
+                if len(name_matches) == 1:
+                    student = name_matches[0]
             if student:
                 sid = student["id"]
                 if qr_token:
