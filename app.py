@@ -2919,13 +2919,19 @@ def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set
         if not row["line_user_id"] or (not row["student_code"] and not row["student_name"]):
             continue
 
-        # 有明確學生編號時依編號綁定單一學生；否則套用姓名／多人別名規則。
-        if row["student_code"]:
+        # 組合別名（例如「雙翁」）優先依姓名展開，避免單一舊編號把兩位學生合併。
+        expanded_names = _expand_student_names_from_text(row["student_name"])
+        if len(expanded_names) > 1:
+            target_students = []
+            for student_name in expanded_names:
+                cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
+                target_students.extend(cur.fetchall())
+        elif row["student_code"]:
             cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE", (row["student_code"],))
             target_students = cur.fetchall()
         else:
             target_students = []
-            for student_name in _expand_student_names_from_text(row["student_name"]):
+            for student_name in expanded_names:
                 cur.execute("SELECT id,name FROM students WHERE name=%s AND active=TRUE ORDER BY id", (student_name,))
                 target_students.extend(cur.fetchall())
 
@@ -2948,7 +2954,7 @@ def _upsert_line_binding_rows(cur, rows: list[dict[str, Any]]) -> tuple[int, set
             else:
                 cur.execute(
                     "INSERT INTO student_line_bindings(student_id,line_user_id,display_name,relation,active,notify_enabled,bound_at,bound_by) VALUES (%s,%s,%s,%s,%s,%s,%s,'EXCEL')",
-                    (student_id, row["display_name"] or None, row["relation"], active, notify, now_local()),
+                    (student_id, row["line_user_id"], row["display_name"] or None, row["relation"], active, notify, now_local()),
                 )
             affected.add(student_id)
             imported += 1
