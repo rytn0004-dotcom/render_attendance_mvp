@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.7"
+APP_VERSION = "0.8.0"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -57,10 +57,10 @@ NOTIFICATION_RETRY_COOLDOWN_MINUTES = max(1, int(os.getenv("NOTIFICATION_RETRY_C
 
 # 主總表自動同步：正式環境建議使用 Google Drive 的私有檔案 + Service Account 讀取。
 MASTER_SYNC_ENABLED = os.getenv("MASTER_SYNC_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
-MASTER_SYNC_PROVIDER_RAW = os.getenv("MASTER_SYNC_PROVIDER", "google_drive").strip().lower()
-# "google_sheets" is a user-facing alias; the implementation reads through
-# Google Drive and supports both native Google Sheets and private XLSX files.
-MASTER_SYNC_PROVIDER = "google_drive" if MASTER_SYNC_PROVIDER_RAW == "google_sheets" else MASTER_SYNC_PROVIDER_RAW
+MASTER_SYNC_PROVIDER_RAW = os.getenv("MASTER_SYNC_PROVIDER", "google_sheets").strip().lower()
+MASTER_SYNC_PROVIDER = {"sheets": "google_sheets", "googlesheets": "google_sheets"}.get(MASTER_SYNC_PROVIDER_RAW, MASTER_SYNC_PROVIDER_RAW)
+if MASTER_SYNC_PROVIDER not in {"google_sheets", "google_drive"}:
+    MASTER_SYNC_PROVIDER = MASTER_SYNC_PROVIDER_RAW
 MASTER_SYNC_INTERVAL_MINUTES = max(5, int(os.getenv("MASTER_SYNC_INTERVAL_MINUTES", "10")))
 MASTER_SYNC_ON_STARTUP = os.getenv("MASTER_SYNC_ON_STARTUP", "true").strip().lower() in {"1", "true", "yes", "y", "是", "啟用"}
 MASTER_SYNC_MAX_MB = max(1, int(os.getenv("MASTER_SYNC_MAX_MB", "20")))
@@ -301,6 +301,13 @@ def ensure_core_compat_schema(cur) -> None:
             "course_date": "DATE",
             "source": "TEXT NOT NULL DEFAULT 'legacy'",
             "source_note": "TEXT",
+            "attendance_kind": "TEXT NOT NULL DEFAULT '課程'",
+            "late_action": "TEXT NOT NULL DEFAULT '通知管理員'",
+            "absent_action": "TEXT NOT NULL DEFAULT '通知管理員'",
+            "missing_checkout_action": "TEXT NOT NULL DEFAULT '通知管理員'",
+            "notify_checkin_parent": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "notify_checkout_parent": "BOOLEAN NOT NULL DEFAULT TRUE",
+            "end_time_defined": "BOOLEAN NOT NULL DEFAULT TRUE",
         },
         "attendance": {
             "late_notified_at": "TIMESTAMP",
@@ -328,6 +335,50 @@ def ensure_core_compat_schema(cur) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_open ON attendance(date, check_out_time)")
 
 
+def ensure_kbook_schema(cur) -> None:
+    """Non-destructive schema for standalone K-book attendance."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kbook_students (
+            id BIGSERIAL PRIMARY KEY,
+            kbook_id TEXT NOT NULL UNIQUE,
+            student_id BIGINT NOT NULL REFERENCES students(id),
+            status TEXT NOT NULL DEFAULT '啟用',
+            start_date DATE,
+            deactivate_date DATE,
+            late_grace_minutes INTEGER,
+            late_action TEXT NOT NULL DEFAULT '依當日安排',
+            absent_action TEXT NOT NULL DEFAULT '依當日安排',
+            missing_checkout_action TEXT NOT NULL DEFAULT '只顯示後台',
+            notify_checkin_default TEXT NOT NULL DEFAULT '依當日安排',
+            notify_checkout_default TEXT NOT NULL DEFAULT '依當日安排',
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS kbook_schedules (
+            id BIGSERIAL PRIMARY KEY,
+            schedule_code TEXT NOT NULL UNIQUE,
+            kbook_student_id BIGINT NOT NULL REFERENCES kbook_students(id),
+            schedule_type TEXT NOT NULL,
+            weekday INTEGER,
+            schedule_date DATE,
+            effective_from DATE,
+            effective_to DATE,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            late_grace_minutes INTEGER,
+            late_action TEXT NOT NULL DEFAULT '依當日安排',
+            absent_action TEXT NOT NULL DEFAULT '依當日安排',
+            missing_checkout_action TEXT NOT NULL DEFAULT '依當日安排',
+            notify_checkin_parent TEXT NOT NULL DEFAULT '依當日安排',
+            notify_checkout_parent TEXT NOT NULL DEFAULT '依當日安排',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            source_row INTEGER,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_kbook_students_status ON kbook_students(status, student_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_kbook_schedules_lookup ON kbook_schedules(kbook_student_id, active, weekday, schedule_date)")
+
+
 def db_schema_summary(cur) -> dict:
     wanted = {
         "notification_templates": ["id","notification_type","student_id","template_text","mode","remaining_uses","expires_at","active","note","created_by","created_at","updated_at"],
@@ -335,6 +386,8 @@ def db_schema_summary(cur) -> dict:
         "courses": ["id","student_id","course_name","start_time","end_time","actual_course_id","course_date","source","active"],
         "attendance": ["id","student_id","course_id","date","check_in_time","check_out_time","status","late_notified_at","absent_notified_at","missing_checkout_notified_at"],
         "student_line_bindings": ["id","student_id","line_user_id","active","notify_enabled"],
+        "kbook_students": ["id","kbook_id","student_id","status","start_date","deactivate_date","late_grace_minutes","late_action","absent_action","missing_checkout_action"],
+        "kbook_schedules": ["id","schedule_code","kbook_student_id","schedule_type","weekday","schedule_date","effective_from","effective_to","start_time","end_time","active"],
     }
     result = {}
     for table, columns in wanted.items():
@@ -628,6 +681,7 @@ def init_db() -> None:
             )
             ensure_notification_template_schema(cur)
             ensure_core_compat_schema(cur)
+            ensure_kbook_schema(cur)
             _merge_student_name_aliases(cur)
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_student_line_user ON student_line_bindings(line_user_id) WHERE active=TRUE")
@@ -636,6 +690,7 @@ def init_db() -> None:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_created ON line_message_logs(created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_line_messages_user ON line_message_logs(line_user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_settings_updated ON runtime_settings(updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_attendance_kind_date ON courses(attendance_kind,course_date,active)")
             cur.execute("INSERT INTO master_sync_state(id,provider,updated_at) VALUES (1,%s,%s) ON CONFLICT(id) DO NOTHING", (MASTER_SYNC_PROVIDER, now_local()))
             cur.execute("UPDATE courses SET late_grace_minutes=%s WHERE late_grace_minutes IS NULL", (DEFAULT_LATE_GRACE_MINUTES,))
             cur.execute("UPDATE courses SET checkout_grace_minutes=%s WHERE checkout_grace_minutes IS NULL", (DEFAULT_CHECKOUT_GRACE_MINUTES,))
