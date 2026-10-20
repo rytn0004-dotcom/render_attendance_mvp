@@ -325,6 +325,13 @@ def ensure_core_compat_schema(cur) -> None:
             "use_count": "INTEGER NOT NULL DEFAULT 0",
             "last_used_at": "TIMESTAMP",
         },
+        "master_sync_state": {
+            "last_kbook_students_synced": "INTEGER NOT NULL DEFAULT 0",
+            "last_kbook_schedules_synced": "INTEGER NOT NULL DEFAULT 0",
+            "last_kbook_courses_generated": "INTEGER NOT NULL DEFAULT 0",
+            "last_kbook_error_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_kbook_errors": "TEXT",
+        },
     }
     for table, columns in table_columns.items():
         for column, definition in columns.items():
@@ -655,6 +662,11 @@ def init_db() -> None:
                     last_actual_imported INTEGER NOT NULL DEFAULT 0,
                     last_actual_skipped INTEGER NOT NULL DEFAULT 0,
                     last_binding_imported INTEGER NOT NULL DEFAULT 0,
+                    last_kbook_students_synced INTEGER NOT NULL DEFAULT 0,
+                    last_kbook_schedules_synced INTEGER NOT NULL DEFAULT 0,
+                    last_kbook_courses_generated INTEGER NOT NULL DEFAULT 0,
+                    last_kbook_error_count INTEGER NOT NULL DEFAULT 0,
+                    last_kbook_errors TEXT,
                     last_error_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -3942,7 +3954,7 @@ def _google_response_error(resp, operation: str) -> RuntimeError:
             detail = f"HTTP {resp.status_code}：{str(err)[:500]}"
     except Exception:
         detail = f"HTTP {resp.status_code}：{resp.text[:500]}"
-    return RuntimeError(f"Google Drive {operation} 失敗：{detail}")
+    return RuntimeError(f"Google API {operation} 失敗：{detail}")
 
 def _master_sync_credentials():
     # Read the current environment at call time as well as the startup snapshot.
@@ -4502,7 +4514,7 @@ def admin_master_sync(_: str = Depends(admin_auth)):
     configured, config_detail = _master_sync_configured()
     status_label = {True:"正常", False:"未完成"}.get(bool(state.get("last_success")), "尚未同步") if state else "尚未同步"
     color = "success" if state.get("last_success") else "alert"
-    body = [f"<div class='top'><div><h1>主總表自動同步</h1><div class='muted'>V{APP_VERSION}｜主總表放在 Google Drive，Render 自動檢查更新；手動同步保留為備援。</div></div>{admin_nav()}</div>"]
+    body = [f"<div class='top'><div><h1>主總表自動同步</h1><div class='muted'>V{APP_VERSION}｜Render 直接讀取主 Google 試算表並自動檢查更新；手動同步保留為備援。</div></div>{admin_nav()}</div>"]
     body.append(f"<section><h2>同步狀態</h2><div class='alert {color}'><b>{escape(status_label)}</b>｜{escape(config_detail)}</div><table>"
                 f"<tr><th>同步來源</th><td>{escape(str(state.get('source_name') or '尚未同步'))}</td></tr>"
                 f"<tr><th>最後檢查</th><td>{escape(str(state.get('last_checked_at') or '—'))}</td></tr>"
