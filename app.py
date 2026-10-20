@@ -3547,7 +3547,16 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
 def _rebuild_kbook_courses(cur) -> int:
     today = now_local().date()
     horizon = today + timedelta(days=90)
-    cur.execute("UPDATE courses SET active=FALSE WHERE attendance_kind='K書' AND course_date >= %s",(today,))
+    cur.execute(
+        """UPDATE courses c SET active=FALSE
+           WHERE c.attendance_kind='K書' AND c.course_date >= %s
+             AND NOT EXISTS (
+                 SELECT 1 FROM attendance a
+                 WHERE a.course_id=c.id AND a.date=c.course_date
+                   AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL
+             )""",
+        (today,),
+    )
     cur.execute("""
         SELECT sc.*,ks.kbook_id,ks.status AS kbook_status,ks.start_date,ks.deactivate_date,
                ks.late_grace_minutes AS student_late_grace,ks.late_action AS student_late_action,
