@@ -3217,7 +3217,13 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
             "學生姓名/關聯", "LINE User ID", "LINE ID", "LINE_ID", "關係",
             "家長提醒", "啟用", "簽到識別碼", "下課時間（出勤用）", "開始時間（出勤用）",
             "通知類型", "預設訊息範本", "個別訊息範本", "套用方式", "剩餘次數", "有效至",
-            "設定項目", "目前值", "用途", "說明"
+            "設定項目", "目前值", "用途", "說明",
+            "K書設定ID", "系統學生編號（對應出勤學生）", "狀態", "開始使用日", "停用日期",
+            "遲到門檻（分鐘；空白沿用全域）", "遲到處理預設", "未到班處理預設", "未離班處理預設",
+            "到班通知家長預設", "離班通知家長預設", "安排ID", "安排類型",
+            "指定日期（單日安排用）", "生效日期（每週安排用）", "結束日期（可留空）",
+            "預計到班時間", "預計離班時間", "遲到處理", "未到班處理", "未離班處理",
+            "到班通知家長", "離班通知家長"
         }
         # 不再限制標題只能出現在前 10 列。總表有些工作表在正式欄位前會有較長的說明／標題區，
         # 若硬限制前 10 列，可能把資料列誤當成標題，最後造成例如「出勤學生」讀取 0 筆。
@@ -3227,6 +3233,8 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
             "出勤LINE綁定": {"學生編號", "學生姓名", "LINE User ID", "LINE ID", "LINE_ID", "關係", "家長提醒", "啟用"},
             "聯絡人": {"姓名", "身分", "LINE User ID", "LINE ID", "學生姓名/關聯（可多位）", "學生姓名/關聯"},
             "實際課程": {"Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源"},
+            "K書學生": {"K書設定ID", "學生姓名", "狀態"},
+            "K書出勤安排": {"安排ID", "K書設定ID", "安排類型", "預計到班時間"},
         }.get(target_name, set())
 
         best_score = -1
@@ -4210,6 +4218,14 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
         sync_default_templates_from_excel(cur, attendance_template_rows)
     if attendance_individual_template_rows:
         sync_individual_templates_from_excel(cur, attendance_individual_template_rows)
+
+    kbook_summary = {"students_synced": 0, "schedules_synced": 0, "courses_generated": 0, "errors": []}
+    present_sheets = set(sheets.get("_present_sheets", []))
+    if {"K書學生", "K書出勤安排"}.issubset(present_sheets):
+        kbook_summary = sync_kbook_from_sheets(cur, sheets.get("K書學生", []), sheets.get("K書出勤安排", []))
+    elif "K書學生" in present_sheets or "K書出勤安排" in present_sheets:
+        kbook_summary["errors"].append("K書模組需要同時存在「K書學生」與「K書出勤安排」；本次未更新 K 書資料。")
+
     if binding_rows:
         binding_imported, _ = _upsert_line_binding_rows(cur, binding_rows)
     if binding_imported == 0 and contact_rows:
@@ -4229,6 +4245,10 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
         "actual_imported": actual_imported,
         "actual_skipped": actual_skipped,
         "binding_imported": binding_imported,
+        "kbook_students_synced": kbook_summary["students_synced"],
+        "kbook_schedules_synced": kbook_summary["schedules_synced"],
+        "kbook_courses_generated": kbook_summary["courses_generated"],
+        "kbook_errors": kbook_summary["errors"],
         "errors": errors,
     }
 
