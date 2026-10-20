@@ -4356,6 +4356,124 @@ async def periodic_master_sync():
             await asyncio.to_thread(master_sync_once, "scheduled")
 
 
+
+@app.get("/admin/kbook", response_class=HTMLResponse)
+def admin_kbook(_: str = Depends(admin_auth)):
+    today = now_local().date()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ks.kbook_id,ks.status,ks.start_date,ks.deactivate_date,ks.late_grace_minutes,
+                       s.student_code,s.name,s.qr_token
+                FROM kbook_students ks JOIN students s ON s.id=ks.student_id
+                ORDER BY CASE WHEN ks.status='啟用' THEN 0 WHEN ks.status='暫停' THEN 1 ELSE 2 END,s.name
+            """)
+            people = cur.fetchall()
+            cur.execute("""
+                SELECT c.*,s.student_code,s.name,a.check_in_time,a.check_out_time,a.status AS attendance_status
+                FROM courses c JOIN students s ON s.id=c.student_id
+                LEFT JOIN attendance a ON a.course_id=c.id AND a.student_id=c.student_id AND a.date=%s
+                WHERE c.course_date=%s AND c.active=TRUE AND c.attendance_kind='K書'
+                ORDER BY c.start_time,s.name
+            """, (today,today))
+            roster = cur.fetchall()
+            cur.execute("""
+                SELECT sc.schedule_code,sc.schedule_type,sc.weekday,sc.schedule_date,sc.effective_from,sc.effective_to,
+                       sc.start_time,sc.end_time,sc.late_grace_minutes,sc.late_action,sc.absent_action,sc.missing_checkout_action,
+                       ks.kbook_id,ks.status,s.name
+                FROM kbook_schedules sc JOIN kbook_students ks ON ks.id=sc.kbook_student_id
+                JOIN students s ON s.id=ks.student_id
+                WHERE sc.active=TRUE AND ks.status='啟用'
+                ORDER BY COALESCE(sc.schedule_date,sc.effective_from),sc.weekday,sc.start_time,s.name
+                LIMIT 150
+            """)
+            schedules = cur.fetchall()
+            cur.execute("""
+                SELECT COUNT(*) AS c
+                FROM courses c JOIN attendance a ON a.course_id=c.id AND a.student_id=c.student_id
+                WHERE c.attendance_kind='K書' AND c.course_date=%s AND c.active=TRUE
+                  AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL
+            """, (today,))
+            still_here = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM kbook_students WHERE status='啟用'")
+            active_people = cur.fetchone()["c"]
+            cur.execute("""SELECT COUNT(*) AS c FROM kbook_schedules sc JOIN kbook_students ks ON ks.id=sc.kbook_student_id
+                           WHERE sc.active=TRUE AND ks.status='啟用'""")
+            active_schedules = cur.fetchone()["c"]
+
+    def h(value):
+        return escape(str(value if value is not None else ""))
+
+    people_rows = []
+    for person in people:
+        status_cls = "green" if person["status"] == "啟用" else ("orange" if person["status"] == "暫停" else "gray")
+        qr = "<a href='/qr/" + h(person["student_code"]) + ".png' target='_blank'>開啟固定 QR</a>"
+        people_rows.append(
+            f"<tr><td>{h(person['kbook_id'])}</td><td>{h(person['name'])}</td>"
+            f"<td><span class='{status_cls}'>{h(person['status'])}</span></td>"
+            f"<td>{h(person['start_date'] or '')}</td><td>{h(person['deactivate_date'] or '')}</td>"
+            f"<td>{h(person['late_grace_minutes'] if person['late_grace_minutes'] is not None else '沿用全域')}</td><td>{qr}</td></tr>"
+        )
+    if not people_rows:
+        people_rows.append("<tr><td colspan='7'>尚未同步 K 書學生。請先在主 Google 試算表建立 K書學生與 K書出勤安排兩張工作表。</td></tr>")
+
+    roster_rows = []
+    for row in roster:
+        if row["check_out_time"]:
+            status = "已離班 " + row["check_out_time"].strftime("%H:%M")
+        elif row["check_in_time"]:
+            status = "尚未離班（到班 " + row["check_in_time"].strftime("%H:%M") + "）"
+        elif row["attendance_status"] == "absent":
+            status = "尚未到班（已過門檻）"
+        else:
+            status = "尚未到班"
+        end_value = row["end_time"] if row.get("end_time_defined", True) else "未設定"
+        roster_rows.append(
+            f"<tr><td>{h(row['name'])}</td><td>{h(row['start_time'])}</td><td>{h(end_value)}</td>"
+            f"<td>{h(status)}</td><td>{h(row.get('late_action') or '')}</td>"
+            f"<td>{h(row.get('missing_checkout_action') or '')}</td></tr>"
+        )
+    if not roster_rows:
+        roster_rows.append("<tr><td colspan='6'>今天沒有啟用的 K 書出勤安排。</td></tr>")
+
+    weekday_names = ["一","二","三","四","五","六","日"]
+    schedule_rows = []
+    for row in schedules:
+        if row["schedule_type"] == "單日":
+            when_text = str(row["schedule_date"] or "")
+        else:
+            weekday = row["weekday"]
+            when_text = "每週" + (weekday_names[weekday] if weekday is not None and 0 <= weekday <= 6 else "?")
+        period = str(row["effective_from"] or "") + "～" + str(row["effective_to"] or "未設定")
+        hours = str(row["start_time"]) + "～" + str(row["end_time"] or "未設定")
+        grace_text = str(row["late_grace_minutes"]) if row["late_grace_minutes"] is not None else "沿用學生／全域"
+        policies = str(row["late_action"]) + " / " + str(row["absent_action"]) + " / " + str(row["missing_checkout_action"])
+        schedule_rows.append(
+            f"<tr><td>{h(row['schedule_code'])}</td><td>{h(row['name'])}</td><td>{h(when_text)}</td>"
+            f"<td>{h(period)}</td><td>{h(hours)}</td><td>{h(grace_text)}</td><td>{h(policies)}</td></tr>"
+        )
+    if not schedule_rows:
+        schedule_rows.append("<tr><td colspan='7'>目前沒有啟用排班。未安排日期不會建立未到班提醒。</td></tr>")
+
+    body = (
+        f"<div class='top'><div><h1>K 書出勤</h1><div class='muted'>V{APP_VERSION}｜資料來源：K書學生、K書出勤安排；原本「拉K」記錄頁不參與簽到。</div></div>{admin_nav()}</div>"
+        f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_people}</div></div>"
+        f"<div class='card'><div class='muted'>啟用排班</div><div class='num'>{active_schedules}</div></div>"
+        f"<div class='card'><div class='muted'>今日尚未離班</div><div class='num'>{still_here}</div></div></div>"
+        "<section><h2>今日 K 書出勤</h2><p class='muted'>未設定離班時間或選擇「只顯示後台」的安排，不會推送未離班提醒，但仍會列出到班後尚未離班的人。</p>"
+        "<table><thead><tr><th>學生</th><th>預計到班</th><th>預計離班</th><th>目前狀態</th><th>遲到處理</th><th>未離班處理</th></tr></thead><tbody>"
+        + "".join(roster_rows) +
+        "</tbody></table></section><section><h2>K 書學生</h2><p class='muted'>請在主 Google 試算表新增、暫停或停用學生。停用只停止 K 書排班，不刪除一般學生 QR 或歷史紀錄。新增學生時若找不到唯一既有姓名，程式才會建立新的系統學生與固定 QR；有同名歧義時會要求填系統學生編號。</p>"
+        "<table><thead><tr><th>K 書設定 ID</th><th>學生</th><th>狀態</th><th>開始日期</th><th>停用日期</th><th>遲到門檻</th><th>QR</th></tr></thead><tbody>"
+        + "".join(people_rows) +
+        "</tbody></table></section><section><h2>啟用中的 K 書排班（最多顯示 150 筆）</h2>"
+        "<table><thead><tr><th>安排 ID</th><th>學生</th><th>類型</th><th>生效區間</th><th>到班～離班</th><th>遲到門檻</th><th>處理規則</th></tr></thead><tbody>"
+        + "".join(schedule_rows) +
+        "</tbody></table></section>"
+    )
+    return page("K 書出勤", body)
+
+
 @app.get("/admin/master-sync", response_class=HTMLResponse)
 def admin_master_sync(_: str = Depends(admin_auth)):
     with db_conn() as conn:
