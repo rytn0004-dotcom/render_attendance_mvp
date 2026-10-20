@@ -3465,8 +3465,8 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
                  _kbook_text(raw,"遲到處理預設") or "依當日安排",
                  _kbook_text(raw,"未到班處理預設") or "依當日安排",
                  _kbook_text(raw,"未離班處理預設") or "只顯示後台",
-                 _kbook_text(raw,"到班通知家長預設") or "依當日安排",
-                 _kbook_text(raw,"離班通知家長預設") or "依當日安排",now_local()),
+                 _kbook_text(raw,"到班通知家長預設") or "否",
+                 _kbook_text(raw,"離班通知家長預設") or "否",now_local()),
             )
             cur.execute("RELEASE SAVEPOINT kbook_student_row")
             student_seen.add(kid); student_map[kid] = student_id; valid_students += 1
