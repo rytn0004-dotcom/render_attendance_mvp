@@ -4265,6 +4265,8 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
 
     if attendance_settings_rows:
         sync_runtime_settings(cur, attendance_settings_rows)
+    # Refresh in-memory thresholds before generating K-book courses, since they can inherit global settings.
+    load_runtime_settings(cur)
     if attendance_template_rows:
         sync_default_templates_from_excel(cur, attendance_template_rows)
     if attendance_individual_template_rows:
