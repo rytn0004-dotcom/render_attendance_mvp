@@ -649,7 +649,7 @@ def init_db() -> None:
                 );
                 CREATE TABLE IF NOT EXISTS master_sync_state (
                     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-                    provider TEXT NOT NULL DEFAULT 'google_drive',
+                    provider TEXT NOT NULL DEFAULT 'google_sheets',
                     source_key TEXT,
                     source_name TEXT,
                     remote_modified_at TEXT,
