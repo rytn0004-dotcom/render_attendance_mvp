@@ -871,6 +871,12 @@ def send_student_template_line(cur, attendance_id: int | None, student: dict[str
                                notification_type: str, check_in_time: datetime | None = None,
                                check_out_time: datetime | None = None, when: datetime | None = None,
                                late_minutes: int = 0, legacy_line_user_id: str | None = None) -> bool:
+    if course and str(course.get("attendance_kind") or "") == "K書":
+        allowed = bool(course.get("notify_checkin_parent", True)) if notification_type == "check_in" else bool(course.get("notify_checkout_parent", True)) if notification_type == "check_out" else True
+        if not allowed:
+            disabled_msg = render_notification_template(DEFAULT_NOTIFICATION_TEMPLATES.get(notification_type, ""), student, course, None, check_in_time, check_out_time, when, late_minutes)
+            log_notification(cur, attendance_id, notification_type, None, disabled_msg, LINE_MODE, "disabled", "此 K 書排班已關閉家長通知")
+            return False
     if not setting_enabled("LINE 家長提醒", True):
         disabled_msg = render_notification_template(
             DEFAULT_NOTIFICATION_TEMPLATES[notification_type], student, course, None,
@@ -1003,7 +1009,7 @@ def get_courses_today(cur, student_id: int, work_date: date):
     cur.execute(
         """SELECT * FROM courses
            WHERE student_id=%s AND course_date=%s AND active=TRUE
-             AND actual_course_id IS NOT NULL AND COALESCE(source, '實際課程')='實際課程'
+             AND actual_course_id IS NOT NULL AND COALESCE(source, '實際課程') IN ('實際課程','K書')
            ORDER BY start_time, id""",
         (student_id, work_date),
     )
@@ -1396,6 +1402,10 @@ def scan_student(token: str) -> dict[str, Any]:
                 return {"kind": "error", "student": student["name"], "message": "此學生的簽到功能目前已由管理員關閉。"}
             courses = get_courses_today(cur, student["id"], work_date)
             if not courses:
+                cur.execute("SELECT 1 FROM kbook_students WHERE student_id=%s AND status='啟用' LIMIT 1", (student["id"],))
+                if cur.fetchone():
+                    conn.commit()
+                    return {"kind": "error", "student": student["name"], "message": "今天沒有安排 K 書出席，不會建立未到班紀錄。"}
                 msg = f"⚠️ 無課程簽到\n學生：{student['name']}\n時間：{when:%H:%M}"
                 send_line(cur, None, LINE_ADMIN_USER_ID, msg, "invalid_schedule")
                 conn.commit()
@@ -1466,9 +1476,11 @@ def scan_student(token: str) -> dict[str, Any]:
             final_a = cur.fetchone()
             send_student_template_line(cur, attendance_id, student, course, "check_in", check_in_time=final_a["check_in_time"], when=final_a["check_in_time"], legacy_line_user_id=student["line_user_id"])
             if final_a["late_minutes"] > course["late_grace_minutes"] and not final_a["late_notified_at"]:
-                sent = send_admin_template_line(cur, attendance_id, student, course, "late", check_in_time=final_a["check_in_time"], when=when, late_minutes=final_a["late_minutes"])
-                if sent:
-                    cur.execute("UPDATE attendance SET late_notified_at=%s WHERE id=%s", (when, attendance_id))
+                late_action = str(course.get("late_action") or "通知管理員") if course.get("attendance_kind") == "K書" else "通知管理員"
+                if late_action not in {"只顯示後台", "不提醒", "停用"}:
+                    sent = send_admin_template_line(cur, attendance_id, student, course, "late", check_in_time=final_a["check_in_time"], when=when, late_minutes=final_a["late_minutes"])
+                    if sent:
+                        cur.execute("UPDATE attendance SET late_notified_at=%s WHERE id=%s", (when, attendance_id))
             # 補到班後，若先前已被判定未到，保留紀錄但不再重複發未到。
             cur.execute("UPDATE attendance SET absent_notified_at=absent_notified_at WHERE id=%s", (attendance_id,))
             conn.commit()
@@ -1486,7 +1498,7 @@ def check_scheduled_absences() -> int:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.absent.checker')) AS locked")
             if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute("SELECT c.*, s.name, s.active AS student_active FROM courses c JOIN students s ON s.id=c.student_id WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' AND s.active=TRUE ORDER BY c.start_time,c.id", (work_date,))
+            cur.execute("SELECT c.*, s.name, s.active AS student_active FROM courses c JOIN students s ON s.id=c.student_id WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書') AND s.active=TRUE ORDER BY c.start_time,c.id", (work_date,))
             threshold = setting_int("未到班通知（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
             for course in cur.fetchall():
                 eff = effective_schedule(cur, course, work_date)
@@ -1512,6 +1524,8 @@ def check_scheduled_absences() -> int:
                 if a.get("last_absent_attempt_at") and now-a["last_absent_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
                 cur.execute("UPDATE attendance SET last_absent_attempt_at=%s,updated_at=%s WHERE id=%s",(now,now,aid))
+                if course.get("attendance_kind") == "K書" and str(course.get("absent_action") or "通知管理員") in {"只顯示後台", "不提醒", "停用"}:
+                    continue
                 msg=absent_admin_message(course["name"],eff.get("course_name") or "未命名課程",eff["effective_start"],now)
                 pending.append((aid,"absent",msg))
             if pending:
@@ -1546,7 +1560,7 @@ def check_missing_checkout() -> int:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.missing_checkout.checker')) AS locked")
             if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute("SELECT a.*,s.name,c.course_name,c.start_time,c.end_time,c.checkout_grace_minutes FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL AND a.missing_checkout_notified_at IS NULL AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' FOR UPDATE OF a SKIP LOCKED",(work_date,))
+            cur.execute("SELECT a.*,s.name,c.course_name,c.start_time,c.end_time,c.checkout_grace_minutes FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL AND a.missing_checkout_notified_at IS NULL AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書') FOR UPDATE OF a SKIP LOCKED",(work_date,))
             for row in cur.fetchall():
                 if row.get("last_missing_checkout_attempt_at") and now-row["last_missing_checkout_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
@@ -1554,6 +1568,11 @@ def check_missing_checkout() -> int:
                 course=cur.fetchone()
                 if not course: continue
                 eff=effective_schedule(cur,course,work_date)
+                if course.get("attendance_kind") == "K書" and (
+                    not bool(course.get("end_time_defined", True))
+                    or str(course.get("missing_checkout_action") or "只顯示後台") in {"只顯示後台", "不提醒", "停用"}
+                ):
+                    continue
                 if not eff or not eff.get("effective_end") or now < parse_hhmm(eff["effective_end"],work_date)+timedelta(minutes=eff["checkout_grace_minutes"]):
                     continue
                 cur.execute("SELECT * FROM attendance WHERE id=%s FOR UPDATE",(row["id"],))
@@ -1632,7 +1651,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/tomorrow'>明日簽到表</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/tomorrow'>明日簽到表</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/kbook'>K書出勤</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1696,7 +1715,7 @@ def dashboard(_: str = Depends(admin_auth)):
                 """
                 SELECT c.*, s.name, s.student_code, s.line_user_id
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書')
                 ORDER BY c.start_time, s.name
                 """,
                 (today,),
@@ -1819,7 +1838,7 @@ def admin_tomorrow_roster(_: str = Depends(admin_auth)):
                 FROM courses c JOIN students s ON s.id=c.student_id
                 WHERE c.course_date=%s AND c.active=TRUE
                   AND c.actual_course_id IS NOT NULL
-                  AND COALESCE(c.source,'實際課程')='實際課程'
+                  AND COALESCE(c.source,'實際課程') IN ('實際課程','K書')
                 ORDER BY c.start_time, s.name, c.id
                 """,
                 (target_date,),
@@ -1959,7 +1978,7 @@ def admin_courses(_: str = Depends(admin_auth)):
             cur.execute(
                 """SELECT c.*, s.name, s.student_code
                    FROM courses c JOIN students s ON s.id=c.student_id
-                   WHERE c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' AND c.course_date >= %s
+                   WHERE c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書') AND c.course_date >= %s
                    ORDER BY c.course_date,c.start_time,s.name LIMIT 300""",
                 (today,),
             )
