@@ -3425,6 +3425,7 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
             result["errors"].append(f"K書學生「{name}」狀態必須為啟用、暫停或停用。")
             continue
         try:
+            cur.execute("SAVEPOINT kbook_student_row")
             student_id = _kbook_resolve_student(cur, kid, name, _kbook_text(raw, "系統學生編號（對應出勤學生）", "系統學生編號", "學生編號"))
             start_date = _parse_excel_date_value(_kbook_text(raw, "開始使用日"))
             stop_date = _parse_excel_date_value(_kbook_text(raw, "停用日期"))
@@ -3455,9 +3456,12 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
                  _kbook_text(raw,"到班通知家長預設") or "依當日安排",
                  _kbook_text(raw,"離班通知家長預設") or "依當日安排",now_local()),
             )
+            cur.execute("RELEASE SAVEPOINT kbook_student_row")
             student_seen.add(kid); student_map[kid] = student_id; valid_students += 1
             result["students_synced"] += 1
         except Exception as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT kbook_student_row")
+            cur.execute("RELEASE SAVEPOINT kbook_student_row")
             result["errors"].append(f"K書學生「{name}」：{str(exc)[:250]}")
 
     if valid_students:
@@ -3481,6 +3485,7 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
             continue
         schedule_seen.add(code)
         try:
+            cur.execute("SAVEPOINT kbook_schedule_row")
             typ_text = _kbook_text(raw,"安排類型","類型")
             typ = "單日" if typ_text in {"單日","單次","一次性","single"} else "每週" if typ_text in {"每週","每周","weekly"} else ""
             if not typ:
@@ -3531,8 +3536,11 @@ def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_row
                  _kbook_text(raw,"到班通知家長") or "依當日安排",
                  _kbook_text(raw,"離班通知家長") or "依當日安排",line_no,now_local()),
             )
+            cur.execute("RELEASE SAVEPOINT kbook_schedule_row")
             result["schedules_synced"] += 1
         except Exception as exc:
+            cur.execute("ROLLBACK TO SAVEPOINT kbook_schedule_row")
+            cur.execute("RELEASE SAVEPOINT kbook_schedule_row")
             result["errors"].append(f"K書安排「{code}」：{str(exc)[:250]}")
 
     if schedule_seen:
