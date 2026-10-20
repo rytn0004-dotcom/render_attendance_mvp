@@ -10,7 +10,7 @@ services:
       - key: MASTER_SYNC_ENABLED
         value: "true"
       - key: MASTER_SYNC_PROVIDER
-        value: google_drive
+        value: google_sheets
       - key: MASTER_SYNC_INTERVAL_MINUTES
         value: "10"
       - key: MASTER_SYNC_ON_STARTUP
