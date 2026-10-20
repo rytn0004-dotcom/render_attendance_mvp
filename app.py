@@ -3295,6 +3295,289 @@ def _weekday_index(value: Any, fallback: date) -> int:
     return fallback.weekday()
 
 
+
+def _kbook_weekday_index(value: Any) -> int | None:
+    text = str(value or "").strip()
+    return {"一":0,"星期一":0,"週一":0,"1":0,"二":1,"星期二":1,"週二":1,"2":1,
+            "三":2,"星期三":2,"週三":2,"3":2,"四":3,"星期四":3,"週四":3,"4":3,
+            "五":4,"星期五":4,"週五":4,"5":4,"六":5,"星期六":5,"週六":5,"6":5,
+            "日":6,"天":6,"星期日":6,"星期天":6,"週日":6,"7":6,"0":6}.get(text)
+
+
+def _kbook_text(raw: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _kbook_flag(value: Any, fallback: bool = False) -> bool:
+    text = str(value or "").strip()
+    if not text or text == "依當日安排":
+        return fallback
+    if text in {"是","啟用","1","true","TRUE","yes","Y","y"}:
+        return True
+    if text in {"否","停用","0","false","FALSE","no","N","n"}:
+        return False
+    return fallback
+
+
+def _kbook_action(schedule_value: Any, student_value: Any, fallback: str) -> str:
+    for value in (schedule_value, student_value):
+        text = str(value or "").strip()
+        if text and text != "依當日安排":
+            return text
+    return fallback
+
+
+def _kbook_time(value: Any) -> str:
+    text = _normalize_excel_time(value)
+    if text and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
+        raise ValueError(f"時間格式錯誤：{text}")
+    return text
+
+
+def _kbook_resolve_student(cur, kbook_id: str, name: str, student_code: str) -> int:
+    if student_code:
+        cur.execute("SELECT id,name,active FROM students WHERE student_code=%s", (student_code,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"系統學生編號「{student_code}」不存在，請先確認出勤學生資料。")
+        if not row["active"]:
+            raise ValueError(f"系統學生編號「{student_code}」目前在出勤學生中停用，請先核對狀態。")
+        return row["id"]
+    canonical = _canonical_student_name(name)
+    cur.execute("SELECT id FROM students WHERE name=%s AND active=TRUE ORDER BY id", (canonical,))
+    matches = cur.fetchall()
+    if len(matches) == 1:
+        return matches[0]["id"]
+    if len(matches) > 1:
+        raise ValueError(f"學生「{canonical}」有多筆同名資料，請填「系統學生編號」以免 QR 混用。")
+    cur.execute("SELECT id FROM students WHERE name=%s AND active=FALSE", (canonical,))
+    if cur.fetchone():
+        raise ValueError(f"學生「{canonical}」已有停用資料，請在「出勤學生」恢復或核對後填入系統學生編號。")
+    code = "KBOOK-" + hashlib.sha1(kbook_id.encode("utf-8")).hexdigest()[:12].upper()
+    cur.execute("SELECT id,name FROM students WHERE student_code=%s", (code,))
+    collision = cur.fetchone()
+    if collision and collision["name"] != canonical:
+        raise ValueError("自動學生編號發生衝突，請填入正式系統學生編號。")
+    if collision:
+        return collision["id"]
+    cur.execute(
+        """INSERT INTO students(student_code,name,qr_token,active,checkin_enabled,notify_checkin_enabled,
+           notify_checkout_enabled,notify_exception_enabled)
+           VALUES (%s,%s,%s,TRUE,TRUE,TRUE,TRUE,TRUE) RETURNING id""",
+        (code, canonical, secrets.token_urlsafe(24)),
+    )
+    return cur.fetchone()["id"]
+
+
+def sync_kbook_from_sheets(cur, student_rows: list[dict[str, Any]], schedule_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sync separate K-book settings; the user's 拉K note sheet is intentionally ignored."""
+    result = {"students_synced": 0, "schedules_synced": 0, "courses_generated": 0, "errors": []}
+    student_seen: set[str] = set()
+    student_map: dict[str, int] = {}
+    valid_students = 0
+    for line_no, raw in enumerate(student_rows, start=3):
+        kid = _kbook_text(raw, "K書設定ID", "K書學生ID", "kbook_id")
+        name = _kbook_text(raw, "學生姓名", "姓名")
+        if not kid and not name:
+            continue
+        if not kid or not name:
+            result["errors"].append(f"K書學生第 {line_no} 列缺少 K書設定ID 或學生姓名。")
+            continue
+        if kid in student_seen:
+            result["errors"].append(f"K書設定ID「{kid}」重複，後續列已略過。")
+            continue
+        status = _kbook_text(raw, "狀態") or "啟用"
+        if status not in {"啟用","暫停","停用"}:
+            result["errors"].append(f"K書學生「{name}」狀態必須為啟用、暫停或停用。")
+            continue
+        try:
+            student_id = _kbook_resolve_student(cur, kid, name, _kbook_text(raw, "系統學生編號（對應出勤學生）", "系統學生編號", "學生編號"))
+            start_date = _parse_excel_date_value(_kbook_text(raw, "開始使用日"))
+            stop_date = _parse_excel_date_value(_kbook_text(raw, "停用日期"))
+            if start_date and stop_date and stop_date < start_date:
+                raise ValueError("停用日期不可早於開始使用日。")
+            grace_text = _kbook_text(raw, "遲到門檻（分鐘；空白沿用全域）", "遲到門檻（分鐘）")
+            grace = int(grace_text) if grace_text else None
+            if grace is not None and not 0 <= grace <= 360:
+                raise ValueError("遲到門檻必須介於 0 到 360 分鐘。")
+            cur.execute("SELECT student_id FROM kbook_students WHERE kbook_id=%s", (kid,))
+            old = cur.fetchone()
+            if old and old["student_id"] != student_id:
+                raise ValueError(f"K書設定ID「{kid}」已連結另一位學生，本次不更換身分。")
+            cur.execute(
+                """INSERT INTO kbook_students(kbook_id,student_id,status,start_date,deactivate_date,late_grace_minutes,
+                   late_action,absent_action,missing_checkout_action,notify_checkin_default,notify_checkout_default,updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(kbook_id) DO UPDATE SET status=EXCLUDED.status,start_date=EXCLUDED.start_date,
+                   deactivate_date=EXCLUDED.deactivate_date,late_grace_minutes=EXCLUDED.late_grace_minutes,
+                   late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
+                   missing_checkout_action=EXCLUDED.missing_checkout_action,
+                   notify_checkin_default=EXCLUDED.notify_checkin_default,
+                   notify_checkout_default=EXCLUDED.notify_checkout_default,updated_at=EXCLUDED.updated_at""",
+                (kid,student_id,status,start_date,stop_date,grace,
+                 _kbook_text(raw,"遲到處理預設") or "依當日安排",
+                 _kbook_text(raw,"未到班處理預設") or "依當日安排",
+                 _kbook_text(raw,"未離班處理預設") or "只顯示後台",
+                 _kbook_text(raw,"到班通知家長預設") or "依當日安排",
+                 _kbook_text(raw,"離班通知家長預設") or "依當日安排",now_local()),
+            )
+            student_seen.add(kid); student_map[kid] = student_id; valid_students += 1
+            result["students_synced"] += 1
+        except Exception as exc:
+            result["errors"].append(f"K書學生「{name}」：{str(exc)[:250]}")
+
+    if valid_students:
+        cur.execute("SELECT kbook_id FROM kbook_students")
+        for row in cur.fetchall():
+            if row["kbook_id"] not in student_seen:
+                cur.execute("UPDATE kbook_students SET status='停用',updated_at=%s WHERE kbook_id=%s",(now_local(),row["kbook_id"]))
+                cur.execute("UPDATE kbook_schedules SET active=FALSE,updated_at=%s WHERE kbook_student_id=(SELECT id FROM kbook_students WHERE kbook_id=%s)",(now_local(),row["kbook_id"]))
+
+    schedule_seen: set[str] = set()
+    for line_no, raw in enumerate(schedule_rows, start=3):
+        code = _kbook_text(raw,"安排ID","排班ID","schedule_code")
+        kid = _kbook_text(raw,"K書設定ID","K書學生ID")
+        if not code and not kid:
+            continue
+        if not code:
+            result["errors"].append(f"K書出勤安排第 {line_no} 列缺少安排ID。")
+            continue
+        if code in schedule_seen:
+            result["errors"].append(f"安排ID「{code}」重複，後續列已略過。")
+            continue
+        schedule_seen.add(code)
+        try:
+            typ_text = _kbook_text(raw,"安排類型","類型")
+            typ = "單日" if typ_text in {"單日","單次","一次性","single"} else "每週" if typ_text in {"每週","每周","weekly"} else ""
+            if not typ:
+                raise ValueError("安排類型必須選單日或每週。")
+            start = _kbook_time(_kbook_text(raw,"預計到班時間","到班時間"))
+            end = _kbook_time(_kbook_text(raw,"預計離班時間","離班時間"))
+            if not start:
+                raise ValueError("缺少預計到班時間。")
+            work_date = _parse_excel_date_value(_kbook_text(raw,"指定日期（單日安排用）","指定日期")) if typ=="單日" else None
+            weekday = _kbook_weekday_index(_kbook_text(raw,"星期","出席星期")) if typ=="每週" else None
+            from_date = _parse_excel_date_value(_kbook_text(raw,"生效日期（每週安排用）","生效日期")) if typ=="每週" else work_date
+            to_date = _parse_excel_date_value(_kbook_text(raw,"結束日期（可留空）","結束日期"))
+            if typ=="單日" and work_date is None:
+                raise ValueError("單日安排必須填指定日期。")
+            if typ=="每週" and (weekday is None or from_date is None):
+                raise ValueError("每週安排必須填星期與生效日期。")
+            if to_date and from_date and to_date < from_date:
+                raise ValueError("結束日期不可早於生效日期。")
+            if end and end < start:
+                raise ValueError("預計離班時間不可早於到班時間。")
+            grace_text = _kbook_text(raw,"遲到門檻（分鐘）")
+            grace = int(grace_text) if grace_text else None
+            if grace is not None and not 0 <= grace <= 360:
+                raise ValueError("遲到門檻必須介於 0 到 360 分鐘。")
+            cur.execute("SELECT id,kbook_student_id FROM kbook_schedules WHERE schedule_code=%s",(code,))
+            old = cur.fetchone()
+            cur.execute("SELECT id FROM kbook_students WHERE kbook_id=%s",(kid,))
+            krow = cur.fetchone()
+            if not krow:
+                raise ValueError(f"K書設定ID「{kid}」不存在，請先建立 K書學生。")
+            if old and old["kbook_student_id"] != krow["id"]:
+                raise ValueError("此安排ID 已連結其他 K 書學生，請改用新的安排ID。")
+            cur.execute(
+                """INSERT INTO kbook_schedules(schedule_code,kbook_student_id,schedule_type,weekday,schedule_date,
+                   effective_from,effective_to,start_time,end_time,late_grace_minutes,late_action,absent_action,
+                   missing_checkout_action,notify_checkin_parent,notify_checkout_parent,active,source_row,updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s)
+                   ON CONFLICT(schedule_code) DO UPDATE SET schedule_type=EXCLUDED.schedule_type,weekday=EXCLUDED.weekday,
+                   schedule_date=EXCLUDED.schedule_date,effective_from=EXCLUDED.effective_from,effective_to=EXCLUDED.effective_to,
+                   start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,late_grace_minutes=EXCLUDED.late_grace_minutes,
+                   late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
+                   missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin_parent=EXCLUDED.notify_checkin_parent,
+                   notify_checkout_parent=EXCLUDED.notify_checkout_parent,active=TRUE,source_row=EXCLUDED.source_row,updated_at=EXCLUDED.updated_at""",
+                (code,krow["id"],typ,weekday,work_date,from_date,to_date,start,end,grace,
+                 _kbook_text(raw,"遲到處理") or "依當日安排",
+                 _kbook_text(raw,"未到班處理") or "依當日安排",
+                 _kbook_text(raw,"未離班處理") or "依當日安排",
+                 _kbook_text(raw,"到班通知家長") or "依當日安排",
+                 _kbook_text(raw,"離班通知家長") or "依當日安排",line_no,now_local()),
+            )
+            result["schedules_synced"] += 1
+        except Exception as exc:
+            result["errors"].append(f"K書安排「{code}」：{str(exc)[:250]}")
+
+    if schedule_seen:
+        cur.execute("SELECT id,schedule_code FROM kbook_schedules")
+        for row in cur.fetchall():
+            if row["schedule_code"] not in schedule_seen:
+                cur.execute("UPDATE kbook_schedules SET active=FALSE,updated_at=%s WHERE id=%s",(now_local(),row["id"]))
+    result["courses_generated"] = _rebuild_kbook_courses(cur)
+    return result
+
+
+def _rebuild_kbook_courses(cur) -> int:
+    today = now_local().date()
+    horizon = today + timedelta(days=90)
+    cur.execute("UPDATE courses SET active=FALSE WHERE attendance_kind='K書' AND course_date >= %s",(today,))
+    cur.execute("""
+        SELECT sc.*,ks.kbook_id,ks.status AS kbook_status,ks.start_date,ks.deactivate_date,
+               ks.late_grace_minutes AS student_late_grace,ks.late_action AS student_late_action,
+               ks.absent_action AS student_absent_action,ks.missing_checkout_action AS student_missing_checkout_action,
+               ks.notify_checkin_default,ks.notify_checkout_default,
+               s.id AS student_id,s.student_code,s.name,s.notify_checkin_enabled,s.notify_checkout_enabled,s.active AS core_active
+        FROM kbook_schedules sc JOIN kbook_students ks ON ks.id=sc.kbook_student_id
+        JOIN students s ON s.id=ks.student_id
+        WHERE sc.active=TRUE AND ks.status='啟用' AND s.active=TRUE
+    """)
+    schedules = cur.fetchall()
+    generated = 0
+    for sc in schedules:
+        d = today
+        while d <= horizon:
+            matches = (sc["schedule_type"]=="單日" and sc["schedule_date"]==d) or (
+                sc["schedule_type"]=="每週" and d >= (sc["effective_from"] or today)
+                and (sc["effective_to"] is None or d <= sc["effective_to"]) and d.weekday()==sc["weekday"]
+            )
+            if sc["start_date"] and d < sc["start_date"]:
+                matches = False
+            if sc["deactivate_date"] and d > sc["deactivate_date"]:
+                matches = False
+            if matches:
+                grace = sc["late_grace_minutes"] if sc["late_grace_minutes"] is not None else sc["student_late_grace"]
+                if grace is None:
+                    grace = setting_int("遲到門檻（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
+                late_action = _kbook_action(sc["late_action"],sc["student_late_action"],"通知管理員")
+                absent_action = _kbook_action(sc["absent_action"],sc["student_absent_action"],"通知管理員")
+                missing_action = _kbook_action(sc["missing_checkout_action"],sc["student_missing_checkout_action"],"只顯示後台")
+                parent_in_default = sc["notify_checkin_default"] if sc["notify_checkin_default"] != "依當日安排" else ("是" if sc["notify_checkin_enabled"] else "否")
+                parent_out_default = sc["notify_checkout_default"] if sc["notify_checkout_default"] != "依當日安排" else ("是" if sc["notify_checkout_enabled"] else "否")
+                parent_in = _kbook_flag(sc["notify_checkin_parent"],_kbook_flag(parent_in_default,bool(sc["notify_checkin_enabled"])))
+                parent_out = _kbook_flag(sc["notify_checkout_parent"],_kbook_flag(parent_out_default,bool(sc["notify_checkout_enabled"])))
+                end_defined = bool(sc["end_time"])
+                end_time = sc["end_time"] or sc["start_time"]
+                actual_id = "KBOOK-" + hashlib.sha1((sc["schedule_code"]+"|"+d.isoformat()).encode()).hexdigest()[:20].upper()
+                note = f"K書排班：{sc['schedule_code']}；K書設定：{sc['kbook_id']}"
+                cur.execute("SELECT id FROM courses WHERE actual_course_id=%s",(actual_id,))
+                old = cur.fetchone()
+                common = (sc["student_id"],"K書讀書",None,d.weekday(),sc["start_time"],end_time,int(grace),
+                          DEFAULT_CHECKOUT_GRACE_MINUTES,True,d,note)
+                policy = (late_action,absent_action,missing_action,parent_in,parent_out,end_defined)
+                if old:
+                    cur.execute("""UPDATE courses SET student_id=%s,course_name=%s,teacher_name=%s,weekday=%s,start_time=%s,end_time=%s,
+                        late_grace_minutes=%s,checkout_grace_minutes=%s,active=%s,course_date=%s,source_note=%s,source='K書',
+                        attendance_kind='K書',late_action=%s,absent_action=%s,missing_checkout_action=%s,
+                        notify_checkin_parent=%s,notify_checkout_parent=%s,end_time_defined=%s WHERE actual_course_id=%s""",
+                        common+policy+(actual_id,))
+                else:
+                    cur.execute("""INSERT INTO courses(student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,
+                        checkout_grace_minutes,active,course_date,source_note,source,attendance_kind,late_action,absent_action,
+                        missing_checkout_action,notify_checkin_parent,notify_checkout_parent,end_time_defined,actual_course_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'K書','K書',%s,%s,%s,%s,%s,%s,%s)""",
+                        common+policy+(actual_id,))
+                generated += 1
+            d += timedelta(days=1)
+    return generated
+
+
 def _upsert_actual_courses_from_excel(cur, rows: list[dict[str, Any]]) -> tuple[int, int, list[str]]:
     """Import the master-sheet 實際課程 snapshot.
 
