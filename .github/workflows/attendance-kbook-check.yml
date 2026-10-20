@@ -1,0 +1,47 @@
+name: Attendance K-book static checks
+
+on:
+  push:
+    branches:
+      - "feature/kbook-attendance-v080"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  syntax-and-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile application
+        run: python -m py_compile app.py
+      - name: Check required routes and sync contracts
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          routes = []
+          functions = []
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                  functions.append(node.name)
+                  for decorator in node.decorator_list:
+                      if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute):
+                          if isinstance(decorator.func.value, ast.Name) and decorator.func.value.id == "app":
+                              if decorator.args and isinstance(decorator.args[0], ast.Constant):
+                                  routes.append((decorator.func.attr, decorator.args[0].value))
+          duplicates = sorted({name for name in functions if functions.count(name) > 1})
+          assert not duplicates, f"Duplicate function definitions: {duplicates}"
+          assert ("get", "/admin/kbook") in routes, "Missing K-book admin page"
+          assert "sync_kbook_from_sheets" in functions, "Missing K-book sheet sync"
+          assert "_download_master_from_google_sheets" in functions, "Missing direct Google Sheets provider"
+          assert 'range("拉K")' not in source and '_xlsx_read_sheet(raw, "拉K")' not in source, "The private 拉K notes sheet must not be read"
+          print("Static checks passed.")
+          PY
