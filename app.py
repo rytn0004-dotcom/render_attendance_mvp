@@ -3633,9 +3633,10 @@ def _master_sync_credentials():
         try:
             info = _decode_service_account_json(value)
             logger.info("Google Service Account credentials parsed from %s", source)
+            scope = "https://www.googleapis.com/auth/spreadsheets.readonly" if MASTER_SYNC_PROVIDER == "google_sheets" else "https://www.googleapis.com/auth/drive.readonly"
             return service_account.Credentials.from_service_account_info(
                 info,
-                scopes=["https://www.googleapis.com/auth/drive.readonly"],
+                scopes=[scope],
             )
         except Exception as exc:
             errors.append(f"{source}: {str(exc)[:180]}")
@@ -3643,6 +3644,89 @@ def _master_sync_credentials():
     if not seen:
         raise RuntimeError("尚未設定 GOOGLE_SERVICE_ACCOUNT_JSON_BASE64（或 GOOGLE_SERVICE_ACCOUNT_JSON）。")
     raise RuntimeError("Google Service Account JSON 無法解析；已嘗試可用的 JSON／Base64 設定，但都不是有效的 Service Account 憑證。")
+
+
+def _google_grid_to_rows(sheet_name: str, matrix: list[list[Any]]) -> list[dict[str, Any]]:
+    if not matrix:
+        return []
+    known_headers = {
+        "Course ID","課程日期","星期","上課時間","學生","課程","老師","校區","來源","固定課表ID","調課ID","調課結果","備註",
+        "學生編號","學生姓名","姓名","身分","學生姓名/關聯（可多位）","學生姓名/關聯","LINE User ID","LINE ID","LINE_ID","關係",
+        "家長提醒","啟用","簽到識別碼","下課時間（出勤用）","開始時間（出勤用）","通知類型","預設訊息範本","個別訊息範本",
+        "套用方式","剩餘次數","有效至","設定項目","目前值","用途","說明","K書設定ID","狀態","開始使用日","停用日期",
+        "遲到門檻（分鐘；空白沿用全域）","遲到處理預設","未到班處理預設","未離班處理預設","到班通知家長預設","離班通知家長預設",
+        "安排ID","安排類型","指定日期（單日安排用）","生效日期（每週安排用）","結束日期（可留空）",
+        "預計到班時間","預計離班時間","遲到處理","未到班處理","未離班處理","到班通知家長","離班通知家長"
+    }
+    preferred_headers = {
+        "實際課程": {"Course ID","課程日期","上課時間","學生","課程","老師","來源"},
+        "出勤學生": {"學生編號","學生姓名","簽到識別碼","簽到啟用"},
+        "出勤LINE綁定": {"學生編號","學生姓名","LINE User ID","啟用","家長提醒"},
+        "聯絡人": {"姓名","身分","LINE User ID","學生姓名/關聯"},
+        "出勤設定": {"設定項目","目前值"},
+        "出勤通知模板": {"通知類型","預設訊息範本"},
+        "出勤通知個別": {"學生編號","通知類型","個別訊息範本"},
+        "K書學生": {"K書設定ID","學生姓名","狀態"},
+        "K書出勤安排": {"安排ID","K書設定ID","安排類型","預計到班時間"},
+    }.get(sheet_name, set())
+    header_idx, best_score = -1, -1
+    for i, row in enumerate(matrix[:50]):
+        vals = {str(v).strip() for v in row if str(v).strip()}
+        generic = len(vals & known_headers)
+        preferred = len(vals & preferred_headers) if preferred_headers else 0
+        score = preferred * 10 + generic
+        if generic >= 2 and score > best_score:
+            header_idx, best_score = i, score
+    if header_idx < 0:
+        logger.warning("Google Sheet %s 找不到可辨識的標題列。", sheet_name)
+        return []
+    headers = [str(x).strip() for x in matrix[header_idx]]
+    for prior in matrix[:header_idx]:
+        for i, value in enumerate(prior):
+            label = str(value or "").strip()
+            if label in known_headers and (i >= len(headers) or not headers[i]):
+                headers.extend([""] * (i + 1 - len(headers)))
+                headers[i] = label
+    out = []
+    for row in matrix[header_idx + 1:]:
+        obj = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers)) if headers[i]}
+        if any(str(v).strip() for v in obj.values()):
+            out.append(obj)
+    return out
+
+
+def _download_master_from_google_sheets() -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
+    if not GOOGLE_DRIVE_FILE_ID:
+        raise RuntimeError("尚未設定 GOOGLE_DRIVE_FILE_ID（Google 試算表 ID）。")
+    creds = _master_sync_credentials()
+    session = AuthorizedSession(creds)
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_DRIVE_FILE_ID}"
+    meta_resp = session.get(base, params={"fields":"spreadsheetId,properties(title),sheets(properties(title,index,sheetId))"}, timeout=30)
+    if not meta_resp.ok:
+        raise _google_response_error(meta_resp, "讀取 Google 試算表資訊")
+    meta_json = meta_resp.json()
+    names = [str(x.get("properties",{}).get("title","")) for x in meta_json.get("sheets",[]) if x.get("properties",{}).get("title")]
+    requested = ["出勤學生","出勤LINE綁定","聯絡人","實際課程","課程提醒","出勤設定","出勤通知模板","出勤通知個別","K書學生","K書出勤安排"]
+    present = [name for name in requested if name in names]
+    if "實際課程" not in present:
+        raise RuntimeError("Google 試算表缺少「實際課程」工作表。")
+    params = [("ranges", "'" + name.replace("'", "''") + "'!A:AZ") for name in present]
+    params.extend([("valueRenderOption","FORMATTED_VALUE"),("dateTimeRenderOption","FORMATTED_STRING")])
+    values_resp = session.get(base + "/values:batchGet", params=params, timeout=60)
+    if not values_resp.ok:
+        raise _google_response_error(values_resp, "批次讀取工作表")
+    value_ranges = values_resp.json().get("valueRanges", [])
+    grids = {}
+    for i, name in enumerate(present):
+        grids[name] = value_ranges[i].get("values", []) if i < len(value_ranges) else []
+    sheets = {name: _google_grid_to_rows(name, grids.get(name, [])) for name in requested}
+    sheets["_present_sheets"] = present
+    checksum_payload = {"title": meta_json.get("properties",{}).get("title",""), "sheets": {n:grids.get(n,[]) for n in present}}
+    checksum = hashlib.sha256(json.dumps(checksum_payload,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
+    meta = {"provider":"google_sheets","source_key":GOOGLE_DRIVE_FILE_ID,
+            "source_name":str(meta_json.get("properties",{}).get("title") or "Google 試算表"),
+            "remote_modified_at":"","remote_checksum":checksum}
+    return sheets, meta
 
 
 def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
@@ -3714,9 +3798,17 @@ def _download_master_from_google_drive() -> tuple[bytes, dict[str, str]]:
     }
 
 
+def _xlsx_workbook_sheet_names(raw: bytes) -> list[str]:
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        root = ET.fromstring(z.read("xl/workbook.xml"))
+        ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        return [str(sh.attrib.get("name") or "") for sh in root.findall(f"{{{ns}}}sheets/{{{ns}}}sheet")]
+
+
 def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
     if not raw.startswith(b"PK"):
         raise RuntimeError("主總表不是有效的 .xlsx 檔案。")
+    present_sheets = _xlsx_workbook_sheet_names(raw)
     names = {
         "出勤學生": "出勤學生",
         "出勤LINE綁定": "出勤LINE綁定",
@@ -3726,8 +3818,10 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
         "出勤設定": "出勤設定",
         "出勤通知模板": "出勤通知模板",
         "出勤通知個別": "出勤通知個別",
+        "K書學生": "K書學生",
+        "K書出勤安排": "K書出勤安排",
     }
-    out = {}
+    out = {"_present_sheets": present_sheets}
     for key, sheet in names.items():
         out[key] = _xlsx_read_sheet(raw, sheet)
     # 目前正式總表沒有「出勤學生」工作表；學生名單直接由「實際課程」建立。
@@ -3865,7 +3959,7 @@ def _get_master_sync_state(cur) -> dict[str, Any]:
 def _master_sync_configured() -> tuple[bool, str]:
     if not MASTER_SYNC_ENABLED:
         return False, "自動同步已關閉（MASTER_SYNC_ENABLED=false）"
-    if MASTER_SYNC_PROVIDER != "google_drive":
+    if MASTER_SYNC_PROVIDER not in {"google_drive", "google_sheets"}:
         return False, f"目前不支援的同步來源：{MASTER_SYNC_PROVIDER}"
     if not GOOGLE_DRIVE_FILE_ID:
         return False, "缺少 GOOGLE_DRIVE_FILE_ID"
@@ -3888,7 +3982,11 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                 cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
                 conn.commit()
                 try:
-                    raw, meta = _download_master_from_google_drive()
+                    if MASTER_SYNC_PROVIDER == "google_sheets":
+                        sheets, meta = _download_master_from_google_sheets()
+                    else:
+                        raw, meta = _download_master_from_google_drive()
+                        sheets = _load_master_workbook_sheets(raw)
                 except Exception as exc:
                     cur.execute("UPDATE master_sync_state SET last_success=FALSE,last_error=%s,last_trigger=%s,updated_at=%s WHERE id=1", (str(exc)[:2000], trigger, now_local()))
                     conn.commit()
@@ -3897,13 +3995,12 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
 
                 cur.execute("SELECT remote_modified_at,remote_checksum,last_success FROM master_sync_state WHERE id=1")
                 state = cur.fetchone() or {}
-                if meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                if meta.get("remote_checksum") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
                     cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,last_error=NULL,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
                     conn.commit()
                     return {"status": "unchanged", "source_name": meta.get("source_name"), "detail": "主總表沒有更新"}
 
                 try:
-                    sheets = _load_master_workbook_sheets(raw)
                     summary = _apply_master_sync(cur, sheets)
                     cur.execute("""UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,
                         last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger=%s,
