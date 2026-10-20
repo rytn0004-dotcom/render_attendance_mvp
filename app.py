@@ -1402,9 +1402,12 @@ def scan_student(token: str) -> dict[str, Any]:
                 return {"kind": "error", "student": student["name"], "message": "此學生的簽到功能目前已由管理員關閉。"}
             courses = get_courses_today(cur, student["id"], work_date)
             if not courses:
-                cur.execute("SELECT 1 FROM kbook_students WHERE student_id=%s AND status='啟用' LIMIT 1", (student["id"],))
-                if cur.fetchone():
+                cur.execute("SELECT status FROM kbook_students WHERE student_id=%s ORDER BY id DESC LIMIT 1", (student["id"],))
+                kbook_status = cur.fetchone()
+                if kbook_status:
                     conn.commit()
+                    if kbook_status["status"] != "啟用":
+                        return {"kind": "error", "student": student["name"], "message": "此學生的 K 書出勤目前已暫停或停用，不會建立未到班紀錄。"}
                     return {"kind": "error", "student": student["name"], "message": "今天沒有安排 K 書出席，不會建立未到班紀錄。"}
                 msg = f"⚠️ 無課程簽到\n學生：{student['name']}\n時間：{when:%H:%M}"
                 send_line(cur, None, LINE_ADMIN_USER_ID, msg, "invalid_schedule")
