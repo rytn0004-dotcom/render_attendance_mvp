@@ -4358,9 +4358,14 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                     summary = _apply_master_sync(cur, sheets)
                     cur.execute("""UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,
                         last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger=%s,
-                        last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                        last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,
+                        last_kbook_students_synced=%s,last_kbook_schedules_synced=%s,last_kbook_courses_generated=%s,
+                        last_kbook_error_count=%s,last_kbook_errors=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
                         (meta.get("provider"), meta.get("source_key"), meta.get("source_name"), meta.get("remote_modified_at"), meta.get("remote_checksum"),
-                         now_local(), now_local(), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                         now_local(), now_local(), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"],
+                         summary.get("kbook_students_synced", 0), summary.get("kbook_schedules_synced", 0), summary.get("kbook_courses_generated", 0),
+                         len(summary.get("kbook_errors", [])), "；".join(summary.get("kbook_errors", [])[:10]) or None,
+                         len(summary["errors"]) + len(summary.get("kbook_errors", [])), now_local()))
                     conn.commit()
                     logger.info("Master Excel sync success: %s", summary)
                     return {"status": "synced", "source_name": meta.get("source_name"), **summary}
@@ -4522,6 +4527,10 @@ def admin_master_sync(_: str = Depends(admin_auth)):
                 f"<tr><th>來源最後修改</th><td>{escape(str(state.get('remote_modified_at') or '—'))}</td></tr>"
                 f"<tr><th>實際課程</th><td>{escape(str(state.get('last_actual_imported') or 0))} 筆（跳過 {escape(str(state.get('last_actual_skipped') or 0))} 筆）</td></tr>"
                 f"<tr><th>LINE 綁定</th><td>{escape(str(state.get('last_binding_imported') or 0))} 筆</td></tr>"
+                f"<tr><th>K書學生</th><td>{escape(str(state.get('last_kbook_students_synced') or 0))} 筆</td></tr>"
+                f"<tr><th>K書出勤安排</th><td>{escape(str(state.get('last_kbook_schedules_synced') or 0))} 筆</td></tr>"
+                f"<tr><th>K書未來課程生成</th><td>{escape(str(state.get('last_kbook_courses_generated') or 0))} 筆</td></tr>"
+                f"<tr><th>K書資料警告</th><td style='white-space:pre-wrap'>{escape(str(state.get('last_kbook_errors') or '無'))}</td></tr>"
                 f"<tr><th>上次錯誤</th><td style='white-space:pre-wrap'>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
                 f"<p><b>自動檢查間隔：</b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</p>"
                 f"<form method='post' action='/admin/master-sync/now'><button>立即檢查並同步</button></form></section>")
@@ -4545,8 +4554,14 @@ def sync_master_excel_manual(raw: bytes) -> dict[str, Any]:
                 raise HTTPException(409, "目前正有自動同步正在執行，請稍後再試。")
             try:
                 summary = _apply_master_sync(cur, sheets)
-                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
-                            ("管理員手動上傳總表", now_local(), now_local(), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger='manual_upload',
+                    last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,
+                    last_kbook_students_synced=%s,last_kbook_schedules_synced=%s,last_kbook_courses_generated=%s,
+                    last_kbook_error_count=%s,last_kbook_errors=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                    ("管理員手動上傳總表", now_local(), now_local(), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"],
+                     summary.get("kbook_students_synced",0), summary.get("kbook_schedules_synced",0), summary.get("kbook_courses_generated",0),
+                     len(summary.get("kbook_errors",[])), "；".join(summary.get("kbook_errors",[])[:10]) or None,
+                     len(summary["errors"])+len(summary.get("kbook_errors",[])), now_local()))
                 conn.commit()
                 return summary
             finally:
