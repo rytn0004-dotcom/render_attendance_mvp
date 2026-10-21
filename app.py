@@ -3841,18 +3841,23 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         if not aid or not kid: continue
         cur.execute("SELECT * FROM kbook_student_settings WHERE kbook_id=%s",(kid,)); st=cur.fetchone()
         if not st: counts["errors"].append(f"安排 {aid}：找不到 K書設定ID {kid}。"); continue
+
         typ="single" if any(x in r.get("安排類型","") for x in ("單日","指定日期","單次")) else "weekly"
         wd=_kbook_weekday(r.get("星期")); sd=_kbook_date(r.get("指定日期（單日安排用）"))
-        ed=_kbook_date(r.get("生效日期（每週安排用）")) or now_local().date(); endd=_kbook_date(r.get("結束日期（可留空）"))
+        ed=_kbook_date(r.get("生效日期（每週安排用）"))
+        endd=_kbook_date(r.get("結束日期（可留空）"))
         start=_normalize_excel_time(r.get("預計到班時間","")); end=_normalize_excel_time(r.get("預計離班時間",""))
-        if not start or not end or (typ=="single" and not sd) or (typ=="weekly" and wd is None):
-            counts["errors"].append(f"安排 {aid}：日期、星期或時間不完整。"); continue
+        if (not start or not end or (typ=="single" and not sd) or
+            (typ=="weekly" and (wd is None or ed is None))):
+            counts["errors"].append(f"安排 {aid}：日期、星期、每週生效日期或時間不完整。"); continue
         try:
             parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
+            if end <= start:
+                raise ValueError("離班時間必須晚於到班時間")
             grace_text=r.get("遲到門檻（分鐘）") or st["late_grace_minutes"]
             grace=max(0,int(float(grace_text))) if grace_text not in (None,"") else None
         except (ValueError,TypeError):
-            counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤。"); continue
+            counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤（離班時間須晚於到班時間）。"); continue
         cur.execute("""INSERT INTO kbook_arrangements
         (arrangement_id,kbook_id,schedule_type,weekday,specific_date,effective_date,end_date,start_time,end_time,late_grace_minutes,
          late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,active,note,updated_at)
@@ -3886,7 +3891,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
         try: parse_hhmm(a["start_time"],d); parse_hhmm(a["end_time"],d)
         except ValueError: continue
         actual_id=f"KBOOK-{a['arrangement_id']}-{d:%Y%m%d}"
-        grace=a["late_grace_minutes"] if a["late_grace_minutes"] is not None else (a["ks_grace"] if a["ks_grace"] is not None else DEFAULT_LATE_GRACE_MINUTES)
+        grace=a["late_grace_minutes"] if a["late_grace_minutes"] is not None else (a["ks_grace"] if a["ks_grace"] is not None else setting_int("遲到門檻（分鐘）", DEFAULT_LATE_GRACE_MINUTES))
         cur.execute("""INSERT INTO courses
         (student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,active,
          actual_course_id,course_date,source,source_note,kbook_arrangement_id,kbook_late_action,kbook_absent_action,
@@ -4197,7 +4202,8 @@ def admin_kbook(_: str = Depends(admin_auth)):
                 if r.get("end_date"): scope+="～"+str(r["end_date"])
             raw_grace=r.get("late_grace_minutes")
             if raw_grace is None: raw_grace=r.get("student_late_grace_minutes")
-            grace=DEFAULT_LATE_GRACE_MINUTES if raw_grace is None else int(raw_grace)
+            setting_grace=setting_int("遲到門檻（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
+            grace=setting_grace if raw_grace is None else int(raw_grace)
             grace_label=f"{grace} 分鐘（全域預設）" if raw_grace is None else f"{grace} 分鐘"
             vals=(r["arrangement_id"],r["name"],scope,r["start_time"],r["end_time"],grace_label,r.get("late_action") or "只提醒",r.get("absent_action") or "只顯示後台",r.get("missing_checkout_action") or "只顯示後台")
             body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
