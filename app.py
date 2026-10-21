@@ -1718,7 +1718,7 @@ def dashboard(_: str = Depends(admin_auth)):
                 """
                 SELECT c.*, s.name, s.student_code, s.line_user_id
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書')
                 ORDER BY c.start_time, s.name
                 """,
                 (today,),
