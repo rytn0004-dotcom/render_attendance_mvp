@@ -32,7 +32,9 @@ jobs:
           assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
           assert app._kbook_weekday("星期一") == 0
           assert app._kbook_weekday("週日") == 6
-          assert app._kbook_weekday("5") == 5
+          assert app._kbook_weekday("1") == 0
+          assert app._kbook_weekday("5") == 4
+          assert app._kbook_weekday("7") == 6
           assert app._kbook_weekday("8") is None
           assert app._kbook_date("") is None
           print("K-book helper checks passed")
