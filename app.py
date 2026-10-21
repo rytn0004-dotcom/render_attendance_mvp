@@ -3240,7 +3240,7 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
             "生效日期（每週安排用）", "結束日期（可留空）", "預計到班時間",
             "預計離班時間", "遲到門檻（分鐘）", "遲到處理", "未到班處理",
             "未離班處理", "到班通知家長", "離班通知家長", "安排啟用",
-            "狀態", "開始使用日", "停用日期", "遲到門檻（分鐘；空白沿用全域）",
+            "狀態", "開始使用日", "開始日期", "停用日期", "遲到門檻（分鐘；空白沿用全域）",
             "遲到處理預設", "未到班處理預設", "未離班處理預設",
             "到班通知家長預設", "離班通知家長預設"
         }
@@ -3794,7 +3794,7 @@ def _kbook_weekday(v: Any) -> int | None:
     if t in aliases: return aliases[t]
     try:
         n=int(float(t))
-        return n if 0 <= n <= 6 else (n-1 if 1 <= n <= 7 else None)
+        return n-1 if 1 <= n <= 7 else (0 if n == 0 else None)
     except (TypeError,ValueError): return None
 
 
@@ -3825,7 +3825,7 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
         missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
         notify_checkout=EXCLUDED.notify_checkout,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
-        (kid,st["id"],r.get("狀態") or "啟用",_kbook_date(r.get("開始使用日")),_kbook_date(r.get("停用日期")),grace,
+        (kid,st["id"],r.get("狀態") or "啟用",_kbook_date(r.get("開始使用日") or r.get("開始日期")),_kbook_date(r.get("停用日期")),grace,
         r.get("遲到處理預設") or "依當日安排",r.get("未到班處理預設") or "依當日安排",
         r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),True),
         _truthy_binding(r.get("離班通知家長預設"),True),r.get("管理備註",""),now_local()))
@@ -3871,7 +3871,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     cur.execute("""SELECT a.*,ks.student_id,ks.status AS kstatus,ks.start_date AS ks_start,ks.end_date AS ks_end,
     ks.late_grace_minutes AS ks_grace FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
     WHERE a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
-    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>=%s)
+    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
     AND ((a.schedule_type='single' AND a.specific_date=%s) OR (a.schedule_type='weekly' AND a.weekday=%s
     AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s)))""",
     (d,d,d,d.weekday(),d,d))
@@ -3900,7 +3900,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     cur.execute("""UPDATE courses c SET active=FALSE WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
     WHERE a.arrangement_id=c.kbook_arrangement_id AND a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
-    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>=%s)
+    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
     AND ((a.schedule_type='single' AND a.specific_date=%s) OR (a.schedule_type='weekly' AND a.weekday=%s
     AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))))""",
     (d,d,d,d,d.weekday(),d,d))
