@@ -1,0 +1,39 @@
+name: K-book attendance code checks
+
+on:
+  push:
+    branches:
+      - feature/kbook-attendance-management
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - ".github/workflows/kbook-check.yml"
+
+jobs:
+  syntax-and-helper-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m py_compile app.py
+      - name: Test K-book date and weekday parsing
+        run: |
+          python - <<'PY'
+          import app
+          from datetime import date
+          assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
+          assert app._kbook_weekday("星期一") == 0
+          assert app._kbook_weekday("週日") == 6
+          assert app._kbook_weekday("5") == 5
+          assert app._kbook_weekday("8") is None
+          assert app._kbook_date("") is None
+          print("K-book helper checks passed")
+          PY
