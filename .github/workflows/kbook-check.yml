@@ -28,8 +28,10 @@ jobs:
         run: |
           python - <<'PY'
           import app
-          from datetime import date
+          from datetime import date, timedelta
           assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
+          assert app._kbook_date("46000") == date(1899, 12, 30) + timedelta(days=46000)
+          assert app._kbook_date("5") is None
           assert app._kbook_weekday("星期一") == 0
           assert app._kbook_weekday("週日") == 6
           assert app._kbook_weekday("1") == 0
@@ -37,5 +39,7 @@ jobs:
           assert app._kbook_weekday("7") == 6
           assert app._kbook_weekday("8") is None
           assert app._kbook_date("") is None
+          assert app._normalize_excel_time(0.5) == "12:00"
+          assert app._normalize_excel_time("18:30") == "18:30"
           print("K-book helper checks passed")
           PY
