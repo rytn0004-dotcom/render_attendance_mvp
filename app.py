@@ -3885,8 +3885,18 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
         aid=r.get("安排ID",""); kid=r.get("K書設定ID","")
         if not aid or not kid: continue
-        cur.execute("SELECT * FROM kbook_student_settings WHERE kbook_id=%s",(kid,)); st=cur.fetchone()
-        if not st: counts["errors"].append(f"安排 {aid}：找不到 K書設定ID {kid}。"); continue
+        cur.execute("""SELECT ks.*,s.name AS student_name,s.student_code AS student_code
+                       FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+                       WHERE ks.kbook_id=%s""",(kid,))
+        st=cur.fetchone()
+        if not st:
+            counts["errors"].append(f"安排 {aid}：找不到 K書設定ID {kid}。"); continue
+        arrangement_name=_canonical_student_name(r.get("學生姓名（核對用）",""))
+        arrangement_code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
+        if arrangement_name and arrangement_name != _canonical_student_name(st["student_name"]):
+            counts["errors"].append(f"安排 {aid}：學生姓名與 K書設定ID {kid} 不一致。"); continue
+        if arrangement_code and arrangement_code != st["student_code"]:
+            counts["errors"].append(f"安排 {aid}：系統學生編號與 K書設定ID {kid} 不一致。"); continue
 
         typ="single" if any(x in r.get("安排類型","") for x in ("單日","指定日期","單次")) else "weekly"
         wd=_kbook_weekday(r.get("星期")); sd=_kbook_date(r.get("指定日期（單日安排用）"))
@@ -3896,6 +3906,12 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         if (not start or not end or (typ=="single" and not sd) or
             (typ=="weekly" and (wd is None or ed is None))):
             counts["errors"].append(f"安排 {aid}：日期、星期、每週生效日期或時間不完整。"); continue
+        if typ=="weekly" and endd is not None and ed is not None and endd < ed:
+            counts["errors"].append(f"安排 {aid}：結束日期早於生效日期。"); continue
+        cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
+        existing_arrangement=cur.fetchone()
+        if existing_arrangement and existing_arrangement["kbook_id"] != kid:
+            counts["errors"].append(f"安排ID {aid} 已綁定其他 K書設定ID；若要新增安排，請使用新的安排ID。"); continue
         try:
             parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
             if end <= start:
@@ -4207,7 +4223,9 @@ def admin_kbook(_: str = Depends(admin_auth)):
             ks.late_grace_minutes AS student_late_grace_minutes
             FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
             JOIN students s ON s.id=ks.student_id WHERE a.active=TRUE
-            ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""")
+              AND ((a.schedule_type='single' AND a.specific_date >= %s)
+                OR (a.schedule_type='weekly' AND (a.end_date IS NULL OR a.end_date >= %s)))
+            ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""",(today,today))
             arrangements=cur.fetchall()
         conn.commit()
     body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
