@@ -3844,7 +3844,8 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             counts["errors"].append(f"安排 {aid}：日期、星期或時間不完整。"); continue
         try:
             parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
-            grace=max(0,int(float(r.get("遲到門檻（分鐘）") or st["late_grace_minutes"] or DEFAULT_LATE_GRACE_MINUTES)))
+            grace_text=r.get("遲到門檻（分鐘）") or st["late_grace_minutes"]
+            grace=max(0,int(float(grace_text))) if grace_text not in (None,"") else None
         except (ValueError,TypeError):
             counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤。"); continue
         cur.execute("""INSERT INTO kbook_arrangements
@@ -4142,7 +4143,8 @@ def admin_kbook(_: str = Depends(admin_auth)):
             WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE ORDER BY c.start_time,s.name""",(today,today))
             rows=cur.fetchall()
             pending=sum(1 for r in rows if r.get("check_in_time") and not r.get("check_out_time"))
-            cur.execute("""SELECT a.*,s.name,ks.status AS student_status
+            cur.execute("""SELECT a.*,s.name,ks.status AS student_status,
+            ks.late_grace_minutes AS student_late_grace_minutes
             FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
             JOIN students s ON s.id=ks.student_id WHERE a.active=TRUE
             ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""")
@@ -4188,8 +4190,11 @@ def admin_kbook(_: str = Depends(admin_auth)):
                 wd=r.get("weekday")
                 scope=(weekday_labels[int(wd)] if wd is not None and 0<=int(wd)<=6 else "星期未設定")+"｜"+str(r.get("effective_date") or "即日起")
                 if r.get("end_date"): scope+="～"+str(r["end_date"])
-            grace=int(r.get("late_grace_minutes") or 0)
-            vals=(r["arrangement_id"],r["name"],scope,r["start_time"],r["end_time"],f"{grace} 分鐘",r.get("late_action") or "只提醒",r.get("absent_action") or "只顯示後台",r.get("missing_checkout_action") or "只顯示後台")
+            raw_grace=r.get("late_grace_minutes")
+            if raw_grace is None: raw_grace=r.get("student_late_grace_minutes")
+            grace=DEFAULT_LATE_GRACE_MINUTES if raw_grace is None else int(raw_grace)
+            grace_label=f"{grace} 分鐘（全域預設）" if raw_grace is None else f"{grace} 分鐘"
+            vals=(r["arrangement_id"],r["name"],scope,r["start_time"],r["end_time"],grace_label,r.get("late_action") or "只提醒",r.get("absent_action") or "只顯示後台",r.get("missing_checkout_action") or "只顯示後台")
             body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
         body.append("</table></div>")
     else:
