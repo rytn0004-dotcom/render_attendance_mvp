@@ -973,11 +973,12 @@ def get_student(cur, token: str):
 
 
 def get_courses_today(cur, student_id: int, work_date: date):
-    """出勤唯一課程來源：總表「實際課程」同步進來的日課程。"""
+    """讀取當日一般課程與獨立 K 書安排；每筆活動維持獨立出勤紀錄。"""
     cur.execute(
         """SELECT * FROM courses
            WHERE student_id=%s AND course_date=%s AND active=TRUE
-             AND actual_course_id IS NOT NULL AND COALESCE(source, '實際課程')='實際課程'
+             AND actual_course_id IS NOT NULL
+             AND COALESCE(source, '實際課程') IN ('實際課程','K書')
            ORDER BY start_time, id""",
         (student_id, work_date),
     )
@@ -1358,7 +1359,7 @@ def missing_checkout_message(row: dict[str, Any], now: datetime) -> str:
     return f"🔴 未完成離班簽到\n\n{row['name']}\n課程：{row['course_name']}\n到班：{row['check_in_time']:%H:%M}\n原定下課：{row['effective_end']}\n截至 {now:%H:%M} 尚未完成離班簽到。"
 
 
-def scan_student(token: str) -> dict[str, Any]:
+def scan_student(token: str, selected_course_id: int | None = None) -> dict[str, Any]:
     when = now_local()
     work_date = when.date()
     with db_conn() as conn:
@@ -1380,7 +1381,37 @@ def scan_student(token: str) -> dict[str, Any]:
             cur.execute("SELECT * FROM attendance WHERE student_id=%s AND date=%s", (student["id"], work_date))
             for a in cur.fetchall():
                 existing[a["course_id"]] = a
-            course = choose_course(courses, when, existing)
+            # 若同一天有一般課程與 K 書，不能只靠時間猜測，否則同一 QR 可能把 K 書簽退誤判成英文課簽退。
+            # 先讓掃描者選擇活動，再針對該活動獨立簽到/離班。
+            if selected_course_id is None and len(courses) > 1:
+                options = []
+                for item in courses:
+                    record = existing.get(item["id"])
+                    if not record or not record.get("check_in_time"):
+                        action_label = "簽到"
+                        current_state = "尚未到班"
+                    elif not record.get("check_out_time"):
+                        action_label = "簽退"
+                        current_state = f"已於 {record['check_in_time']:%H:%M} 到班"
+                    else:
+                        action_label = "查看紀錄"
+                        current_state = f"已完成（{record['check_in_time']:%H:%M}–{record['check_out_time']:%H:%M}）"
+                    options.append({
+                        "id": item["id"],
+                        "name": item.get("course_name") or ("K書" if item.get("source") == "K書" else "一般課程"),
+                        "source": item.get("source") or "實際課程",
+                        "start": item.get("effective_start") or item.get("start_time") or "",
+                        "end": item.get("effective_end") or item.get("end_time") or "",
+                        "action": action_label,
+                        "state": current_state,
+                    })
+                return {"kind": "choose_course", "student": student["name"], "options": options}
+            if selected_course_id is not None:
+                course = next((item for item in courses if int(item["id"]) == int(selected_course_id)), None)
+                if not course:
+                    return {"kind": "error", "student": student["name"], "message": "選擇的課程不屬於這位學生今天的有效安排，沒有寫入簽到紀錄。"}
+            else:
+                course = choose_course(courses, when, existing)
             if not course:
                 return {"kind": "error", "student": student["name"], "message": "今天沒有可用課程。"}
 
@@ -4351,11 +4382,30 @@ def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
 
 
 @app.get("/scan/{token}", response_class=HTMLResponse)
-def scan(token: str, request: Request):
+def scan(token: str, request: Request, course_id: int | None = None):
     if setting_enabled("教室設備限制", True):
         require_checkin_device(request)
-    result = scan_student(token)
+    result = scan_student(token, selected_course_id=course_id)
     kind = result.get("kind")
+    if kind == "choose_course":
+        options_html = []
+        for item in result["options"]:
+            label = "K 書" if item["source"] == "K書" else item["name"]
+            options_html.append(
+                "<a class='btn' style='display:block;margin:12px auto;max-width:460px;text-align:left;padding:14px' "
+                f"href='/scan/{escape(token)}?course_id={int(item['id'])}'>"
+                f"<b>{escape(label)}</b><br>預計：{escape(str(item['start']))}–{escape(str(item['end']))}"
+                f"<br>{escape(str(item['state']))}｜按此{escape(str(item['action']))}</a>"
+            )
+        body = (
+            "<div style='max-width:600px;margin:40px auto;background:white;border-radius:16px;padding:24px;box-shadow:0 4px 20px #0001'>"
+            "<h1>請選擇此次出勤項目</h1>"
+            f"<h2>{escape(result['student'])}</h2>"
+            "<p>今天有多個課程安排。請先選擇這次要簽到或簽退的項目，英文課與 K 書會分開記錄，避免時間互相混淆。</p>"
+            + "".join(options_html) +
+            "<p class='muted'>選錯項目時，請返回後重新掃描，不要連續掃描其他項目來代替簽退。</p></div>"
+        )
+        return page("選擇出勤項目", body)
     if kind == "check_in":
         title = "到班完成"; icon = "✅"; detail = f"{result['time'][11:16]}<br>遲到：{result['late']} 分鐘" if result.get('late', 0) else result['time'][11:16]
     elif kind == "check_out":
