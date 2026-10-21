@@ -3826,9 +3826,12 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         late_grace_minutes=EXCLUDED.late_grace_minutes,late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
         missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
         notify_checkout=EXCLUDED.notify_checkout,active=EXCLUDED.active,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
-        (aid,kid,typ,wd,sd,ed,endd,start,end,grace,r.get("遲到處理") or "只提醒",r.get("未到班處理") or "只顯示後台",
-         r.get("未離班處理") or "只顯示後台",_truthy_binding(r.get("到班通知家長"),True),
-         _truthy_binding(r.get("離班通知家長"),True),_truthy_binding(r.get("安排啟用"),True),r.get("管理備註",""),now_local()))
+        (aid,kid,typ,wd,sd,ed,endd,start,end,grace,r.get("遲到處理") or st["late_action"] or "只提醒",
+         r.get("未到班處理") or st["absent_action"] or "只顯示後台",
+         r.get("未離班處理") or st["missing_checkout_action"] or "只顯示後台",
+         _truthy_binding(r.get("到班通知家長"),bool(st["notify_checkin"])),
+         _truthy_binding(r.get("離班通知家長"),bool(st["notify_checkout"])),
+         _truthy_binding(r.get("安排啟用"),True),r.get("管理備註",""),now_local()))
         counts["arrangements"]+=1
     return counts
 
@@ -4001,7 +4004,7 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
         "kbook_students_imported": kbook_summary["students"],
         "kbook_arrangements_imported": kbook_summary["arrangements"],
         "kbook_errors": kbook_summary["errors"],
-        "errors": errors,
+        "errors": errors + kbook_summary["errors"],
     }
 
 
@@ -4145,7 +4148,7 @@ def admin_master_sync(_: str = Depends(admin_auth)):
                 f"<tr><th>上次錯誤</th><td style='white-space:pre-wrap'>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
                 f"<p><b>自動檢查間隔：</b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</p>"
                 f"<form method='post' action='/admin/master-sync/now'><button>立即檢查並同步</button></form></section>")
-    body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p></section>")
+    body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p><p>K書學生若未填正確的系統學生編號，會保留錯誤記錄且不會自行建立學生或 QR。</p></section>")
     return page("主總表自動同步", ''.join(body))
 
 
