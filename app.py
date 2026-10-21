@@ -3810,16 +3810,62 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         kid=r.get("K書設定ID",""); name=_canonical_student_name(r.get("學生姓名",""))
         code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
         if not kid or not name: continue
-        if code:
-            cur.execute("SELECT id,name FROM students WHERE student_code=%s AND active=TRUE",(code,)); st=cur.fetchone()
-            if st and _canonical_student_name(st["name"]) != name:
-                counts["errors"].append(f"{name}：系統學生編號與姓名不一致。"); continue
+
+        # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
+        cur.execute("""SELECT s.id,s.name,s.student_code,s.active
+                       FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+                       WHERE ks.kbook_id=%s""",(kid,))
+        mapped=cur.fetchone()
+        st=None
+        if mapped:
+            if _canonical_student_name(mapped["name"]) != name:
+                counts["errors"].append(f"{kid}：已對應到不同姓名（{mapped['name']}），請先核對學生編號；未重新綁定。")
+                continue
+            if not mapped["active"]:
+                counts["errors"].append(f"{name}：既有系統學生已停用，為避免產生重複學生，請先核對或恢復原學生。")
+                continue
+            if code and code != mapped["student_code"]:
+                counts["errors"].append(f"{name}：填入的系統學生編號與既有 K書綁定不同，請核對後再同步。")
+                continue
+            st=mapped
+        elif code:
+            cur.execute("SELECT id,name,student_code,active FROM students WHERE student_code=%s",(code,))
+            st=cur.fetchone()
+            if not st:
+                counts["errors"].append(f"{name}：找不到系統學生編號 {code}；若是新 K 書學生，請先留空編號再同步，若是既有學生請填正確編號。")
+                continue
+            if not st["active"]:
+                counts["errors"].append(f"{name}：系統學生 {code} 已停用，未自動建立替代學生。")
+                continue
+            if _canonical_student_name(st["name"]) != name:
+                counts["errors"].append(f"{name}：系統學生編號 {code} 對應姓名不一致，未同步。")
+                continue
         else:
-            cur.execute("SELECT id,name FROM students WHERE active=TRUE"); matches=[x for x in cur.fetchall() if _canonical_student_name(x["name"])==name]
-            st=matches[0] if len(matches)==1 else None
-            if len(matches)>1: counts["errors"].append(f"{name}：有多筆同名學生，請填系統學生編號。"); continue
-        if not st:
-            counts["errors"].append(f"{name}：找不到既有出勤學生；為避免重複 QR，未自動新增。"); continue
+            cur.execute("SELECT id,name,student_code,active FROM students ORDER BY id")
+            matches=[x for x in cur.fetchall() if _canonical_student_name(x["name"])==name]
+            if len(matches)>1:
+                counts["errors"].append(f"{name}：系統內有多筆同名學生，請填入系統學生編號。")
+                continue
+            if len(matches)==1:
+                st=matches[0]
+                if not st["active"]:
+                    counts["errors"].append(f"{name}：找到同名但已停用的系統學生，為避免建立重複學生，請先恢復原學生或填入正確編號。")
+                    continue
+            else:
+                # 找不到既有姓名時，才建立新的系統學生與固定 QR；之後以 K書設定ID 穩定沿用。
+                new_code="KBOOK-"+hashlib.sha256(kid.encode("utf-8")).hexdigest()[:12].upper()
+                cur.execute("SELECT id,name,student_code,active FROM students WHERE student_code=%s",(new_code,))
+                collision=cur.fetchone()
+                if collision:
+                    if _canonical_student_name(collision["name"]) != name or not collision["active"]:
+                        counts["errors"].append(f"{name}：自動學生編號 {new_code} 已被其他資料使用，請人工指定系統學生編號。")
+                        continue
+                    st=collision
+                else:
+                    cur.execute("INSERT INTO students(student_code,name,qr_token) VALUES (%s,%s,%s) RETURNING id,name,student_code,active",
+                                (new_code,name,secrets.token_urlsafe(18)))
+                    st=cur.fetchone()
+                    logger.info("Created K-book-only student: kbook_id=%s student_code=%s",kid,new_code)
         try: grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
         except ValueError: counts["errors"].append(f"{name}：遲到門檻格式錯誤。"); continue
         cur.execute("""INSERT INTO kbook_student_settings
