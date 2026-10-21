@@ -4100,10 +4100,10 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                     sheets = _load_master_workbook_sheets(raw)
                     summary = _apply_master_sync(cur, sheets)
                     cur.execute("""UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,
-                        last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger=%s,
+                        last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=%s,last_trigger=%s,
                         last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
                         (meta.get("provider"), meta.get("source_key"), meta.get("source_name"), meta.get("remote_modified_at"), meta.get("remote_checksum"),
-                         now_local(), now_local(), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                         now_local(), now_local(), ("；".join(summary["errors"][:10])[:1800] or None), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
                     conn.commit()
                     logger.info("Master Excel sync success: %s", summary)
                     return {"status": "synced", "source_name": meta.get("source_name"), **summary}
@@ -4222,6 +4222,9 @@ def admin_master_sync(_: str = Depends(admin_auth)):
     configured, config_detail = _master_sync_configured()
     status_label = {True:"正常", False:"未完成"}.get(bool(state.get("last_success")), "尚未同步") if state else "尚未同步"
     color = "success" if state.get("last_success") else "alert"
+    if state.get("last_success") and state.get("last_error"):
+        status_label = "已同步，但有資料警告"
+        color = "alert"
     body = [f"<div class='top'><div><h1>主總表自動同步</h1><div class='muted'>V{APP_VERSION}｜主總表放在 Google Drive，Render 自動檢查更新；手動同步保留為備援。</div></div>{admin_nav()}</div>"]
     body.append(f"<section><h2>同步狀態</h2><div class='alert {color}'><b>{escape(status_label)}</b>｜{escape(config_detail)}</div><table>"
                 f"<tr><th>同步來源</th><td>{escape(str(state.get('source_name') or '尚未同步'))}</td></tr>"
@@ -4253,8 +4256,8 @@ def sync_master_excel_manual(raw: bytes) -> dict[str, Any]:
                 raise HTTPException(409, "目前正有自動同步正在執行，請稍後再試。")
             try:
                 summary = _apply_master_sync(cur, sheets)
-                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
-                            ("管理員手動上傳總表", now_local(), now_local(), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=%s,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                            ("管理員手動上傳總表", now_local(), now_local(), ("；".join(summary["errors"][:10])[:1800] or None), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
                 conn.commit()
                 return summary
             finally:
