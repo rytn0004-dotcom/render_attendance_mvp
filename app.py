@@ -3785,7 +3785,7 @@ def _kbook_date(v: Any) -> date | None:
         except ValueError: pass
     try:
         n=float(t)
-        if 1 <= n <= 100000: return date(1899,12,30)+timedelta(days=int(n))
+        if 30000 <= n <= 100000: return date(1899,12,30)+timedelta(days=int(n))
     except (TypeError,ValueError,OverflowError): pass
     return None
 
@@ -3832,8 +3832,8 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         notify_checkout=EXCLUDED.notify_checkout,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
         (kid,st["id"],r.get("狀態") or "啟用",_kbook_date(r.get("開始使用日") or r.get("開始日期")),_kbook_date(r.get("停用日期")),grace,
         r.get("遲到處理預設") or "依當日安排",r.get("未到班處理預設") or "依當日安排",
-        r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),True),
-        _truthy_binding(r.get("離班通知家長預設"),True),r.get("管理備註",""),now_local()))
+        r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),False),
+        _truthy_binding(r.get("離班通知家長預設"),False),r.get("管理備註",""),now_local()))
         counts["students"]+=1
     for raw in arrangement_rows:
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
