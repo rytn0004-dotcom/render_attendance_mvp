@@ -4153,7 +4153,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
             WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE ORDER BY c.start_time,s.name""",(today,today))
             rows=cur.fetchall()
             pending=sum(1 for r in rows if r.get("check_in_time") and not r.get("check_out_time"))
-            cur.execute("""SELECT a.*,s.name,ks.status AS student_status,
+            cur.execute("""SELECT a.*,s.name,ks.status AS student_status,s.active AS system_active,
             ks.late_grace_minutes AS student_late_grace_minutes
             FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
             JOIN students s ON s.id=ks.student_id WHERE a.active=TRUE
@@ -4162,7 +4162,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
         conn.commit()
     body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
     active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
-    active_arrangements=sum(1 for r in arrangements if str(r.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"})
+    active_arrangements=sum(1 for r in arrangements if r.get("system_active") and str(r.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"})
     body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>啟用排班</div><div class='num'>{active_arrangements}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
     body.append("<section><h2>今日 K 書出勤</h2><p class='muted'>實際到班／離班時間會在 QR 掃描後寫入；遲到以該筆排班的預計到班時間及遲到門檻判斷。</p>")
     if rows:
@@ -4184,7 +4184,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
         state=str(r.get("status") or "停用")
         if not r.get("system_active"): state += "（系統學生已停用）"
         grace="沿用全域" if r.get("late_grace_minutes") is None else f"{r['late_grace_minutes']} 分鐘"
-        notify=f"到班：{'是' if r.get('notify_checkin') else '否'}；離班：{'是' if r.get('notify_checkout') else '否'}"
+        notify=f"到班預設：{'開啟' if r.get('notify_checkin') else '關閉（排班可單獨開啟）'}；離班預設：{'開啟' if r.get('notify_checkout') else '關閉（排班可單獨開啟）'}"
         qr_html=f"<a href='/qr/{escape(str(r['student_code']))}.png' target='_blank' rel='noopener'>開啟固定 QR</a>" if r.get("system_active") and r.get("student_code") else "無可用 QR"
         vals=(r["kbook_id"],r["name"],state,r.get("start_date") or "—",r.get("end_date") or "—",grace,notify)
         body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+f"<td>{qr_html}</td></tr>")
