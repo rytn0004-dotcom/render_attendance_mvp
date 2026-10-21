@@ -1,0 +1,89 @@
+name: K-book attendance code checks
+
+on:
+  push:
+    branches:
+      - feature/kbook-attendance-management
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - ".github/workflows/kbook-check.yml"
+
+jobs:
+  syntax-and-helper-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m py_compile app.py
+      - name: Test K-book date and weekday parsing
+        run: |
+          python - <<'PY'
+          import app
+          from datetime import date, timedelta
+          assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
+          assert app._kbook_date("46000") == date(1899, 12, 30) + timedelta(days=46000)
+          assert app._kbook_date("5") is None
+          assert app._kbook_weekday("星期一") == 0
+          assert app._kbook_weekday("週日") == 6
+          assert app._kbook_weekday("1") == 0
+          assert app._kbook_weekday("5") == 4
+          assert app._kbook_weekday("7") == 6
+          assert app._kbook_weekday("8") is None
+          assert app._kbook_date("") is None
+          assert app._normalize_excel_time(0.5) == "12:00"
+          assert app._normalize_excel_time("18:30") == "18:30"
+
+          # Build a small XLSX fixture with a title row before the headers.
+          from io import BytesIO
+          from zipfile import ZipFile, ZIP_DEFLATED
+          from xml.sax.saxutils import escape
+
+          def col_name(n):
+              out = ""
+              while n:
+                  n, rem = divmod(n - 1, 26)
+                  out = chr(65 + rem) + out
+              return out
+
+          def xml_row(row_no, values):
+              cells = []
+              for index, value in enumerate(values, 1):
+                  if value is None or value == "":
+                      continue
+                  ref = f"{col_name(index)}{row_no}"
+                  cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>')
+              return f'<row r="{row_no}">' + "".join(cells) + "</row>"
+
+          ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+          pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+          student_headers = ["K書設定ID", "系統學生編號（對應出勤學生）", "學生姓名", "狀態", "開始使用日", "停用日期", "遲到門檻（分鐘；空白沿用全域）"]
+          student_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, ["K 書學生設定｜標題"]) + xml_row(2, student_headers) + xml_row(3, ["KBOOK-TEST", None, "新同學", "啟用", "2026-10-21", None, "15"]) + "</sheetData></worksheet>"
+          arrangement_headers = ["安排ID", "K書設定ID", "安排類型", "星期", "生效日期（每週安排用）", "預計到班時間", "預計離班時間", "遲到門檻（分鐘）", "安排啟用"]
+          arrangement_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, arrangement_headers) + xml_row(2, ["ARR-TEST", "KBOOK-TEST", "每週固定", "星期三", "2026-10-21", "18:00", "20:00", "10", "是"]) + "</sheetData></worksheet>"
+          workbook_xml = f'<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="K書學生" sheetId="1" r:id="rId1"/><sheet name="K書出勤安排" sheetId="2" r:id="rId2"/></sheets></workbook>'
+          relationships_xml = f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+          fixture = BytesIO()
+          with ZipFile(fixture, "w", ZIP_DEFLATED) as z:
+              z.writestr("xl/workbook.xml", workbook_xml)
+              z.writestr("xl/_rels/workbook.xml.rels", relationships_xml)
+              z.writestr("xl/worksheets/sheet1.xml", student_xml)
+              z.writestr("xl/worksheets/sheet2.xml", arrangement_xml)
+          student_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書學生")
+          arrangement_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書出勤安排")
+          assert student_rows[0]["K書設定ID"] == "KBOOK-TEST"
+          assert student_rows[0]["學生姓名"] == "新同學"
+          assert student_rows[0]["開始使用日"] == "2026-10-21"
+          assert arrangement_rows[0]["安排ID"] == "ARR-TEST"
+          assert arrangement_rows[0]["預計到班時間"] == "18:00"
+          print("K-book helper and XLSX sheet parser checks passed")
+          PY
