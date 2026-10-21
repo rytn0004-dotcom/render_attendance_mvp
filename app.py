@@ -4045,7 +4045,6 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 f"原因：{detail}"
             )
     kbook_summary = _kbook_sync_sheets(cur, sheets.get("K書學生", []), sheets.get("K書出勤安排", []))
-    _ensure_kbook_courses_for_date(cur, now_local().date())
     logger.info("K書同步：學生=%s 安排=%s 錯誤=%s", kbook_summary["students"], kbook_summary["arrangements"], len(kbook_summary["errors"]))
     # 若舊同步曾把組合姓名當成單一學生，且新個別學生已建立、舊紀錄已無啟用課程，
     # 將舊組合名設為停用；歷史簽到紀錄保留，不會刪除。
@@ -4085,6 +4084,7 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
         binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
     load_runtime_settings(cur)
+    _ensure_kbook_courses_for_date(cur, now_local().date())
     return {
         "actual_imported": actual_imported,
         "actual_skipped": actual_skipped,
