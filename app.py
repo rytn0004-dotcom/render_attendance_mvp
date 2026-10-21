@@ -4124,25 +4124,35 @@ async def periodic_master_sync():
 @app.get("/admin/kbook", response_class=HTMLResponse)
 def admin_kbook(_: str = Depends(admin_auth)):
     today=now_local().date()
+    now=now_local()
     with db_conn() as conn:
         with conn.cursor() as cur:
             _ensure_kbook_courses_for_date(cur,today)
-            cur.execute("""SELECT ks.kbook_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
-            ks.missing_checkout_action,COUNT(DISTINCT a.arrangement_id) FILTER (WHERE a.active=TRUE) AS arrangement_count
+            cur.execute("""SELECT ks.kbook_id,s.id AS student_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
+            ks.late_grace_minutes,ks.notify_checkin,ks.notify_checkout,ks.missing_checkout_action,
+            s.active AS system_active
             FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
-            LEFT JOIN kbook_arrangements a ON a.kbook_id=ks.kbook_id
-            GROUP BY ks.kbook_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,ks.missing_checkout_action
             ORDER BY s.name,ks.kbook_id""")
             students=cur.fetchall()
-            cur.execute("""SELECT s.name,s.student_code,c.start_time,c.end_time,a.check_in_time,a.check_out_time
+            cur.execute("""SELECT s.name,s.student_code,c.id AS course_id,c.start_time,c.end_time,
+            c.late_grace_minutes,c.kbook_late_action,c.kbook_absent_action,c.kbook_missing_checkout_action,
+            c.kbook_notify_checkin,c.kbook_notify_checkout,a.check_in_time,a.check_out_time
             FROM courses c JOIN students s ON s.id=c.student_id
             LEFT JOIN attendance a ON a.course_id=c.id AND a.date=%s
             WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE ORDER BY c.start_time,s.name""",(today,today))
             rows=cur.fetchall()
             pending=sum(1 for r in rows if r.get("check_in_time") and not r.get("check_out_time"))
+            cur.execute("""SELECT a.*,s.name,ks.status AS student_status
+            FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+            JOIN students s ON s.id=ks.student_id WHERE a.active=TRUE
+            ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""")
+            arrangements=cur.fetchall()
         conn.commit()
     body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
-    body.append(f"<section><h2>今日出勤</h2><div class='cards'><div class='card'><div class='muted'>今日安排</div><div class='num'>{len(rows)}</div></div><div class='card'><div class='muted'>已到班尚未離班</div><div class='num'>{pending}</div></div></div>")
+    active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
+    active_arrangements=sum(1 for r in arrangements if str(r.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"})
+    body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>啟用排班</div><div class='num'>{active_arrangements}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
+    body.append("<section><h2>今日 K 書出勤</h2><p class='muted'>實際到班／離班時間會在 QR 掃描後寫入；遲到以該筆排班的預計到班時間及遲到門檻判斷。</p>")
     if rows:
         body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>學生編號</th><th>預計到班</th><th>預計離班</th><th>實際到班</th><th>實際離班</th><th>狀態</th></tr>")
         for r in rows:
