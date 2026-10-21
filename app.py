@@ -3803,6 +3803,15 @@ def _kbook_weekday(v: Any) -> int | None:
     except (TypeError,ValueError): return None
 
 
+def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "只顯示後台") -> str:
+    # 「依當日安排」代表由單筆安排覆寫；若單筆也留空，採不推播的安全預設。
+    for value in (primary, student_default):
+        text_value = str(value or "").strip()
+        if text_value and text_value not in {"依當日安排", "依學生設定"}:
+            return text_value
+    return fallback
+
+
 def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
     counts={"students":0,"arrangements":0,"errors":[]}
     for raw in student_rows:
@@ -3930,9 +3939,9 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         late_grace_minutes=EXCLUDED.late_grace_minutes,late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
         missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
         notify_checkout=EXCLUDED.notify_checkout,active=EXCLUDED.active,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
-        (aid,kid,typ,wd,sd,ed,endd,start,end,grace,r.get("遲到處理") or st["late_action"] or "只提醒",
-         r.get("未到班處理") or st["absent_action"] or "只顯示後台",
-         r.get("未離班處理") or st["missing_checkout_action"] or "只顯示後台",
+        (aid,kid,typ,wd,sd,ed,endd,start,end,grace,_kbook_resolve_action(r.get("遲到處理"), st["late_action"], "只顯示後台"),
+         _kbook_resolve_action(r.get("未到班處理"), st["absent_action"], "只顯示後台"),
+         _kbook_resolve_action(r.get("未離班處理"), st["missing_checkout_action"], "只顯示後台"),
          _truthy_binding(r.get("到班通知家長"),bool(st["notify_checkin"])),
          _truthy_binding(r.get("離班通知家長"),bool(st["notify_checkout"])),
          _truthy_binding(r.get("安排啟用"),True),r.get("管理備註",""),now_local()))
