@@ -1503,7 +1503,12 @@ def check_scheduled_absences() -> int:
                 eff = effective_schedule(cur, course, work_date)
                 if not eff:
                     continue
-                if now < parse_hhmm(eff["effective_start"], work_date) + timedelta(minutes=threshold):
+                threshold_minutes = (
+                    max(0, int(course.get("late_grace_minutes") or 0))
+                    if course.get("source") == "K書"
+                    else threshold
+                )
+                if now < parse_hhmm(eff["effective_start"], work_date) + timedelta(minutes=threshold_minutes):
                     continue
                 cur.execute("INSERT INTO attendance(student_id,course_id,date,status,updated_at) VALUES (%s,%s,%s,'absent',%s) ON CONFLICT(student_id,course_id,date) DO NOTHING RETURNING id", (course["student_id"],course["id"],work_date,now))
                 inserted = cur.fetchone()
