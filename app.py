@@ -4089,9 +4089,13 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                     logger.exception("Master Excel sync download failed")
                     return {"status": "failed", "detail": str(exc)[:1000]}
 
-                cur.execute("SELECT remote_modified_at,remote_checksum,last_success FROM master_sync_state WHERE id=1")
+                cur.execute("SELECT remote_modified_at,remote_checksum,last_success,last_error FROM master_sync_state WHERE id=1")
                 state = cur.fetchone() or {}
                 if meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                    if state.get("last_error"):
+                        cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
+                        conn.commit()
+                        return {"status": "unchanged_with_warnings", "source_name": meta.get("source_name"), "detail": "主總表沒有更新；保留上次資料警告", "warnings": state.get("last_error")}
                     cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,last_error=NULL,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
                     conn.commit()
                     return {"status": "unchanged", "source_name": meta.get("source_name"), "detail": "主總表沒有更新"}
