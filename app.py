@@ -1793,6 +1793,8 @@ def dashboard(_: str = Depends(admin_auth)):
             status = "<span class='orange'>🟠 遲到</span>"
         elif a and a["check_in_time"]:
             status = "<span class='gray'>✅ 已到班</span>"
+        elif r.get("source") == "K書" and now_local() > parse_hhmm(r["effective_start"], today) + timedelta(minutes=int(r.get("late_grace_minutes") or 0)):
+            status = "<span class='orange'>尚未到班（已超過門檻）</span>"
         else:
             status = "<span class='gray'>尚未掃描</span>"
         actions = []
