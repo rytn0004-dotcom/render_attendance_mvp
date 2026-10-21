@@ -4167,12 +4167,35 @@ def admin_kbook(_: str = Depends(admin_auth)):
             body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
         body.append("</table></div>")
     else: body.append("<p>今日沒有已啟用的 K 書出勤安排；未安排日期不會判定未到班。</p>")
-    body.append("</section><section><h2>K書學生名單</h2><p>請在 Google 總表的「K書學生」與「K書出勤安排」工作表新增、停用或調整時間。為避免重複 QR，系統不會自動建立不存在的學生，請先填入正確的系統學生編號。停用請明確設定狀態，不會因工作表空白而刪除紀錄。</p><div style='overflow:auto'><table><tr><th>K書設定ID</th><th>學生</th><th>系統學生編號</th><th>狀態</th><th>開始日</th><th>停用日</th><th>安排數</th><th>未離班規則</th></tr>")
+    body.append("</section><section><h2>K書學生設定</h2><p>「開始使用日」當天起生效；「停用日期」當天起不再排班。遲到門檻留白時依個別 K 書排班；排班也留白時再沿用全域遲到門檻。停用 K 書不會刪除一般英文課、QR 或歷史紀錄。</p><div style='overflow:auto'><table><tr><th>K書設定ID</th><th>學生</th><th>狀態</th><th>開始日期</th><th>停用日期</th><th>遲到門檻</th><th>通知設定</th><th>固定 QR</th></tr>")
     for r in students:
-        vals=(r["kbook_id"],r["name"],r["student_code"],r["status"],r["start_date"],r["end_date"],r["arrangement_count"],r["missing_checkout_action"])
-        body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
-    body.append("</table></div><p><a class='btn btn2' href='/admin/master-sync'>查看同步狀態</a></p></section>")
-    return page("K書出勤管理","".join(body))
+        state=str(r.get("status") or "停用")
+        if not r.get("system_active"): state += "（系統學生已停用）"
+        grace="沿用全域" if r.get("late_grace_minutes") is None else f"{r['late_grace_minutes']} 分鐘"
+        notify=f"到班：{'是' if r.get('notify_checkin') else '否'}；離班：{'是' if r.get('notify_checkout') else '否'}"
+        qr_html=f"<a href='/qr/{escape(str(r['student_code']))}.png' target='_blank' rel='noopener'>開啟固定 QR</a>" if r.get("system_active") and r.get("student_code") else "無可用 QR"
+        vals=(r["kbook_id"],r["name"],state,r.get("start_date") or "—",r.get("end_date") or "—",grace,notify)
+        body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+f"<td>{qr_html}</td></tr>")
+    body.append("</table></div></section>") 
+    weekday_labels=["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
+    body.append("<section><h2>啟用中的 K 書排班</h2><p class='muted'>每週安排依星期與生效區間判斷；指定日期安排只在該日有效。每位學生的 K 書時間獨立於同日英文課。</p>")
+    if arrangements:
+        body.append("<div style='overflow:auto'><table><tr><th>安排ID</th><th>學生</th><th>類型／日期</th><th>應到教室時間</th><th>預計離開</th><th>遲到門檻</th><th>遲到處理</th><th>未到班處理</th><th>未離班處理</th></tr>")
+        for r in arrangements:
+            if r.get("schedule_type")=="single":
+                scope="單次："+str(r.get("specific_date") or "未填")
+            else:
+                wd=r.get("weekday")
+                scope=(weekday_labels[int(wd)] if wd is not None and 0<=int(wd)<=6 else "星期未設定")+"｜"+str(r.get("effective_date") or "即日起")
+                if r.get("end_date"): scope+="～"+str(r["end_date"])
+            grace=int(r.get("late_grace_minutes") or 0)
+            vals=(r["arrangement_id"],r["name"],scope,r["start_time"],r["end_time"],f"{grace} 分鐘",r.get("late_action") or "只提醒",r.get("absent_action") or "只顯示後台",r.get("missing_checkout_action") or "只顯示後台")
+            body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
+        body.append("</table></div>")
+    else:
+        body.append("<p>目前沒有啟用中的 K 書排班。請到 Google 總表「K書出勤安排」新增時段。</p>")
+    body.append("</section><section><h2>設定方式</h2><p>請在 Google 總表修改「K書學生」與「K書出勤安排」，等待自動同步或到「總表同步」按立即同步。若學生未與現有出勤學生唯一對應，系統會記錄錯誤，不會自行建立第二筆學生或 QR。</p><p><a class='btn btn2' href='/admin/master-sync'>查看總表同步狀態</a></p></section>")
+    return page("K 書出勤", "".join(body))
 
 
 @app.get("/admin/master-sync", response_class=HTMLResponse)
