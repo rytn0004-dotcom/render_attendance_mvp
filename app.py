@@ -4154,11 +4154,16 @@ def admin_kbook(_: str = Depends(admin_auth)):
     body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>啟用排班</div><div class='num'>{active_arrangements}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
     body.append("<section><h2>今日 K 書出勤</h2><p class='muted'>實際到班／離班時間會在 QR 掃描後寫入；遲到以該筆排班的預計到班時間及遲到門檻判斷。</p>")
     if rows:
-        body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>學生編號</th><th>預計到班</th><th>預計離班</th><th>實際到班</th><th>實際離班</th><th>狀態</th></tr>")
+        body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>預計到班</th><th>預計離班</th><th>實際到班時間</th><th>實際離班時間</th><th>目前狀態</th><th>遲到門檻</th><th>未離班處理</th></tr>")
         for r in rows:
             ci=r.get("check_in_time"); co=r.get("check_out_time")
-            state="尚未到班" if not ci else ("已離班" if co else "尚未離班")
-            vals=(r["name"],r["student_code"],r["start_time"],r["end_time"],iso(ci) or "—",iso(co) or "—",state)
+            grace=int(r.get("late_grace_minutes") or 0)
+            try:
+                late_limit=parse_hhmm(r["start_time"],today)+timedelta(minutes=grace)
+                state="已離班" if co else ("已到班，尚未離班" if ci else ("尚未到班（已超過遲到門檻）" if now>late_limit else "尚未到班"))
+            except (ValueError,TypeError):
+                state="排班時間格式需檢查"
+            vals=(r["name"],r["start_time"],r["end_time"],iso(ci) or "—",iso(co) or "—",state,f"超過 {grace} 分鐘才記遲到",r.get("kbook_missing_checkout_action") or "只顯示後台")
             body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
         body.append("</table></div>")
     else: body.append("<p>今日沒有已啟用的 K 書出勤安排；未安排日期不會判定未到班。</p>")
