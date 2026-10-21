@@ -4260,7 +4260,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
         body.append("</table></div>")
     else:
         body.append("<p>目前沒有啟用中的 K 書排班。請到 Google 總表「K書出勤安排」新增時段。</p>")
-    body.append("</section><section><h2>設定方式</h2><p>請在 Google 總表修改「K書學生」與「K書出勤安排」，等待自動同步或到「總表同步」按立即同步。若學生未與現有出勤學生唯一對應，系統會記錄錯誤，不會自行建立第二筆學生或 QR。</p><p><a class='btn btn2' href='/admin/master-sync'>查看總表同步狀態</a></p></section>")
+    body.append("</section><section><h2>設定方式</h2><p>請在 Google 總表修改「K書學生」與「K書出勤安排」，等待自動同步或到「總表同步」按立即同步。若找不到既有同名學生且「系統學生編號」留白，系統會建立新的系統學生與固定 QR；若有多筆同名或填入的編號不符，會提示核對並停止該列同步。停用日期當天起不再排 K 書，但不刪除學生 QR 或歷史紀錄。</p><p><a class='btn btn2' href='/admin/master-sync'>查看總表同步狀態</a></p></section>")
     return page("K 書出勤", "".join(body))
 
 
