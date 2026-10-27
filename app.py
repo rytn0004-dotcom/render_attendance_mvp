@@ -3913,7 +3913,9 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
                 if default_end <= default_start:
                     raise ValueError("預計離班時間須晚於預計到班時間")
             except ValueError as exc:
-                counts["errors"].append(f"{name}：平日預設時段錯誤（{exc}），未同步。"); continue
+                counts["errors"].append(f"{name}：平日預設時段錯誤（{exc}）；已保留學生狀態，但暫不產生平日簽到表。")
+                default_start=None
+                default_end=None
         elif weekday_enabled and str(r.get("狀態") or "啟用").strip() in {"啟用","啟用中","是","TRUE","true","1"}:
             counts["errors"].append(f"{name}：已啟用平日固定 K 書，但未填預計到班與離班時間；學生名單已保留，尚不能自動建立每日簽到表。")
 
