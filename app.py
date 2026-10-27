@@ -656,6 +656,19 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_kbook_arrangements_active ON kbook_arrangements(active, weekday, specific_date);
                 CREATE INDEX IF NOT EXISTS idx_courses_kbook_date ON courses(source, course_date, active);
+                CREATE TABLE IF NOT EXISTS kbook_sync_diagnostics (
+                    id INTEGER PRIMARY KEY,
+                    last_sync_at TIMESTAMP,
+                    student_sheet_present BOOLEAN NOT NULL DEFAULT FALSE,
+                    arrangement_sheet_present BOOLEAN NOT NULL DEFAULT FALSE,
+                    student_source_rows INTEGER NOT NULL DEFAULT 0,
+                    arrangement_source_rows INTEGER NOT NULL DEFAULT 0,
+                    students_imported INTEGER NOT NULL DEFAULT 0,
+                    arrangements_imported INTEGER NOT NULL DEFAULT 0,
+                    errors_count INTEGER NOT NULL DEFAULT 0,
+                    errors_text TEXT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
             """)
             _merge_student_name_aliases(cur)
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE")
@@ -3766,9 +3779,19 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
         "K書學生": "K書學生",
         "K書出勤安排": "K書出勤安排",
     }
+    with zipfile.ZipFile(io.BytesIO(raw)) as workbook_zip:
+        workbook_root = ET.fromstring(workbook_zip.read("xl/workbook.xml"))
+    workbook_names = {
+        str(sheet.attrib.get("name") or "")
+        for sheet in workbook_root.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheets/{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet")
+    }
     out = {}
     for key, sheet in names.items():
         out[key] = _xlsx_read_sheet(raw, sheet, require_header=key in {"K書學生", "K書出勤安排"})
+    out["_kbook_source_meta"] = [{
+        "student_sheet_present": "K書學生" in workbook_names,
+        "arrangement_sheet_present": "K書出勤安排" in workbook_names,
+    }]
     # 目前正式總表沒有「出勤學生」工作表；學生名單直接由「實際課程」建立。
     # 因此「實際課程」是出勤同步的必要來源，其他工作表都是輔助資料。
     if not out["實際課程"]:
@@ -4074,8 +4097,38 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 f"實際課程讀取 {len(actual_course_rows)} 筆、跳過 {actual_skipped} 筆。"
                 f"原因：{detail}"
             )
-    kbook_summary = _kbook_sync_sheets(cur, sheets.get("K書學生", []), sheets.get("K書出勤安排", []))
-    logger.info("K書同步：學生=%s 安排=%s 錯誤=%s", kbook_summary["students"], kbook_summary["arrangements"], len(kbook_summary["errors"]))
+    kbook_student_rows = sheets.get("K書學生", [])
+    kbook_arrangement_rows = sheets.get("K書出勤安排", [])
+    kbook_summary = _kbook_sync_sheets(cur, kbook_student_rows, kbook_arrangement_rows)
+    source_meta = (sheets.get("_kbook_source_meta") or [{}])[0]
+    if not source_meta.get("student_sheet_present", True):
+        kbook_summary["errors"].append("主總表缺少「K書學生」工作表；請把 K 書範本的工作表插入同一份主總表。")
+    if not source_meta.get("arrangement_sheet_present", True):
+        kbook_summary["errors"].append("主總表缺少「K書出勤安排」工作表；目前無法依 K 書安排自動建立簽到表。")
+    elif not kbook_arrangement_rows:
+        kbook_summary["errors"].append("「K書出勤安排」工作表目前沒有資料列；系統不會依原本「拉K」紀錄推定應到日，請至少新增一筆有效排班。")
+    cur.execute("""
+        INSERT INTO kbook_sync_diagnostics
+          (id,last_sync_at,student_sheet_present,arrangement_sheet_present,
+           student_source_rows,arrangement_source_rows,students_imported,arrangements_imported,
+           errors_count,errors_text,updated_at)
+        VALUES (1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(id) DO UPDATE SET last_sync_at=EXCLUDED.last_sync_at,
+          student_sheet_present=EXCLUDED.student_sheet_present,
+          arrangement_sheet_present=EXCLUDED.arrangement_sheet_present,
+          student_source_rows=EXCLUDED.student_source_rows,
+          arrangement_source_rows=EXCLUDED.arrangement_source_rows,
+          students_imported=EXCLUDED.students_imported,
+          arrangements_imported=EXCLUDED.arrangements_imported,
+          errors_count=EXCLUDED.errors_count,errors_text=EXCLUDED.errors_text,
+          updated_at=EXCLUDED.updated_at
+    """, (now_local(),bool(source_meta.get("student_sheet_present", True)),
+          bool(source_meta.get("arrangement_sheet_present", True)),len(kbook_student_rows),
+          len(kbook_arrangement_rows),kbook_summary["students"],kbook_summary["arrangements"],
+          len(kbook_summary["errors"]),("；".join(kbook_summary["errors"][:20])[:3500] or None),now_local()))
+    logger.info("K書同步：學生來源列=%s 已匯入=%s；排班來源列=%s 已匯入=%s；錯誤=%s",
+        len(kbook_student_rows),kbook_summary["students"],len(kbook_arrangement_rows),
+        kbook_summary["arrangements"],len(kbook_summary["errors"]))
     # 若舊同步曾把組合姓名當成單一學生，且新個別學生已建立、舊紀錄已無啟用課程，
     # 將舊組合名設為停用；歷史簽到紀錄保留，不會刪除。
     for composite_name, intended_names in STUDENT_GROUP_NAME_ALIASES.items():
