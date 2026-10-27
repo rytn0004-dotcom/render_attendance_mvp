@@ -24,6 +24,53 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile Python
         run: python -m py_compile app.py
+
+      - name: Validate K-book SQL parentheses and parameter counts
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          source = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          fn = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "_ensure_kbook_courses_for_date")
+          checked = 0
+          for node in ast.walk(fn):
+              if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "execute" or not node.args:
+                  continue
+              sql_node = node.args[0]
+              if not isinstance(sql_node, ast.Constant) or not isinstance(sql_node.value, str):
+                  continue
+              sql = sql_node.value
+              # Every percent in these parameterized statements must be part of a supported placeholder.
+              percent_remainder = re.sub(r"%s|%b|%t", "", sql)
+              assert "%" not in percent_remainder, f"Unexpected percent in SQL near line {node.lineno}: {percent_remainder!r}"
+              sql_without_literals = re.sub(r"'(?:''|[^'])*'|\\"(?:\\"\\"|[^\"])*\\"", "''", sql)
+              depth = 0
+              for char in sql_without_literals:
+                  if char == "(":
+                      depth += 1
+                  elif char == ")":
+                      depth -= 1
+                      assert depth >= 0, f"Extra closing parenthesis in K-book SQL near line {node.lineno}"
+              assert depth == 0, f"Unclosed parenthesis in K-book SQL near line {node.lineno}: depth={depth}"
+              placeholders = len(re.findall(r"%(?:s|b|t)", sql))
+              if len(node.args) < 2:
+                  params = 0
+              elif isinstance(node.args[1], (ast.Tuple, ast.List)):
+                  params = len(node.args[1].elts)
+              else:
+                  continue
+              assert placeholders == params, (
+                  f"K-book SQL near line {node.lineno}: {placeholders} placeholders but {params} parameters"
+              )
+              checked += 1
+          assert checked >= 5, f"Expected at least 5 K-book SQL statements checked, got {checked}"
+          print(f"Validated SQL parentheses and parameter counts for {checked} K-book statements")
+          PY
+
       - name: Test K-book date and weekday parsing
         run: |
           python - <<'PY'
