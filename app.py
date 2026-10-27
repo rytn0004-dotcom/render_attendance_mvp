@@ -4300,11 +4300,16 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
     kbook_summary = _kbook_sync_sheets(cur, kbook_student_rows, kbook_arrangement_rows)
     source_meta = (sheets.get("_kbook_source_meta") or [{}])[0]
     if not source_meta.get("student_sheet_present", True):
-        kbook_summary["errors"].append("主總表缺少「K書學生」工作表；請把 K 書範本的工作表插入同一份主總表。")
+        kbook_summary["errors"].append("主總表缺少「K書學生」工作表；請把 K 書工作表插入同一份主總表。")
     if not source_meta.get("arrangement_sheet_present", True):
-        kbook_summary["errors"].append("主總表缺少「K書出勤安排」工作表；目前無法依 K 書安排自動建立簽到表。")
-    elif not kbook_arrangement_rows:
-        kbook_summary["errors"].append("「K書出勤安排」工作表目前沒有資料列；系統不會依原本「拉K」紀錄推定應到日，請至少新增一筆有效排班。")
+        kbook_summary["errors"].append("主總表缺少「K書出勤安排」工作表；請保留此表供單日停用等例外設定使用。")
+    cur.execute("""SELECT COUNT(*) AS n FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+        WHERE s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+          AND ks.weekday_schedule_enabled=TRUE
+          AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''""")
+    weekday_defaults_ready = int(cur.fetchone()["n"] or 0)
+    if not kbook_arrangement_rows and weekday_defaults_ready == 0:
+        kbook_summary["errors"].append("目前沒有可用的 K 書排班：請在「K書學生」設定每位學生的「預計到班時間」與「預計離班時間」。設定完成後系統會自動建立週一至週五簽到表；「K書出勤安排」平常可以留白，只在某天不來時新增「單日停用」例外。")
     cur.execute("""
         INSERT INTO kbook_sync_diagnostics
           (id,last_sync_at,student_sheet_present,arrangement_sheet_present,
