@@ -3901,6 +3901,21 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
         except (TypeError,ValueError):
             counts["errors"].append(f"{name}：遲到門檻格式錯誤，未同步。"); continue
+        weekday_enabled=_truthy_binding(r.get("平日固定K書") or r.get("平日固定") or r.get("預設平日K書"),True)
+        default_start=_normalize_excel_time(r.get("預計到班時間") or r.get("應到教室時間") or "")
+        default_end=_normalize_excel_time(r.get("預計離班時間") or "")
+        if default_start or default_end:
+            try:
+                if not default_start or not default_end:
+                    raise ValueError("到班與離班時間必須一起填寫")
+                parse_hhmm(default_start,now_local().date())
+                parse_hhmm(default_end,now_local().date())
+                if default_end <= default_start:
+                    raise ValueError("預計離班時間須晚於預計到班時間")
+            except ValueError as exc:
+                counts["errors"].append(f"{name}：平日預設時段錯誤（{exc}），未同步。"); continue
+        elif weekday_enabled and str(r.get("狀態") or "啟用").strip() in {"啟用","啟用中","是","TRUE","true","1"}:
+            counts["errors"].append(f"{name}：已啟用平日固定 K 書，但未填預計到班與離班時間；學生名單已保留，尚不能自動建立每日簽到表。")
 
         # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
         cur.execute("""SELECT s.id,s.name,s.student_code,s.active
@@ -3958,14 +3973,16 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
                     st=cur.fetchone()
                     logger.info("Created K-book-only student: kbook_id=%s student_code=%s",kid,new_code)
         cur.execute("""INSERT INTO kbook_student_settings
-        (kbook_id,student_id,status,start_date,end_date,late_grace_minutes,late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,note,updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        (kbook_id,student_id,status,start_date,end_date,late_grace_minutes,weekday_schedule_enabled,default_start_time,default_end_time,
+         late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,note,updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT(kbook_id) DO UPDATE SET student_id=EXCLUDED.student_id,status=EXCLUDED.status,
         start_date=EXCLUDED.start_date,end_date=EXCLUDED.end_date,late_grace_minutes=EXCLUDED.late_grace_minutes,
-        late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
+        weekday_schedule_enabled=EXCLUDED.weekday_schedule_enabled,default_start_time=EXCLUDED.default_start_time,
+        default_end_time=EXCLUDED.default_end_time,late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
         missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
         notify_checkout=EXCLUDED.notify_checkout,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
-        (kid,st["id"],r.get("狀態") or "啟用",start_date,stop_date,grace,
+        (kid,st["id"],r.get("狀態") or "啟用",start_date,stop_date,grace,weekday_enabled,default_start,default_end,
         r.get("遲到處理預設") or "依當日安排",r.get("未到班處理預設") or "依當日安排",
         r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),False),
         _truthy_binding(r.get("離班通知家長預設"),False),r.get("管理備註",""),now_local()))
