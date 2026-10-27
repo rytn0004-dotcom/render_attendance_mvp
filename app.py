@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.8.4"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4198,7 +4198,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
             count+=1
 
     cur.execute("""UPDATE courses c SET active=FALSE WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
-    AND c.kbook_arrangement_id NOT LIKE 'DEFAULT-%'
+    AND LEFT(c.kbook_arrangement_id, 8) <> 'DEFAULT-'
     AND NOT EXISTS (
       SELECT 1 FROM attendance att
       WHERE att.course_id=c.id AND att.date=%s
@@ -4219,7 +4219,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     # default times are cleared, a one-day stop is enabled, or an explicit schedule overrides the date.
     cur.execute("""UPDATE courses c SET active=FALSE
         WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
-          AND c.kbook_arrangement_id LIKE 'DEFAULT-%'
+          AND LEFT(c.kbook_arrangement_id, 8) = 'DEFAULT-'
           AND NOT EXISTS (SELECT 1 FROM attendance att
               WHERE att.course_id=c.id AND att.date=%s
                 AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL))
