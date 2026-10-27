@@ -70,8 +70,10 @@ jobs:
           student_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, ["K 書學生設定｜標題"]) + xml_row(2, student_headers) + xml_row(3, ["KBOOK-TEST", None, "新同學", "啟用", "2026-10-21", None, "15"]) + "</sheetData></worksheet>"
           arrangement_headers = ["安排ID", "K書設定ID", "安排類型", "星期", "生效日期（每週安排用）", "預計到班時間", "預計離班時間", "遲到門檻（分鐘）", "安排啟用"]
           arrangement_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, arrangement_headers) + xml_row(2, ["ARR-TEST", "KBOOK-TEST", "每週固定", "星期三", "2026-10-21", "18:00", "20:00", "10", "是"]) + "</sheetData></worksheet>"
-          workbook_xml = f'<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="K書學生" sheetId="1" r:id="rId1"/><sheet name="K書出勤安排" sheetId="2" r:id="rId2"/></sheets></workbook>'
-          relationships_xml = f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+          course_headers = ["Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源"]
+          course_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, course_headers) + xml_row(2, ["COURSE-TEST", "2026-10-21", "星期三", "16:00", "測試學生", "英文", "測試老師", "信義", "固定課表"]) + "</sheetData></worksheet>"
+          workbook_xml = f'<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="K書學生" sheetId="1" r:id="rId1"/><sheet name="K書出勤安排" sheetId="2" r:id="rId2"/><sheet name="實際課程" sheetId="3" r:id="rId3"/></sheets></workbook>'
+          relationships_xml = f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="{rel}/worksheet" Target="worksheets/sheet3.xml"/></Relationships>'
           fixture = BytesIO()
           with ZipFile(fixture, "w", ZIP_DEFLATED) as z:
               z.writestr("xl/workbook.xml", workbook_xml)
