@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.7"
+APP_VERSION = "0.8.8"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4339,13 +4339,28 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
         kbook_summary["errors"].append("主總表缺少「K書學生」工作表；請把 K 書工作表插入同一份主總表。")
     if not source_meta.get("arrangement_sheet_present", True):
         kbook_summary["errors"].append("主總表缺少「K書出勤安排」工作表；請保留此表供單日停用等例外設定使用。")
-    cur.execute("""SELECT COUNT(*) AS n FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+    cur.execute("""SELECT COUNT(DISTINCT ks.kbook_id) AS n
+        FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
         WHERE s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
-          AND ks.weekday_schedule_enabled=TRUE
-          AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''""")
+          AND (
+            (ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>'')
+            OR EXISTS (SELECT 1 FROM kbook_arrangements a
+              WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE AND a.schedule_type='weekdays'
+                AND COALESCE(a.start_time,'')<>'' AND COALESCE(a.end_time,'')<>'')
+          )""")
     weekday_defaults_ready = int(cur.fetchone()["n"] or 0)
-    if not kbook_arrangement_rows and weekday_defaults_ready == 0:
-        kbook_summary["errors"].append("目前沒有可用的 K 書排班：請在「K書學生」設定每位學生的「預計到班時間」與「預計離班時間」。設定完成後系統會自動建立週一至週五簽到表；「K書出勤安排」平常可以留白，只在某天不來時新增「單日停用」例外。")
+    cur.execute("""SELECT COUNT(DISTINCT ks.kbook_id) AS n
+        FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+        JOIN students s ON s.id=ks.student_id
+        WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
+          AND s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+          AND ((a.schedule_type='single' AND a.specific_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL)
+            OR (a.schedule_type='weekly' AND a.weekday IS NOT NULL AND a.effective_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL)
+            OR (a.schedule_type='weekdays' AND a.effective_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL))""")
+    configured_arrangement_students = int(cur.fetchone()["n"] or 0)
+    if weekday_defaults_ready == 0 and configured_arrangement_students == 0:
+        kbook_summary["errors"].append("目前尚未設定可產生簽到表的 K 書時段。毋須新增或修改「K書學生」的時間欄位：請在既有「K書出勤安排」中，固定平日學生每人新增一列「平日固定」，填入 K書設定ID、安排ID、生效日期、預計到班與預計離班時間；偶爾來一天則用「單日」並填指定日期。這是每人一列，不需每週新增五列；「單日停用」只用於臨時不來的日期。")
     cur.execute("""
         INSERT INTO kbook_sync_diagnostics
           (id,last_sync_at,student_sheet_present,arrangement_sheet_present,
