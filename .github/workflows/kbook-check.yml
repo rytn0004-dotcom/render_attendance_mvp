@@ -80,6 +80,7 @@ jobs:
               z.writestr("xl/_rels/workbook.xml.rels", relationships_xml)
               z.writestr("xl/worksheets/sheet1.xml", student_xml)
               z.writestr("xl/worksheets/sheet2.xml", arrangement_xml)
+              z.writestr("xl/worksheets/sheet3.xml", course_xml)
           student_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書學生")
           arrangement_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書出勤安排")
           assert student_rows[0]["K書設定ID"] == "KBOOK-TEST"
@@ -87,5 +88,9 @@ jobs:
           assert student_rows[0]["開始使用日"] == "2026-10-21"
           assert arrangement_rows[0]["安排ID"] == "ARR-TEST"
           assert arrangement_rows[0]["預計到班時間"] == "18:00"
-          print("K-book helper and XLSX sheet parser checks passed")
+          all_sheets = app._load_master_workbook_sheets(fixture.getvalue())
+          assert all_sheets["_kbook_source_meta"][0]["student_sheet_present"] is True
+          assert all_sheets["_kbook_source_meta"][0]["arrangement_sheet_present"] is True
+          assert len(all_sheets["K書出勤安排"]) == 1
+          print("K-book helpers and full workbook parsing checks passed")
           PY
