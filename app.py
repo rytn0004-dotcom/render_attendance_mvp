@@ -4180,6 +4180,38 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
       WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s))""",
     (d,d,d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
+
+    # Independently retire stale default weekday rows when the student is paused,
+    # default times are cleared, a one-day stop is enabled, or an explicit schedule overrides the date.
+    cur.execute("""UPDATE courses c SET active=FALSE
+        WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
+          AND c.kbook_arrangement_id LIKE 'DEFAULT-%'
+          AND NOT EXISTS (SELECT 1 FROM attendance att
+              WHERE att.course_id=c.id AND att.date=%s
+                AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL))
+          AND NOT EXISTS (
+            SELECT 1 FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+            WHERE c.kbook_arrangement_id='DEFAULT-' || ks.kbook_id
+              AND s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+              AND ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''
+              AND (ks.start_date IS NULL OR ks.start_date<=%s)
+              AND (ks.end_date IS NULL OR ks.end_date>%s)
+              AND %s BETWEEN 0 AND 4
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+                  WHERE stop.kbook_id=ks.kbook_id AND stop.active=TRUE
+                    AND stop.schedule_type='skip' AND stop.specific_date=%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a
+                  WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE
+                    AND a.schedule_type IN ('single','weekly','weekdays')
+                    AND ((a.schedule_type='single' AND a.specific_date=%s)
+                      OR (a.schedule_type='weekly' AND a.weekday=%s
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))
+                      OR (a.schedule_type='weekdays'
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))))
+          )""", (d,d,d,d,weekday,d,d,weekday,d,d,d,d))
     return count
 
 
