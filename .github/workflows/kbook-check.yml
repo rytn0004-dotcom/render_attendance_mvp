@@ -39,6 +39,14 @@ jobs:
           assert app._kbook_weekday("7") == 6
           assert app._kbook_weekday("8") is None
           assert app._kbook_date("") is None
+          assert app._kbook_schedule_type("平日固定") == "weekdays"
+          assert app._kbook_schedule_type("每週固定") == "weekly"
+          assert app._kbook_schedule_type("單日") == "single"
+          assert app._kbook_schedule_type("單日停用") == "skip"
+          assert app._kbook_schedule_type("未知類型") is None
+          assert app._kbook_regular_day_matches("weekdays", 0) is True
+          assert app._kbook_regular_day_matches("weekdays", 4) is True
+          assert app._kbook_regular_day_matches("weekdays", 5) is False
           assert app._normalize_excel_time(0.5) == "12:00"
           assert app._normalize_excel_time("18:30") == "18:30"
 
@@ -66,8 +74,8 @@ jobs:
           ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
           pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
-          student_headers = ["K書設定ID", "系統學生編號（對應出勤學生）", "學生姓名", "狀態", "開始使用日", "停用日期", "遲到門檻（分鐘；空白沿用全域）"]
-          student_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, ["K 書學生設定｜標題"]) + xml_row(2, student_headers) + xml_row(3, ["KBOOK-TEST", None, "新同學", "啟用", "2026-10-21", None, "15"]) + "</sheetData></worksheet>"
+          student_headers = ["K書設定ID", "系統學生編號（對應出勤學生）", "學生姓名", "狀態", "開始使用日", "停用日期", "遲到門檻（分鐘；空白沿用全域）", "平日固定K書", "預計到班時間", "預計離班時間"]
+          student_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, ["K 書學生設定｜標題"]) + xml_row(2, student_headers) + xml_row(3, ["KBOOK-TEST", None, "新同學", "啟用", "2026-10-21", None, "15", "是", "18:00", "20:00"]) + "</sheetData></worksheet>"
           arrangement_headers = ["安排ID", "K書設定ID", "安排類型", "星期", "生效日期（每週安排用）", "預計到班時間", "預計離班時間", "遲到門檻（分鐘）", "安排啟用"]
           arrangement_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, arrangement_headers) + xml_row(2, ["ARR-TEST", "KBOOK-TEST", "每週固定", "星期三", "2026-10-21", "18:00", "20:00", "10", "是"]) + "</sheetData></worksheet>"
           course_headers = ["Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源"]
@@ -86,6 +94,9 @@ jobs:
           assert student_rows[0]["K書設定ID"] == "KBOOK-TEST"
           assert student_rows[0]["學生姓名"] == "新同學"
           assert student_rows[0]["開始使用日"] == "2026-10-21"
+          assert student_rows[0]["平日固定K書"] == "是"
+          assert student_rows[0]["預計到班時間"] == "18:00"
+          assert student_rows[0]["預計離班時間"] == "20:00"
           assert arrangement_rows[0]["安排ID"] == "ARR-TEST"
           assert arrangement_rows[0]["預計到班時間"] == "18:00"
           all_sheets = app._load_master_workbook_sheets(fixture.getvalue())
