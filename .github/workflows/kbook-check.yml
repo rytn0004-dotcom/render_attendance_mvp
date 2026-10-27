@@ -74,7 +74,23 @@ jobs:
         run: |
           python - <<'PY'
           import app
+          import ast
+          from pathlib import Path
           from datetime import date, timedelta
+
+          # Regression test for NameError: weekday was used before it was defined.
+          source_tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
+          generator = next(node for node in source_tree.body
+                           if isinstance(node, ast.FunctionDef) and node.name == "_ensure_kbook_courses_for_date")
+          weekday_assignment = next((node for node in generator.body
+                                     if isinstance(node, ast.Assign)
+                                     and any(isinstance(target, ast.Name) and target.id == "weekday" for target in node.targets)), None)
+          assert weekday_assignment is not None, "_ensure_kbook_courses_for_date must define weekday"
+          assert isinstance(weekday_assignment.value, ast.Call)
+          assert isinstance(weekday_assignment.value.func, ast.Attribute)
+          assert weekday_assignment.value.func.attr == "weekday"
+          assert isinstance(weekday_assignment.value.func.value, ast.Name)
+          assert weekday_assignment.value.func.value.id == "d"
           assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
           assert app._kbook_date("46000") == date(1899, 12, 30) + timedelta(days=46000)
           assert app._kbook_date("5") is None
