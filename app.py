@@ -4103,7 +4103,68 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
          a.get("note") or f"K書安排 {a['arrangement_id']}",a["arrangement_id"],a["late_action"],a["absent_action"],
          a["missing_checkout_action"],a["notify_checkin"],a["notify_checkout"]))
         count+=1
+
+    # Default: one setting per student creates a daily course Monday-Friday.
+    # Explicit active single/weekly/weekdays rows override the default for that date.
+    if d.weekday() <= 4:
+        cur.execute("""SELECT ks.* FROM kbook_student_settings ks
+            JOIN students s ON s.id=ks.student_id
+            WHERE s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+              AND ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''
+              AND (ks.start_date IS NULL OR ks.start_date<=%s)
+              AND (ks.end_date IS NULL OR ks.end_date>%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+                  WHERE stop.kbook_id=ks.kbook_id AND stop.active=TRUE
+                    AND stop.schedule_type='skip' AND stop.specific_date=%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a
+                  WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE
+                    AND a.schedule_type IN ('single','weekly','weekdays')
+                    AND ((a.schedule_type='single' AND a.specific_date=%s)
+                      OR (a.schedule_type='weekly' AND a.weekday=%s
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))
+                      OR (a.schedule_type='weekdays'
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))))
+            ORDER BY s.name,ks.kbook_id""", 
+            (d,d,d,d,d.weekday(),d,d,d,d))
+        for row in cur.fetchall():
+            start=row.get("default_start_time")
+            end=row.get("default_end_time")
+            try:
+                parse_hhmm(start,d); parse_hhmm(end,d)
+                if end <= start:
+                    raise ValueError("離班時間須晚於到班時間")
+            except (ValueError,TypeError):
+                logger.warning("Invalid K-book weekday default: kbook_id=%s date=%s",row["kbook_id"],d)
+                continue
+            grace=row.get("late_grace_minutes")
+            if grace is None:
+                grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES)
+            default_id="DEFAULT-"+str(row["kbook_id"])
+            cur.execute("""INSERT INTO courses
+                (student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,active,
+                 actual_course_id,course_date,source,source_note,kbook_arrangement_id,kbook_late_action,kbook_absent_action,
+                 kbook_missing_checkout_action,kbook_notify_checkin,kbook_notify_checkout)
+                VALUES (%s,'K書','K書',%s,%s,%s,%s,%s,TRUE,%s,%s,'K書','K書平日預設',%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(actual_course_id) WHERE actual_course_id IS NOT NULL DO UPDATE SET
+                student_id=EXCLUDED.student_id,start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,
+                late_grace_minutes=EXCLUDED.late_grace_minutes,checkout_grace_minutes=EXCLUDED.checkout_grace_minutes,
+                active=TRUE,source_note=EXCLUDED.source_note,kbook_arrangement_id=EXCLUDED.kbook_arrangement_id,
+                kbook_late_action=EXCLUDED.kbook_late_action,kbook_absent_action=EXCLUDED.kbook_absent_action,
+                kbook_missing_checkout_action=EXCLUDED.kbook_missing_checkout_action,
+                kbook_notify_checkin=EXCLUDED.kbook_notify_checkin,kbook_notify_checkout=EXCLUDED.kbook_notify_checkout""",
+                (row["student_id"],d.weekday(),start,end,int(grace),DEFAULT_CHECKOUT_GRACE_MINUTES,
+                 f"KBOOK-{default_id}-{d:%Y%m%d}",d,default_id,
+                 _kbook_resolve_action(row.get("late_action"),None,"只顯示後台"),
+                 _kbook_resolve_action(row.get("absent_action"),None,"只顯示後台"),
+                 _kbook_resolve_action(row.get("missing_checkout_action"),None,"只顯示後台"),
+                 bool(row.get("notify_checkin",False)),bool(row.get("notify_checkout",False))))
+            count+=1
+
     cur.execute("""UPDATE courses c SET active=FALSE WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
+    AND c.kbook_arrangement_id NOT LIKE 'DEFAULT-%'
     AND NOT EXISTS (
       SELECT 1 FROM attendance att
       WHERE att.course_id=c.id AND att.date=%s
