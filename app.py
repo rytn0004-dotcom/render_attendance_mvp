@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.6"
+APP_VERSION = "0.8.7"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4104,6 +4104,8 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
 
 
 def _ensure_kbook_courses_for_date(cur, d: date) -> int:
+    # Reuse the target date's weekday for default-schedule filters and SQL parameters.
+    weekday = d.weekday()
     cur.execute("""SELECT a.*,ks.student_id,ks.status AS kstatus,ks.start_date AS ks_start,ks.end_date AS ks_end,
     ks.late_grace_minutes AS ks_grace FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
     WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
