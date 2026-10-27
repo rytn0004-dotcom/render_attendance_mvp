@@ -4272,6 +4272,8 @@ def admin_kbook(_: str = Depends(admin_auth)):
     with db_conn() as conn:
         with conn.cursor() as cur:
             _ensure_kbook_courses_for_date(cur,today)
+            cur.execute("SELECT * FROM kbook_sync_diagnostics WHERE id=1")
+            diag=cur.fetchone()
             cur.execute("""SELECT ks.kbook_id,s.id AS student_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
             ks.late_grace_minutes,ks.notify_checkin,ks.notify_checkout,ks.missing_checkout_action,
             s.active AS system_active
