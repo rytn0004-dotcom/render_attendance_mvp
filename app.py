@@ -4478,8 +4478,8 @@ def admin_kbook(_: str = Depends(admin_auth)):
             cur.execute("SELECT * FROM kbook_sync_diagnostics WHERE id=1")
             diag=cur.fetchone()
             cur.execute("""SELECT ks.kbook_id,s.id AS student_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
-            ks.late_grace_minutes,ks.notify_checkin,ks.notify_checkout,ks.missing_checkout_action,
-            s.active AS system_active
+            ks.late_grace_minutes,ks.weekday_schedule_enabled,ks.default_start_time,ks.default_end_time,
+            ks.notify_checkin,ks.notify_checkout,ks.missing_checkout_action,s.active AS system_active
             FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
             ORDER BY s.name,ks.kbook_id""")
             students=cur.fetchall()
@@ -4495,8 +4495,8 @@ def admin_kbook(_: str = Depends(admin_auth)):
             ks.late_grace_minutes AS student_late_grace_minutes
             FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
             JOIN students s ON s.id=ks.student_id WHERE a.active=TRUE
-              AND ((a.schedule_type='single' AND a.specific_date >= %s)
-                OR (a.schedule_type='weekly' AND (a.end_date IS NULL OR a.end_date >= %s)))
+              AND ((a.schedule_type IN ('single','skip') AND a.specific_date >= %s)
+                OR (a.schedule_type IN ('weekly','weekdays') AND (a.end_date IS NULL OR a.end_date >= %s)))
             ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""",(today,today))
             arrangements=cur.fetchall()
         conn.commit()
