@@ -3842,13 +3842,13 @@ def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "�
 
 def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
     counts={"students":0,"arrangements":0,"errors":[]}
-    for raw in student_rows:
+    for row_number, raw in enumerate(student_rows, start=3):
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
         kid=r.get("K書設定ID",""); name=_canonical_student_name(r.get("學生姓名",""))
         code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
         if not kid or not name:
             if any(str(value or "").strip() for value in raw.values()):
-                counts["errors"].append(f"第 {len([x for x in student_rows[:student_rows.index(raw)]])+3} 筆 K書學生資料缺少 K書設定ID 或學生姓名，未匯入。")
+                counts["errors"].append(f"工作表第 {row_number} 列 K書學生資料缺少 K書設定ID 或學生姓名，未匯入。")
             continue
 
         # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
