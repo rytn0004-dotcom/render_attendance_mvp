@@ -47,6 +47,10 @@ jobs:
           assert app._kbook_regular_day_matches("weekdays", 0) is True
           assert app._kbook_regular_day_matches("weekdays", 4) is True
           assert app._kbook_regular_day_matches("weekdays", 5) is False
+          assert app._kbook_weekday_enabled("", True) is True
+          assert app._kbook_weekday_enabled("", False) is False
+          assert app._kbook_weekday_enabled("是", False) is True
+          assert app._kbook_weekday_enabled("否", True) is False
           assert app._normalize_excel_time(0.5) == "12:00"
           assert app._normalize_excel_time("18:30") == "18:30"
 
