@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.9"
+APP_VERSION = "0.8.10"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -3907,7 +3907,7 @@ def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "�
 
 
 def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
-    counts={"students":0,"arrangements":0,"errors":[]}
+    counts={"students":0,"arrangements":0,"drafts":0,"errors":[]}
     for row_number, raw in enumerate(student_rows, start=3):
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
         kid=r.get("K書設定ID",""); name=_canonical_student_name(r.get("學生姓名",""))
@@ -4027,6 +4027,21 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         if not aid or not kid:
             if any(str(value or "").strip() for value in raw.values()):
                 counts["errors"].append(f"有內容的 K 書排班列缺少安排ID或K書設定ID（安排ID={aid or '未填'}），未匯入。")
+            continue
+        # Inactive rows with missing times are draft templates; they must not block sync.
+        enabled_text=r.get("安排啟用") or r.get("啟用") or ""
+        draft_type=_kbook_schedule_type(r.get("安排類型",""))
+        draft_start=_normalize_excel_time(r.get("預計到班時間",""))
+        draft_end=_normalize_excel_time(r.get("預計離班時間",""))
+        if not _truthy_binding(enabled_text,True) and draft_type not in {"skip",None} and (not draft_start or not draft_end):
+            cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
+            draft_existing=cur.fetchone()
+            if draft_existing and draft_existing["kbook_id"] != kid:
+                counts["errors"].append(f"安排ID {aid} 已綁定其他 K書設定ID；請核對後再停用。")
+                continue
+            if draft_existing:
+                cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s",(now_local(),aid))
+            counts["drafts"]+=1
             continue
         cur.execute("""SELECT ks.*,s.name AS student_name,s.student_code AS student_code
                        FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
@@ -4360,7 +4375,10 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
             OR (a.schedule_type='weekdays' AND a.effective_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL))""")
     configured_arrangement_students = int(cur.fetchone()["n"] or 0)
     if weekday_defaults_ready == 0 and configured_arrangement_students == 0:
-        kbook_summary["errors"].append("目前尚未設定可產生簽到表的 K 書時段。毋須新增或修改「K書學生」的時間欄位：請在既有「K書出勤安排」中，固定平日學生每人新增一列「平日固定」，填入 K書設定ID、安排ID、生效日期、預計到班與預計離班時間；偶爾來一天則用「單日」並填指定日期。這是每人一列，不需每週新增五列；「單日停用」只用於臨時不來的日期。")
+        if kbook_summary.get("drafts",0):
+            kbook_summary["errors"].append(f"已讀取 {kbook_summary['drafts']} 筆未啟用的 K 書排班草稿。請先核對 K書設定ID／系統學生編號，填妥預計到班與預計離班時間，再將「安排啟用」改成「是」；草稿不會產生簽到表。固定平日每人一列「平日固定」，偶爾來一天使用「單日」，只有臨時不來才用「單日停用」。")
+        else:
+            kbook_summary["errors"].append("目前尚未設定可產生簽到表的 K 書時段。毋須新增或修改「K書學生」的時間欄位：請在既有「K書出勤安排」中，固定平日學生每人新增一列「平日固定」，填入 K書設定ID、安排ID、生效日期、預計到班與預計離班時間；偶爾來一天則用「單日」並填指定日期。這是每人一列，不需每週新增五列；「單日停用」只用於臨時不來的日期。")
     cur.execute("""
         INSERT INTO kbook_sync_diagnostics
           (id,last_sync_at,student_sheet_present,arrangement_sheet_present,
