@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.8.2"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -456,9 +456,12 @@ def sync_individual_templates_from_excel(cur, rows: list[dict[str, Any]]) -> int
     return imported
 
 
-def init_db() -> None:
+def _init_db_once() -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Serialize startup DDL/migrations across overlapping Render instances.
+            # Acquire this transaction-scoped lock before any CREATE/ALTER TABLE.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (731084108221,))
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS students (
@@ -700,6 +703,27 @@ def init_db() -> None:
                 )
             load_runtime_settings(cur)
         conn.commit()
+
+
+def init_db() -> None:
+    """Initialize schema with advisory locking and retry transient DDL deadlocks."""
+    max_attempts = 5
+    retryable_sqlstates = {"40P01", "40001", "55P03"}  # deadlock, serialization, lock timeout/unavailable
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _init_db_once()
+            return
+        except psycopg.Error as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate not in retryable_sqlstates or attempt >= max_attempts:
+                logger.exception("Database initialization failed (attempt %s/%s)", attempt, max_attempts)
+                raise
+            delay_seconds = min(0.5 * (2 ** (attempt - 1)), 4.0)
+            logger.warning(
+                "Database initialization lock conflict (SQLSTATE %s); retrying attempt %s/%s in %.1fs",
+                sqlstate, attempt + 1, max_attempts, delay_seconds,
+            )
+            time.sleep(delay_seconds)
 
 
 def seed_demo_data(cur) -> None:
