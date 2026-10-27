@@ -3962,9 +3962,18 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         else:
             counts["errors"].append(f"安排 {aid}：安排類型未填或不支援（{schedule_text or '空白'}），請填「每週固定」或「單日」。")
             continue
-        wd=_kbook_weekday(r.get("星期")); sd=_kbook_date(r.get("指定日期（單日安排用）"))
-        ed=_kbook_date(r.get("生效日期（每週安排用）"))
-        endd=_kbook_date(r.get("結束日期（可留空）"))
+        weekday_text=r.get("星期","")
+        specific_text=r.get("指定日期（單日安排用）","")
+        effective_text=r.get("生效日期（每週安排用）","")
+        end_date_text=r.get("結束日期（可留空）","")
+        wd=_kbook_weekday(weekday_text); sd=_kbook_date(specific_text)
+        ed=_kbook_date(effective_text); endd=_kbook_date(end_date_text)
+        if specific_text and sd is None:
+            counts["errors"].append(f"安排 {aid}：指定日期格式無法辨識。"); continue
+        if effective_text and ed is None:
+            counts["errors"].append(f"安排 {aid}：生效日期格式無法辨識。"); continue
+        if end_date_text and endd is None:
+            counts["errors"].append(f"安排 {aid}：結束日期格式無法辨識。"); continue
         start=_normalize_excel_time(r.get("預計到班時間","")); end=_normalize_excel_time(r.get("預計離班時間",""))
         if (not start or not end or (typ=="single" and not sd) or
             (typ=="weekly" and (wd is None or ed is None))):
