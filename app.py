@@ -638,7 +638,11 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS kbook_student_settings (
                     kbook_id TEXT PRIMARY KEY, student_id BIGINT NOT NULL REFERENCES students(id),
                     status TEXT NOT NULL DEFAULT '啟用', start_date DATE, end_date DATE,
-                    late_grace_minutes INTEGER, late_action TEXT NOT NULL DEFAULT '依當日安排',
+                    late_grace_minutes INTEGER,
+                    weekday_schedule_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    default_start_time TEXT,
+                    default_end_time TEXT,
+                    late_action TEXT NOT NULL DEFAULT '依當日安排',
                     absent_action TEXT NOT NULL DEFAULT '依當日安排',
                     missing_checkout_action TEXT NOT NULL DEFAULT '只顯示後台',
                     notify_checkin BOOLEAN NOT NULL DEFAULT TRUE, notify_checkout BOOLEAN NOT NULL DEFAULT TRUE,
@@ -656,6 +660,9 @@ def init_db() -> None:
                 );
                 ALTER TABLE kbook_arrangements ALTER COLUMN start_time DROP NOT NULL;
                 ALTER TABLE kbook_arrangements ALTER COLUMN end_time DROP NOT NULL;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS weekday_schedule_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS default_start_time TEXT;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS default_end_time TEXT;
                 CREATE INDEX IF NOT EXISTS idx_kbook_arrangements_active ON kbook_arrangements(active, weekday, specific_date);
                 CREATE INDEX IF NOT EXISTS idx_courses_kbook_date ON courses(source, course_date, active);
                 CREATE TABLE IF NOT EXISTS kbook_sync_diagnostics (
@@ -3264,7 +3271,9 @@ def _xlsx_read_sheet(raw: bytes, target_name: str, require_header: bool = False)
             "未離班處理", "到班通知家長", "離班通知家長", "安排啟用",
             "狀態", "開始使用日", "開始日期", "停用日期", "遲到門檻（分鐘；空白沿用全域）",
             "遲到處理預設", "未到班處理預設", "未離班處理預設",
-            "到班通知家長預設", "離班通知家長預設"
+            "到班通知家長預設", "離班通知家長預設",
+            "平日固定K書", "平日固定", "預設平日K書",
+            "預計到班時間", "預計離班時間", "應到教室時間"
         }
         # 不再限制標題只能出現在前 10 列。總表有些工作表在正式欄位前會有較長的說明／標題區，
         # 若硬限制前 10 列，可能把資料列誤當成標題，最後造成例如「出勤學生」讀取 0 筆。
