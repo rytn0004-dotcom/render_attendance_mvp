@@ -4362,6 +4362,14 @@ def admin_kbook(_: str = Depends(admin_auth)):
     return page("K 書出勤", "".join(body))
 
 
+@app.post("/admin/kbook/sync-now")
+def admin_kbook_sync_now(_: str = Depends(admin_auth)):
+    # 手動操作一律強制重新讀取來源，即使 Google 檔案的修改時間沒有變也重新套用 K 書排班。
+    result = master_sync_once("manual")
+    logger.info("Manual K-book sync requested: status=%s detail=%s", result.get("status"), result.get("detail"))
+    return RedirectResponse("/admin/kbook", status_code=303)
+
+
 @app.get("/admin/master-sync", response_class=HTMLResponse)
 def admin_master_sync(_: str = Depends(admin_auth)):
     with db_conn() as conn:
