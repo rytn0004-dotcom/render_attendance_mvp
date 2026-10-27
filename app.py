@@ -4301,6 +4301,17 @@ def admin_kbook(_: str = Depends(admin_auth)):
     active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
     active_arrangements=sum(1 for r in arrangements if r.get("system_active") and str(r.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"})
     body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>啟用排班</div><div class='num'>{active_arrangements}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
+    body.append("<section><h2>排班同步診斷</h2><p>此處確認主總表是否有 K 書工作表、系統實際讀到多少資料列，以及匯入多少筆排班。</p>")
+    if not diag:
+        body.append("<div class='alert'>尚未取得 K 書同步診斷。請按下方按鈕重新讀取主總表。</div>")
+    else:
+        diag_errors = str(diag.get("errors_text") or "").strip()
+        source_status = "正常" if diag.get("student_sheet_present") and diag.get("arrangement_sheet_present") else "缺少工作表"
+        alert_class = "alert danger" if diag_errors or source_status != "正常" else "alert success"
+        body.append(f"<div class='{alert_class}'><b>來源狀態：{escape(source_status)}</b><br>「K書學生」：{'存在' if diag.get('student_sheet_present') else '不存在'}，讀取 {diag.get('student_source_rows', 0)} 列、匯入 {diag.get('students_imported', 0)} 位。<br>「K書出勤安排」：{'存在' if diag.get('arrangement_sheet_present') else '不存在'}，讀取 {diag.get('arrangement_source_rows', 0)} 列、匯入 {diag.get('arrangements_imported', 0)} 筆。<br>最近同步：{escape(str(diag.get('last_sync_at') or '—'))}<br>警告：{escape(diag_errors or '無')}</div>")
+        if diag.get("arrangement_sheet_present") and not diag.get("arrangement_source_rows") and not diag.get("arrangements_imported"):
+            body.append("<p><b>目前原因：</b>排班工作表沒有可辨識的資料列，所以沒有每日簽到表可建立。請新增至少一筆排班，並填寫安排ID、K書設定ID、安排類型、星期或指定日期、生效日期、預計到班、預計離班，且將「安排啟用」設為「是」。系統不會依原本「拉K」紀錄推定出席日。</p>")
+    body.append("<form method='post' action='/admin/kbook/sync-now'><button>重新讀取主總表並建立今日簽到表</button></form></section>")
     body.append("<section><h2>今日 K 書出勤</h2><p class='muted'>實際到班／離班時間會在 QR 掃描後寫入；遲到以該筆排班的預計到班時間及遲到門檻判斷。</p>")
     if rows:
         body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>預計到班</th><th>預計離班</th><th>實際到班時間</th><th>實際離班時間</th><th>目前狀態</th><th>遲到門檻</th><th>未離班處理</th></tr>")
