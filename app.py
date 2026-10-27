@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.8"
+APP_VERSION = "0.8.9"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4553,8 +4553,11 @@ def admin_kbook(_: str = Depends(admin_auth)):
         conn.commit()
     body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
     active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
-    weekday_defaults_ready=sum(1 for r in students if r.get("system_active") and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
-    active_arrangements=sum(1 for r in arrangements if r.get("active") and r.get("system_active") and str(r.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"} and r.get("schedule_type") != "skip")
+    active_statuses={"啟用","啟用中","是","TRUE","true","1"}
+    default_schedule_kids={r["kbook_id"] for r in students if r.get("system_active") and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time") and str(r.get("status")) in active_statuses}
+    arrangement_weekday_kids={r["kbook_id"] for r in arrangements if r.get("active") and r.get("system_active") and str(r.get("student_status")) in active_statuses and r.get("schedule_type")=="weekdays" and r.get("start_time") and r.get("end_time")}
+    weekday_defaults_ready=len(default_schedule_kids | arrangement_weekday_kids)
+    active_arrangements=sum(1 for r in arrangements if r.get("active") and r.get("system_active") and str(r.get("student_status")) in active_statuses and r.get("schedule_type") != "skip")
     body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>平日固定已設時間</div><div class='num'>{weekday_defaults_ready}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
     body.append("<section><h2>排班同步診斷</h2><p>此處確認主總表是否有 K 書工作表、系統實際讀到多少資料列，以及匯入多少筆排班。</p>")
     if not diag:
@@ -4565,7 +4568,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
         alert_class = "alert danger" if diag_errors or source_status != "正常" else "alert success"
         body.append(f"<div class='{alert_class}'><b>來源狀態：{escape(source_status)}</b><br>「K書學生」：{'存在' if diag.get('student_sheet_present') else '不存在'}，讀取 {diag.get('student_source_rows', 0)} 列、匯入 {diag.get('students_imported', 0)} 位。<br>「K書出勤安排」：{'存在' if diag.get('arrangement_sheet_present') else '不存在'}，讀取 {diag.get('arrangement_source_rows', 0)} 列、匯入 {diag.get('arrangements_imported', 0)} 筆。<br>最近同步：{escape(str(diag.get('last_sync_at') or '—'))}<br>警告：{escape(diag_errors or '無')}</div>")
         if not diag.get("arrangement_source_rows") and weekday_defaults_ready == 0:
-            body.append("<p><b>目前原因：</b>尚未設定可用的固定平日時段。請在「K書學生」每位學生的「預計到班時間」與「預計離班時間」各填一次；系統就會自動建立週一至週五簽到表。「K書出勤安排」平常可留白，只在某天不來時新增「單日停用」例外。</p>")
+            body.append("<p><b>目前原因：</b>目前 Excel 不需要新增「K書學生」時間欄位。請在既有「K書出勤安排」中，為每位固定 K 書學生新增一列「平日固定」，填入 K書設定ID、唯一安排ID、生效日期、預計到班時間與預計離班時間，並啟用該列。這一列會套用週一至週五；偶爾來一天則使用「單日」安排。只有臨時不來才新增「單日停用」。</p>")
         elif not diag.get("arrangement_source_rows") and weekday_defaults_ready > 0:
             body.append("<p>「K書出勤安排」沒有例外列是正常的；系統會依已設定的平日預設時段自動建立週一至週五簽到表。</p>")
     body.append("<form method='post' action='/admin/kbook/sync-now'><button>重新讀取主總表並建立今日簽到表</button></form></section>")
@@ -4584,34 +4587,55 @@ def admin_kbook(_: str = Depends(admin_auth)):
             body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
         body.append("</table></div>")
     else: body.append("<p>今日沒有已啟用的 K 書出勤安排；未安排日期不會判定未到班。</p>")
-    body.append("</section><section><h2>K書學生設定</h2><p>每位學生只需在此填一次「預計到班時間」與「預計離班時間」，平日固定預設為週一至週五。整位學生暫停 K 書可將狀態改為停用；只有某一天不來，請在下方「K書出勤安排」新增「單日停用」例外並啟用即可。開始日期當天起生效，停用日期當天起不再排班。</p><div style='overflow:auto'><table><tr><th>K書設定ID</th><th>學生</th><th>狀態</th><th>開始日期</th><th>停用日期</th><th>平日固定</th><th>預計到班</th><th>預計離班</th><th>遲到門檻</th><th>通知設定</th><th>固定 QR</th></tr>")
+    body.append("</section><section><h2>K書學生設定</h2><p>沿用目前 Excel，不必新增時間欄位。固定平日學生請在下方「K書出勤安排」每人新增一列「平日固定」並設定時間；偶爾來一天的學生只需新增「單日」安排。停用整位學生請將狀態改為停用；只有某一天不來，才新增「單日停用」例外。開始日期當天起生效，停用日期當天起不再排班。</p><div style='overflow:auto'><table><tr><th>K書設定ID</th><th>學生</th><th>狀態</th><th>開始日期</th><th>停用日期</th><th>平日固定</th><th>預計到班</th><th>預計離班</th><th>遲到門檻</th><th>通知設定</th><th>固定 QR</th></tr>")
     for r in students:
         state=str(r.get("status") or "停用")
         if not r.get("system_active"): state += "（系統學生已停用）"
         grace="沿用全域" if r.get("late_grace_minutes") is None else f"{r['late_grace_minutes']} 分鐘"
         notify=f"到班預設：{'開啟' if r.get('notify_checkin') else '關閉（排班可單獨開啟）'}；離班預設：{'開啟' if r.get('notify_checkout') else '關閉（排班可單獨開啟）'}"
         qr_html=f"<a href='/qr/{escape(str(r['student_code']))}.png' target='_blank' rel='noopener'>開啟固定 QR</a>" if r.get("system_active") and r.get("student_code") else "無可用 QR"
-        weekday_text="啟用（週一至五）" if r.get("weekday_schedule_enabled") else "停用"
+        schedule_row=next((a for a in arrangements if a.get("kbook_id")==r["kbook_id"] and a.get("active") and a.get("system_active") and str(a.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"} and a.get("schedule_type")=="weekdays" and a.get("start_time") and a.get("end_time")),None)
+        if r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time"):
+            weekday_text="啟用（學生設定）"; display_start=r.get("default_start_time"); display_end=r.get("default_end_time")
+        elif schedule_row:
+            weekday_text="啟用（排班表）"; display_start=schedule_row.get("start_time"); display_end=schedule_row.get("end_time")
+        else:
+            weekday_text="未設定平日固定"; display_start="未設定"; display_end="未設定"
         vals=(r["kbook_id"],r["name"],state,r.get("start_date") or "—",r.get("end_date") or "—",
-              weekday_text,r.get("default_start_time") or "未設定",r.get("default_end_time") or "未設定",grace,notify)
+              weekday_text,display_start,display_end,grace,notify)
         body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+f"<td>{qr_html}</td></tr>")
     body.append("</table></div></section>") 
     weekday_labels=["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
-    body.append("<section><h2>平日固定排班（系統自動建立）</h2><p class='muted'>學生狀態啟用、勾選平日固定並填妥到班／離班時間後，系統會自動產生週一至週五的每日簽到表；不需要在安排表重複建立五筆。</p>")
+    body.append("<section><h2>固定平日排班（由排班表設定）</h2><p class='muted'>沿用現有 Excel：每位固定學生在「K書出勤安排」只需一列「平日固定」，填到班／離班時間與生效日期，系統會自動產生週一至週五的每日簽到表。偶爾到場的學生不需要固定平日列。</p>")
     weekday_rows=[]
-    explicit_base_ids={r.get("kbook_id") for r in arrangements if r.get("active") and r.get("schedule_type") in {"single","weekly","weekdays"}}
+    students_by_kid={r["kbook_id"]:r for r in students}
+    used_weekday_kids=set()
+    for a in arrangements:
+        if not (a.get("active") and a.get("system_active") and str(a.get("student_status")) in active_statuses and a.get("schedule_type")=="weekdays" and a.get("start_time") and a.get("end_time")):
+            continue
+        student=students_by_kid.get(a["kbook_id"],{})
+        scope="週一至週五｜起 "+str(a.get("effective_date") or "未設定")
+        if a.get("end_date"): scope+="｜迄 "+str(a["end_date"])
+        raw_grace=a.get("late_grace_minutes")
+        if raw_grace is None: raw_grace=a.get("student_late_grace_minutes")
+        grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES) if raw_grace is None else int(raw_grace)
+        weekday_rows.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in (a["name"],scope,a["start_time"],a["end_time"],f"{grace} 分鐘","啟用（排班表）"))+"</tr>")
+        used_weekday_kids.add(a["kbook_id"])
     for r in students:
-        if not (r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"} and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time")):
+        if r["kbook_id"] in used_weekday_kids:
+            continue
+        if not (r.get("system_active") and str(r.get("status")) in active_statuses and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time")):
             continue
         scope="週一至週五"
-        if r.get("start_date"): scope += "｜起 " + str(r["start_date"])
-        if r.get("end_date"): scope += "｜停 " + str(r["end_date"])
-        grace="沿用全域" if r.get("late_grace_minutes") is None else f"{r['late_grace_minutes']} 分鐘"
-        weekday_rows.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in (r["name"],scope,r["default_start_time"],r["default_end_time"],grace,"啟用"))+"</tr>")
+        if r.get("start_date"): scope+="｜起 "+str(r["start_date"])
+        if r.get("end_date"): scope+="｜停 "+str(r["end_date"])
+        raw_grace=r.get("late_grace_minutes")
+        grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES) if raw_grace is None else int(raw_grace)
+        weekday_rows.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in (r["name"],scope,r["default_start_time"],r["default_end_time"],f"{grace} 分鐘","啟用（學生設定）"))+"</tr>")
     if weekday_rows:
         body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>生效日期</th><th>應到教室時間</th><th>預計離班</th><th>遲到門檻</th><th>狀態</th></tr>"+"".join(weekday_rows)+"</table></div>")
     else:
-        body.append("<p>目前沒有完整的平日預設時段。請先在「K書學生」填入預計到班及離班時間。</p>")
+        body.append("<p>目前沒有完整的固定平日排班。請在「K書出勤安排」新增一列「平日固定」，填妥 K書設定ID、安排ID、生效日期、預計到班與預計離班時間並啟用；不需要修改「K書學生」工作表。</p>")
     body.append("</section><section><h2>特殊排班與單日停用例外</h2><p class='muted'>一般情況不需要填這張表。若某一天不來，新增「單日停用」，填指定日期並把「安排啟用」設為「是」；要恢復那天，將「安排啟用」切回「否」。例外只影響指定日，不改動其他平日。</p>")
     if arrangements:
         body.append("<div style='overflow:auto'><table><tr><th>安排ID</th><th>學生</th><th>類型／日期</th><th>應到教室時間</th><th>預計離開</th><th>遲到門檻</th><th>未到班處理</th><th>未離班處理</th><th>例外開關</th></tr>")
