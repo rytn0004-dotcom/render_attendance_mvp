@@ -3851,6 +3851,21 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
                 counts["errors"].append(f"工作表第 {row_number} 列 K書學生資料缺少 K書設定ID 或學生姓名，未匯入。")
             continue
 
+        start_text=r.get("開始使用日","") or r.get("開始日期","")
+        stop_text=r.get("停用日期","")
+        start_date=_kbook_date(start_text)
+        stop_date=_kbook_date(stop_text)
+        if start_text and start_date is None:
+            counts["errors"].append(f"{name}：開始日期格式無法辨識，未同步。"); continue
+        if stop_text and stop_date is None:
+            counts["errors"].append(f"{name}：停用日期格式無法辨識，未同步。"); continue
+        if start_date and stop_date and stop_date <= start_date:
+            counts["errors"].append(f"{name}：停用日期必須晚於開始日期，未同步。"); continue
+        try:
+            grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
+        except (TypeError,ValueError):
+            counts["errors"].append(f"{name}：遲到門檻格式錯誤，未同步。"); continue
+
         # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
         cur.execute("""SELECT s.id,s.name,s.student_code,s.active
                        FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
@@ -3906,8 +3921,6 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
                                 (new_code,name,secrets.token_urlsafe(18)))
                     st=cur.fetchone()
                     logger.info("Created K-book-only student: kbook_id=%s student_code=%s",kid,new_code)
-        try: grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
-        except ValueError: counts["errors"].append(f"{name}：遲到門檻格式錯誤。"); continue
         cur.execute("""INSERT INTO kbook_student_settings
         (kbook_id,student_id,status,start_date,end_date,late_grace_minutes,late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,note,updated_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -3916,7 +3929,7 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
         missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
         notify_checkout=EXCLUDED.notify_checkout,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
-        (kid,st["id"],r.get("狀態") or "啟用",_kbook_date(r.get("開始使用日") or r.get("開始日期")),_kbook_date(r.get("停用日期")),grace,
+        (kid,st["id"],r.get("狀態") or "啟用",start_date,stop_date,grace,
         r.get("遲到處理預設") or "依當日安排",r.get("未到班處理預設") or "依當日安排",
         r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),False),
         _truthy_binding(r.get("離班通知家長預設"),False),r.get("管理備註",""),now_local()))
@@ -4021,12 +4034,17 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
          a["missing_checkout_action"],a["notify_checkin"],a["notify_checkout"]))
         count+=1
     cur.execute("""UPDATE courses c SET active=FALSE WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
+    AND NOT EXISTS (
+      SELECT 1 FROM attendance att
+      WHERE att.course_id=c.id AND att.date=%s
+        AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL)
+    )
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
     WHERE a.arrangement_id=c.kbook_arrangement_id AND a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
     AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
     AND ((a.schedule_type='single' AND a.specific_date=%s) OR (a.schedule_type='weekly' AND a.weekday=%s
     AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))))""",
-    (d,d,d,d,d.weekday(),d,d))
+    (d,d,d,d,d,d.weekday(),d,d))
     return count
 
 
