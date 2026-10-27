@@ -47,9 +47,8 @@ jobs:
               # Every percent in these parameterized statements must be part of a supported placeholder.
               percent_remainder = re.sub(r"%s|%b|%t", "", sql)
               assert "%" not in percent_remainder, f"Unexpected percent in SQL near line {node.lineno}: {percent_remainder!r}"
-              sql_without_literals = re.sub(r"'(?:''|[^'])*'|\\"(?:\\"\\"|[^\"])*\\"", "''", sql)
               depth = 0
-              for char in sql_without_literals:
+              for char in sql:
                   if char == "(":
                       depth += 1
                   elif char == ")":
