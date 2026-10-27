@@ -648,12 +648,14 @@ def init_db() -> None:
                     arrangement_id TEXT PRIMARY KEY,
                     kbook_id TEXT NOT NULL REFERENCES kbook_student_settings(kbook_id),
                     schedule_type TEXT NOT NULL, weekday INTEGER, specific_date DATE, effective_date DATE, end_date DATE,
-                    start_time TEXT NOT NULL, end_time TEXT NOT NULL, late_grace_minutes INTEGER,
+                    start_time TEXT, end_time TEXT, late_grace_minutes INTEGER,
                     late_action TEXT NOT NULL DEFAULT '只提醒', absent_action TEXT NOT NULL DEFAULT '只顯示後台',
                     missing_checkout_action TEXT NOT NULL DEFAULT '只顯示後台',
                     notify_checkin BOOLEAN NOT NULL DEFAULT TRUE, notify_checkout BOOLEAN NOT NULL DEFAULT TRUE,
                     active BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                ALTER TABLE kbook_arrangements ALTER COLUMN start_time DROP NOT NULL;
+                ALTER TABLE kbook_arrangements ALTER COLUMN end_time DROP NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_kbook_arrangements_active ON kbook_arrangements(active, weekday, specific_date);
                 CREATE INDEX IF NOT EXISTS idx_courses_kbook_date ON courses(source, course_date, active);
                 CREATE TABLE IF NOT EXISTS kbook_sync_diagnostics (
@@ -3831,6 +3833,31 @@ def _kbook_weekday(v: Any) -> int | None:
     except (TypeError,ValueError): return None
 
 
+def _kbook_schedule_type(value: Any) -> str | None:
+    text_value = str(value or "").strip().lower().replace(" ", "")
+    if not text_value:
+        return None
+    # One-day stop rows are enabled exceptions: enabled means this one date is excluded.
+    if "停用" in text_value and any(token in text_value for token in ("單日", "指定日期", "單次")):
+        return "skip"
+    if any(token in text_value for token in ("平日", "週一至週五", "周一至周五", "週一到週五", "周一到周五",
+                                             "週一～週五", "週一-週五", "工作日", "weekdays")):
+        return "weekdays"
+    if any(token in text_value for token in ("單日", "指定日期", "單次")):
+        return "single"
+    if any(token in text_value for token in ("每週", "每周", "週期", "周期", "weekly")):
+        return "weekly"
+    return None
+
+
+def _kbook_regular_day_matches(schedule_type: str, weekday: int | None) -> bool:
+    if weekday is None or not 0 <= weekday <= 6:
+        return False
+    if schedule_type == "weekdays":
+        return weekday <= 4
+    return schedule_type == "weekly"
+
+
 def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "只顯示後台") -> str:
     # 「依當日安排」代表由單筆安排覆寫；若單筆也留空，採不推播的安全預設。
     for value in (primary, student_default):
@@ -3955,12 +3982,9 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             counts["errors"].append(f"安排 {aid}：系統學生編號與 K書設定ID {kid} 不一致。"); continue
 
         schedule_text=r.get("安排類型","").strip()
-        if any(x in schedule_text for x in ("單日","指定日期","單次")):
-            typ="single"
-        elif any(x in schedule_text for x in ("每週","每周","週期","周期","weekly","Weekly")):
-            typ="weekly"
-        else:
-            counts["errors"].append(f"安排 {aid}：安排類型未填或不支援（{schedule_text or '空白'}），請填「每週固定」或「單日」。")
+        typ=_kbook_schedule_type(schedule_text)
+        if typ is None:
+            counts["errors"].append(f"安排 {aid}：安排類型未填或不支援；請選「平日固定」、「每週固定」、「單日」或「單日停用」。")
             continue
         weekday_text=r.get("星期","")
         specific_text=r.get("指定日期（單日安排用）","")
@@ -3974,20 +3998,27 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             counts["errors"].append(f"安排 {aid}：生效日期格式無法辨識。"); continue
         if end_date_text and endd is None:
             counts["errors"].append(f"安排 {aid}：結束日期格式無法辨識。"); continue
-        start=_normalize_excel_time(r.get("預計到班時間","")); end=_normalize_excel_time(r.get("預計離班時間",""))
-        if (not start or not end or (typ=="single" and not sd) or
-            (typ=="weekly" and (wd is None or ed is None))):
-            counts["errors"].append(f"安排 {aid}：日期、星期、每週生效日期或時間不完整。"); continue
-        if typ=="weekly" and endd is not None and ed is not None and endd < ed:
+        if typ in {"single", "skip"} and sd is None:
+            counts["errors"].append(f"安排 {aid}：單日安排／單日停用必須填寫指定日期。"); continue
+        if typ == "weekly" and (wd is None or ed is None):
+            counts["errors"].append(f"安排 {aid}：每週固定必須填星期與生效日期。"); continue
+        if typ == "weekdays" and ed is None:
+            counts["errors"].append(f"安排 {aid}：平日固定必須填寫生效日期。"); continue
+        start=_normalize_excel_time(r.get("預計到班時間","")) if typ != "skip" else None
+        end=_normalize_excel_time(r.get("預計離班時間","")) if typ != "skip" else None
+        if typ != "skip" and (not start or not end):
+            counts["errors"].append(f"安排 {aid}：缺少預計到班或離班時間。"); continue
+        if typ in {"weekly","weekdays"} and endd is not None and ed is not None and endd < ed:
             counts["errors"].append(f"安排 {aid}：結束日期早於生效日期。"); continue
         cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
         existing_arrangement=cur.fetchone()
         if existing_arrangement and existing_arrangement["kbook_id"] != kid:
             counts["errors"].append(f"安排ID {aid} 已綁定其他 K書設定ID；若要新增安排，請使用新的安排ID。"); continue
         try:
-            parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
-            if end <= start:
-                raise ValueError("離班時間必須晚於到班時間")
+            if typ != "skip":
+                parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
+                if end <= start:
+                    raise ValueError("離班時間必須晚於到班時間")
             grace_text=r.get("遲到門檻（分鐘）") or st["late_grace_minutes"]
             grace=max(0,int(float(grace_text))) if grace_text not in (None,"") else None
         except (ValueError,TypeError):
@@ -4015,11 +4046,15 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
 def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     cur.execute("""SELECT a.*,ks.student_id,ks.status AS kstatus,ks.start_date AS ks_start,ks.end_date AS ks_end,
     ks.late_grace_minutes AS ks_grace FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
-    WHERE a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+    WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
+    AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
     AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
-    AND ((a.schedule_type='single' AND a.specific_date=%s) OR (a.schedule_type='weekly' AND a.weekday=%s
-    AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s)))""",
-    (d,d,d,d.weekday(),d,d))
+    AND ((a.schedule_type='single' AND a.specific_date=%s)
+      OR (a.schedule_type='weekly' AND a.weekday=%s AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+      OR (a.schedule_type='weekdays' AND %s BETWEEN 0 AND 4 AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s)))
+    AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s))""",
+    (d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
     count=0
     for a in cur.fetchall():
         try: parse_hhmm(a["start_time"],d); parse_hhmm(a["end_time"],d)
@@ -4051,9 +4086,13 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
     WHERE a.arrangement_id=c.kbook_arrangement_id AND a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
     AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
-    AND ((a.schedule_type='single' AND a.specific_date=%s) OR (a.schedule_type='weekly' AND a.weekday=%s
-    AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))))""",
-    (d,d,d,d,d,d.weekday(),d,d))
+    AND ((a.schedule_type='single' AND a.specific_date=%s)
+      OR (a.schedule_type='weekly' AND a.weekday=%s AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+      OR (a.schedule_type='weekdays' AND %s BETWEEN 0 AND 4 AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+    )
+    AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s))""",
+    (d,d,d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
     return count
 
 
