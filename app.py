@@ -3182,7 +3182,7 @@ def _xlsx_col_index(ref: str) -> int:
     return n - 1
 
 
-def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
+def _xlsx_read_sheet(raw: bytes, target_name: str, require_header: bool = False) -> list[dict[str, str]]:
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -3277,7 +3277,10 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
                 header_idx = i
 
         if best_score < 0:
-            logger.warning("Excel sheet %s 找不到可辨識的標題列；共讀取 %s 列。", target_name, len(matrix))
+            message = f"Excel 工作表「{target_name}」找不到可辨識的標題列；共讀取 {len(matrix)} 列。"
+            if require_header:
+                raise RuntimeError(message + " 請確認欄名與 K 書範本一致，避免整張排班表被當成空白。")
+            logger.warning(message)
             return []
 
         headers = [matrix[header_idx].get(i, "").strip() for i in range(max_col + 1)]
@@ -3765,7 +3768,7 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
     }
     out = {}
     for key, sheet in names.items():
-        out[key] = _xlsx_read_sheet(raw, sheet)
+        out[key] = _xlsx_read_sheet(raw, sheet, require_header=key in {"K書學生", "K書出勤安排"})
     # 目前正式總表沒有「出勤學生」工作表；學生名單直接由「實際課程」建立。
     # 因此「實際課程」是出勤同步的必要來源，其他工作表都是輔助資料。
     if not out["實際課程"]:
@@ -4164,7 +4167,7 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
 
                 cur.execute("SELECT remote_modified_at,remote_checksum,last_success,last_error FROM master_sync_state WHERE id=1")
                 state = cur.fetchone() or {}
-                if meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                if trigger != "manual" and meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
                     if state.get("last_error"):
                         cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
                         conn.commit()
