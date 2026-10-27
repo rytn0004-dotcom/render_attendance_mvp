@@ -3846,7 +3846,10 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
         kid=r.get("K書設定ID",""); name=_canonical_student_name(r.get("學生姓名",""))
         code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
-        if not kid or not name: continue
+        if not kid or not name:
+            if any(str(value or "").strip() for value in raw.values()):
+                counts["errors"].append(f"第 {len([x for x in student_rows[:student_rows.index(raw)]])+3} 筆 K書學生資料缺少 K書設定ID 或學生姓名，未匯入。")
+            continue
 
         # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
         cur.execute("""SELECT s.id,s.name,s.student_code,s.active
@@ -3921,7 +3924,10 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
     for raw in arrangement_rows:
         r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
         aid=r.get("安排ID",""); kid=r.get("K書設定ID","")
-        if not aid or not kid: continue
+        if not aid or not kid:
+            if any(str(value or "").strip() for value in raw.values()):
+                counts["errors"].append(f"有內容的 K 書排班列缺少安排ID或K書設定ID（安排ID={aid or '未填'}），未匯入。")
+            continue
         cur.execute("""SELECT ks.*,s.name AS student_name,s.student_code AS student_code
                        FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
                        WHERE ks.kbook_id=%s""",(kid,))
@@ -3935,7 +3941,14 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         if arrangement_code and arrangement_code != st["student_code"]:
             counts["errors"].append(f"安排 {aid}：系統學生編號與 K書設定ID {kid} 不一致。"); continue
 
-        typ="single" if any(x in r.get("安排類型","") for x in ("單日","指定日期","單次")) else "weekly"
+        schedule_text=r.get("安排類型","").strip()
+        if any(x in schedule_text for x in ("單日","指定日期","單次")):
+            typ="single"
+        elif any(x in schedule_text for x in ("每週","每周","週期","周期","weekly","Weekly")):
+            typ="weekly"
+        else:
+            counts["errors"].append(f"安排 {aid}：安排類型未填或不支援（{schedule_text or '空白'}），請填「每週固定」或「單日」。")
+            continue
         wd=_kbook_weekday(r.get("星期")); sd=_kbook_date(r.get("指定日期（單日安排用）"))
         ed=_kbook_date(r.get("生效日期（每週安排用）"))
         endd=_kbook_date(r.get("結束日期（可留空）"))
