@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.8.5"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4212,7 +4212,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
       OR (a.schedule_type='weekdays' AND %s BETWEEN 0 AND 4 AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
     )
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
-      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s)""",
+      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s))""",
     (d,d,d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
 
     # Independently retire stale default weekday rows when the student is paused,
