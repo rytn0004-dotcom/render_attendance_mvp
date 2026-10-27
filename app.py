@@ -4015,9 +4015,9 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             counts["errors"].append(f"安排 {aid}：安排類型未填或不支援；請選「平日固定」、「每週固定」、「單日」或「單日停用」。")
             continue
         weekday_text=r.get("星期","")
-        specific_text=r.get("指定日期（單日安排用）","")
-        effective_text=r.get("生效日期（每週安排用）","")
-        end_date_text=r.get("結束日期（可留空）","")
+        specific_text=r.get("指定日期（單日安排用）","") or r.get("指定日期","") or r.get("日期","")
+        effective_text=r.get("生效日期（每週安排用）","") or r.get("生效日期","")
+        end_date_text=r.get("結束日期（可留空）","") or r.get("結束日期","")
         wd=_kbook_weekday(weekday_text); sd=_kbook_date(specific_text)
         ed=_kbook_date(effective_text); endd=_kbook_date(end_date_text)
         if specific_text and sd is None:
@@ -4066,7 +4066,7 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
          _kbook_resolve_action(r.get("未離班處理"), st["missing_checkout_action"], "只顯示後台"),
          _truthy_binding(r.get("到班通知家長"),bool(st["notify_checkin"])),
          _truthy_binding(r.get("離班通知家長"),bool(st["notify_checkout"])),
-         _truthy_binding(r.get("安排啟用"),True),r.get("管理備註",""),now_local()))
+         _truthy_binding(r.get("安排啟用") or r.get("啟用"),True),r.get("管理備註",""),now_local()))
         counts["arrangements"]+=1
     return counts
 
