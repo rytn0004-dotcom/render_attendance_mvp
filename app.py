@@ -3891,6 +3891,12 @@ def _kbook_regular_day_matches(schedule_type: str, weekday: int | None) -> bool:
     return schedule_type == "weekly"
 
 
+def _kbook_weekday_enabled(value: Any, has_default_times: bool) -> bool:
+    # When unspecified, complete default times imply a weekday routine;
+    # no times imply this student may be managed only through single-day rows.
+    return _truthy_binding(value, bool(has_default_times))
+
+
 def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "只顯示後台") -> str:
     # 「依當日安排」代表由單筆安排覆寫；若單筆也留空，採不推播的安全預設。
     for value in (primary, student_default):
@@ -3925,7 +3931,7 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
         except (TypeError,ValueError):
             counts["errors"].append(f"{name}：遲到門檻格式錯誤，未同步。"); continue
-        weekday_enabled=_truthy_binding(r.get("平日固定K書") or r.get("平日固定") or r.get("預設平日K書"),True)
+        weekday_flag = r.get("平日固定K書") or r.get("平日固定") or r.get("預設平日K書") or ""
         default_start=_normalize_excel_time(r.get("預計到班時間") or r.get("應到教室時間") or "")
         default_end=_normalize_excel_time(r.get("預計離班時間") or "")
         if default_start or default_end:
@@ -3940,8 +3946,10 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
                 counts["errors"].append(f"{name}：平日預設時段錯誤（{exc}）；已保留學生狀態，但暫不產生平日簽到表。")
                 default_start=None
                 default_end=None
-        elif weekday_enabled and str(r.get("狀態") or "啟用").strip() in {"啟用","啟用中","是","TRUE","true","1"}:
-            counts["errors"].append(f"{name}：已啟用平日固定 K 書，但未填預計到班與離班時間；學生名單已保留，尚不能自動建立每日簽到表。")
+        weekday_enabled=_kbook_weekday_enabled(weekday_flag, bool(default_start and default_end))
+        if (weekday_flag.strip().lower() in {"是","啟用","1","true","yes","y"} and not (default_start and default_end)
+            and str(r.get("狀態") or "啟用").strip() in {"啟用","啟用中","是","TRUE","true","1"}):
+            counts["errors"].append(f"{name}：已明確啟用平日固定 K 書，但預計到班／離班時間未填完整；不會產生平日簽到表，單日排班仍可使用。")
 
         # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
         cur.execute("""SELECT s.id,s.name,s.student_code,s.active
