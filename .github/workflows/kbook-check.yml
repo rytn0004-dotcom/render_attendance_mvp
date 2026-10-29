@@ -226,3 +226,49 @@ jobs:
           )
           print("Disabled-student K-book schedule regression checks passed")
           PY
+      - name: Verify daily K-book generation and fail-closed schedule handling
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+
+          def function_source(name):
+              node = next(
+                  item for item in tree.body
+                  if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and item.name == name
+              )
+              return ast.get_source_segment(source, node)
+
+          run_checks = function_source("run_all_checks")
+          checker = function_source("periodic_checker")
+          startup = function_source("startup")
+          sync_schedules = function_source("_kbook_sync_sheets")
+          admin_page = function_source("admin_kbook")
+
+          assert "_ensure_kbook_courses_today()" in run_checks, (
+              "Background attendance checks must generate today's K-book courses"
+          )
+          assert "await asyncio.sleep(60)" in checker and "run_all_checks" in checker, (
+              "Daily course generation must run through the background checker, not only on page views"
+          )
+          assert 'asyncio.create_task(periodic_checker())' in startup, (
+              "Application startup must register the background attendance checker"
+          )
+          assert "UPDATE kbook_arrangements SET active=FALSE" in sync_schedules, (
+              "An incomplete/invalid source schedule must not leave a stale active database schedule"
+          )
+          assert "缺少預計到班或離班時間；此排班暫停產生簽到表" in sync_schedules, (
+              "Missing times must produce a clear diagnostic and pause the schedule"
+          )
+          assert 'generated_today = _ensure_kbook_courses_for_date(cur,today)' in admin_page, (
+              "K-book admin page should run today's generator and surface the count"
+          )
+          assert "本次頁面檢查：今日已建立或更新" in admin_page, (
+              "K-book admin page should show today's generated/updated course count"
+          )
+          print("Daily K-book generation wiring and fail-closed schedule checks passed")
+          PY
