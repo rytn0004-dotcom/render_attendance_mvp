@@ -4223,6 +4223,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
         AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL)
     )
     AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+    JOIN students s ON s.id=ks.student_id AND s.active=TRUE
     WHERE a.arrangement_id=c.kbook_arrangement_id AND a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
     AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
     AND ((a.schedule_type='single' AND a.specific_date=%s)
