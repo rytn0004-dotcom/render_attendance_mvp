@@ -4123,6 +4123,7 @@ def _ensure_kbook_courses_for_date(cur, d: date) -> int:
     weekday = d.weekday()
     cur.execute("""SELECT a.*,ks.student_id,ks.status AS kstatus,ks.start_date AS ks_start,ks.end_date AS ks_end,
     ks.late_grace_minutes AS ks_grace FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+    JOIN students s ON s.id=ks.student_id AND s.active=TRUE
     WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
     AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
     AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
