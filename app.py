@@ -4082,7 +4082,9 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
         start=_normalize_excel_time(r.get("預計到班時間","")) if typ != "skip" else None
         end=_normalize_excel_time(r.get("預計離班時間","")) if typ != "skip" else None
         if typ != "skip" and (not start or not end):
-            counts["errors"].append(f"安排 {aid}：缺少預計到班或離班時間。"); continue
+            # Fail closed: do not keep an older active database schedule when the source row is now incomplete.
+            cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s AND kbook_id=%s", (now_local(),aid,kid))
+            counts["errors"].append(f"安排 {aid}：缺少預計到班或離班時間；此排班暫停產生簽到表，補齊時間後會自動恢復。"); continue
         if typ in {"weekly","weekdays"} and endd is not None and ed is not None and endd < ed:
             counts["errors"].append(f"安排 {aid}：結束日期早於生效日期。"); continue
         cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
@@ -4097,7 +4099,8 @@ def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
             grace_text=r.get("遲到門檻（分鐘）") or st["late_grace_minutes"]
             grace=max(0,int(float(grace_text))) if grace_text not in (None,"") else None
         except (ValueError,TypeError):
-            counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤（離班時間須晚於到班時間）。"); continue
+            cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s AND kbook_id=%s", (now_local(),aid,kid))
+            counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤（離班時間須晚於到班時間）；此排班暫停產生簽到表，修正後會自動恢復。"); continue
         cur.execute("""INSERT INTO kbook_arrangements
         (arrangement_id,kbook_id,schedule_type,weekday,specific_date,effective_date,end_date,start_time,end_time,late_grace_minutes,
          late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,active,note,updated_at)
