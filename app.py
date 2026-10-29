@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.11"
+APP_VERSION = "0.8.12"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -4545,7 +4545,7 @@ def admin_kbook(_: str = Depends(admin_auth)):
     now=now_local()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            _ensure_kbook_courses_for_date(cur,today)
+            generated_today = _ensure_kbook_courses_for_date(cur,today)
             cur.execute("SELECT * FROM kbook_sync_diagnostics WHERE id=1")
             diag=cur.fetchone()
             cur.execute("""SELECT ks.kbook_id,s.id AS student_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
@@ -4572,6 +4572,14 @@ def admin_kbook(_: str = Depends(admin_auth)):
             arrangements=cur.fetchall()
         conn.commit()
     body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
+    body.append(
+        "<section><h2>每日自動建立簽到表</h2>"
+        "<p>不需要每天新增 K 書學生，也不需要每天手動建立簽到表。系統背景每 60 秒會依已同步的排班，建立或更新當日 K 書課程；主總表則每 "
+        + str(MASTER_SYNC_INTERVAL_MINUTES) + " 分鐘自動檢查是否有更新。"
+        "只有學生與排班均啟用、生效日期已到、且預計到班與預計離班時間都填妥，才會建立每日簽到表；空白時間不會被系統自行猜測。"
+        "若剛修改 Google 總表，可按下方「重新讀取主總表並建立今日簽到表」立即同步。"
+        + f"<br><b>本次頁面檢查：今日已建立或更新 {generated_today} 筆 K 書課程。</b></p></section>"
+    )
     active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
     active_statuses={"啟用","啟用中","是","TRUE","true","1"}
     default_schedule_kids={r["kbook_id"] for r in students if r.get("system_active") and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time") and str(r.get("status")) in active_statuses}
