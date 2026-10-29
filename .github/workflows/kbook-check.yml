@@ -194,7 +194,7 @@ jobs:
                   and isinstance(node.args[0], ast.Constant)
                   and isinstance(node.args[0].value, str)
               ):
-                  sql_statements.append(re.sub(r"\\s+", " ", node.args[0].value))
+                  sql_statements.append(re.sub(r"\s+", " ", node.args[0].value))
 
           explicit_generation = next(
               (sql for sql in sql_statements
