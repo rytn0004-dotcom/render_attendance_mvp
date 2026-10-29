@@ -74,6 +74,7 @@ jobs:
         run: |
           python - <<'PY'
           import app
+          assert app.STATUS_LABELS["completed"] == "已離班", "Completed attendance must display as 離班 in Chinese"
           import ast
           from pathlib import Path
           from datetime import date, timedelta
