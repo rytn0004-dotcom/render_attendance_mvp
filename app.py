@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.10"
+APP_VERSION = "0.8.11"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -106,7 +106,7 @@ WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "�
 STATUS_LABELS = {
     "checked_in": "已到班",
     "late": "遲到",
-    "completed": "已完成",
+    "completed": "已離班",
     "absent": "未到班",
 }
 NOTIFICATION_TYPE_LABELS = {
@@ -1441,7 +1441,7 @@ def scan_student(token: str, selected_course_id: int | None = None) -> dict[str,
                         current_state = f"已於 {record['check_in_time']:%H:%M} 到班"
                     else:
                         action_label = "查看紀錄"
-                        current_state = f"已完成（{record['check_in_time']:%H:%M}–{record['check_out_time']:%H:%M}）"
+                        current_state = f"已離班（{record['check_in_time']:%H:%M}–{record['check_out_time']:%H:%M}）"
                     options.append({
                         "id": item["id"],
                         "name": item.get("course_name") or ("K書" if item.get("source") == "K書" else "一般課程"),
@@ -1832,7 +1832,7 @@ def dashboard(_: str = Depends(admin_auth)):
         a = r["attendance"]
         late = a["late_minutes"] if a else 0
         if a and a["check_out_time"]:
-            status = "<span class='green'>✅ 已完成</span>"
+            status = "<span class='green'>✅ 已離班</span>"
         elif a and a["status"] == "absent" and not a["check_in_time"]:
             status = "<span class='red'>🔴 未到班</span>"
         elif late > r["late_grace_minutes"]:
