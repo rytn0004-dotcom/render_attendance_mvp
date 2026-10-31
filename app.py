@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.8.13"
+APP_VERSION = "0.8.14"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -1038,25 +1038,65 @@ def get_courses_today(cur, student_id: int, work_date: date):
 
 
 def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attendance: dict[int, dict[str, Any]] | None = None):
+    """依時間自動選擇活動；K 書的有效時段優先，不再要求現場手動選課。"""
     if not courses:
         return None
-    # 先優先已經有未離班紀錄的課程。
-    if existing_attendance:
-        for c in courses:
-            a = existing_attendance.get(c["id"])
-            if a and not a["check_out_time"]:
-                return c
+
+    early_minutes = setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES)
     scored = []
-    for c in courses:
-        st = parse_hhmm(c["effective_start"], when.date())
-        en = parse_hhmm(c["effective_end"], when.date()) if c.get("effective_end") else st
-        early = st - timedelta(minutes=setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES))
-        late_end = en + timedelta(minutes=max(c["checkout_grace_minutes"], 60))
-        inside = early <= when <= late_end
-        distance = 0 if inside else abs((when - st).total_seconds())
-        scored.append((0 if inside else 1, distance, st, c))
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    return scored[0][3]
+    for course in courses:
+        start = parse_hhmm(course.get("effective_start") or course.get("start_time"), when.date())
+        end_text = course.get("effective_end") or course.get("end_time")
+        end = parse_hhmm(end_text, when.date()) if end_text else start
+        checkout_minutes = max(60, int(course.get("checkout_grace_minutes") or 0))
+        earliest = start - timedelta(minutes=early_minutes)
+        latest = end + timedelta(minutes=checkout_minutes)
+        in_scan_window = earliest <= when <= latest
+        kbook_active_now = (
+            str(course.get("source") or "").strip() == "K書"
+            and start <= when <= latest
+        )
+        record = (existing_attendance or {}).get(course["id"])
+        has_open_attendance = bool(
+            record and record.get("check_in_time") and not record.get("check_out_time")
+        )
+        if when < earliest:
+            distance = (earliest - when).total_seconds()
+        elif when > latest:
+            distance = (when - latest).total_seconds()
+        else:
+            distance = 0
+
+        # 優先順序：
+        # 1. 已進入有效時段的 K 書（用 K 書排班時間決定要記哪一筆）
+        # 2. 其他尚未離班的既有紀錄（避免遺失簽退）
+        # 3. 落在簽到時間範圍內的其他課程
+        # 4. 最近的下一個／上一個可辨識課程
+        if kbook_active_now:
+            priority = 0
+        elif has_open_attendance:
+            priority = 1
+        elif in_scan_window:
+            priority = 2
+        else:
+            priority = 3
+        scored.append((priority, distance, start, 0 if has_open_attendance else 1, course))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["id"]))
+    return scored[0][4]
+
+
+def extract_scanned_student_token(payload: str) -> str | None:
+    """Accept either the complete /scan/<token> QR URL or a token-only scanner output."""
+    text_value = str(payload or "").strip()
+    if not text_value or len(text_value) > 2048:
+        return None
+    match = re.search(r"(?:^|/)scan/([A-Za-z0-9_-]{12,128})(?:[/?#]|$)", text_value)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,128}", text_value):
+        return text_value
+    return None
 
 
 def log_line_message(cur, event_id: str | None, direction: str, message_type: str,
@@ -1427,31 +1467,7 @@ def scan_student(token: str, selected_course_id: int | None = None) -> dict[str,
             cur.execute("SELECT * FROM attendance WHERE student_id=%s AND date=%s", (student["id"], work_date))
             for a in cur.fetchall():
                 existing[a["course_id"]] = a
-            # 若同一天有一般課程與 K 書，不能只靠時間猜測，否則同一 QR 可能把 K 書簽退誤判成英文課簽退。
-            # 先讓掃描者選擇活動，再針對該活動獨立簽到/離班。
-            if selected_course_id is None and len(courses) > 1:
-                options = []
-                for item in courses:
-                    record = existing.get(item["id"])
-                    if not record or not record.get("check_in_time"):
-                        action_label = "簽到"
-                        current_state = "尚未到班"
-                    elif not record.get("check_out_time"):
-                        action_label = "簽退"
-                        current_state = f"已於 {record['check_in_time']:%H:%M} 到班"
-                    else:
-                        action_label = "查看紀錄"
-                        current_state = f"已離班（{record['check_in_time']:%H:%M}–{record['check_out_time']:%H:%M}）"
-                    options.append({
-                        "id": item["id"],
-                        "name": item.get("course_name") or ("K書" if item.get("source") == "K書" else "一般課程"),
-                        "source": item.get("source") or "實際課程",
-                        "start": item.get("effective_start") or item.get("start_time") or "",
-                        "end": item.get("effective_end") or item.get("end_time") or "",
-                        "action": action_label,
-                        "state": current_state,
-                    })
-                return {"kind": "choose_course", "student": student["name"], "options": options}
+            # 不再要求現場選擇 K 書／一般課程；由 choose_course() 依當下時間自動判斷。
             if selected_course_id is not None:
                 course = next((item for item in courses if int(item["id"]) == int(selected_course_id)), None)
                 if not course:
@@ -4931,41 +4947,98 @@ def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
     return RedirectResponse("/admin", status_code=303)
 
 
+def _scan_result_display(result: dict[str, Any]) -> tuple[str, str, str]:
+    kind = result.get("kind")
+    if kind == "check_in":
+        title = "到班完成"
+        icon = "✅"
+        detail = f"{result['time'][11:16]}｜遲到：{result['late']} 分鐘" if result.get("late", 0) else result["time"][11:16]
+    elif kind == "check_out":
+        title = "離班完成"
+        icon = "👋"
+        detail = f"到班：{result['check_in'][11:16]}｜離班：{result['time'][11:16]}"
+    elif kind == "duplicate":
+        title, icon, detail = "已有紀錄", "ℹ️", str(result.get("message") or "")
+    else:
+        title, icon, detail = str(result.get("message") or "系統訊息"), "⚠️", ""
+    return title, icon, detail
+
+
 @app.get("/scan/{token}", response_class=HTMLResponse)
 def scan(token: str, request: Request, course_id: int | None = None):
     if setting_enabled("教室設備限制", True):
         require_checkin_device(request)
     result = scan_student(token, selected_course_id=course_id)
-    kind = result.get("kind")
-    if kind == "choose_course":
-        options_html = []
-        for item in result["options"]:
-            label = "K 書" if item["source"] == "K書" else item["name"]
-            options_html.append(
-                "<a class='btn' style='display:block;margin:12px auto;max-width:460px;text-align:left;padding:14px' "
-                f"href='/scan/{escape(token)}?course_id={int(item['id'])}'>"
-                f"<b>{escape(label)}</b><br>預計：{escape(str(item['start']))}–{escape(str(item['end']))}"
-                f"<br>{escape(str(item['state']))}｜按此{escape(str(item['action']))}</a>"
-            )
-        body = (
-            "<div style='max-width:600px;margin:40px auto;background:white;border-radius:16px;padding:24px;box-shadow:0 4px 20px #0001'>"
-            "<h1>請選擇此次出勤項目</h1>"
-            f"<h2>{escape(result['student'])}</h2>"
-            "<p>今天有多個課程安排。請先選擇這次要簽到或簽退的項目，英文課與 K 書會分開記錄，避免時間互相混淆。</p>"
-            + "".join(options_html) +
-            "<p class='muted'>選錯項目時，請返回後重新掃描，不要連續掃描其他項目來代替簽退。</p></div>"
-        )
-        return page("選擇出勤項目", body)
-    if kind == "check_in":
-        title = "到班完成"; icon = "✅"; detail = f"{result['time'][11:16]}<br>遲到：{result['late']} 分鐘" if result.get('late', 0) else result['time'][11:16]
-    elif kind == "check_out":
-        title = "離班完成"; icon = "👋"; detail = f"到班：{result['check_in'][11:16]}<br>離班：{result['time'][11:16]}"
-    elif kind == "duplicate":
-        title = "已有紀錄"; icon = "ℹ️"; detail = escape(result["message"])
-    else:
-        title = result.get("message", "系統訊息"); icon = "⚠️"; detail = ""
-    body = f"<div style='max-width:540px;margin:60px auto;background:white;border-radius:16px;padding:28px;text-align:center;box-shadow:0 4px 20px #0001'><div style='font-size:30px'>{icon}</div><h1>{escape(title)}</h1><h2>{escape(result.get('student',''))}</h2><p>{escape(result.get('course',''))}</p><p>{detail}</p><p><a class='btn' href='/admin'>返回管理頁</a></p></div>"
+    title, icon, detail = _scan_result_display(result)
+    body = (
+        "<div style='max-width:540px;margin:60px auto;background:white;border-radius:16px;padding:28px;text-align:center;box-shadow:0 4px 20px #0001'>"
+        f"<div style='font-size:30px'>{icon}</div><h1>{escape(title)}</h1>"
+        f"<h2>{escape(str(result.get('student') or ''))}</h2>"
+        f"<p>{escape(str(result.get('course') or ''))}</p><p>{escape(detail)}</p>"
+        "<p><a class='btn' href='/device/kiosk'>返回 USB 快速掃描</a></p></div>"
+    )
     return page("簽到結果", body)
+
+
+@app.get("/device/kiosk", response_class=HTMLResponse)
+def device_kiosk(request: Request):
+    device = require_checkin_device(request)
+    body = (
+        "<section style='max-width:720px;margin:40px auto;text-align:center'>"
+        "<h1>USB QR 快速簽到</h1>"
+        f"<p>已授權設備：<b>{escape(str(device.get('name') or '教室設備'))}</b></p>"
+        "<div class='alert success'>掃描器讀取學生 QR 後，會自動依排班時間判斷 K 書或一般課程，不需要另外選擇。</div>"
+        "<form id='usb-scan-form' method='post' action='/device/kiosk/scan'>"
+        "<label for='usb-scan-payload'>掃描輸入區</label><br>"
+        "<input id='usb-scan-payload' name='payload' type='text' autofocus autocomplete='off' "
+        "autocapitalize='off' spellcheck='false' placeholder='請把游標留在此處，再掃描學生 QR' "
+        "style='width:100%;max-width:640px;font-size:20px;padding:16px;margin:12px 0' required>"
+        "<br><button class='btn' type='submit'>送出掃描內容</button></form>"
+        "<p class='muted'>建議將 USB 掃描器設定為鍵盤輸入模式，並在每次掃描結尾送出 Enter。掃描完成後畫面會自動回到輸入框，可連續掃描下一位。</p>"
+        "<p><a class='btn btn2' href='/device'>返回設備首頁</a></p></section>"
+        "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
+        "let t=null;i.addEventListener('input',function(){if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(function(){if(i.value.trim())f.requestSubmit();},350);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();if(i.value.trim())f.requestSubmit();}});"
+        "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
+    )
+    return page("USB QR 快速簽到", body)
+
+
+@app.post("/device/kiosk/scan", response_class=HTMLResponse)
+def device_kiosk_scan(request: Request, payload: str = Form(...)):
+    device = require_checkin_device(request)
+    token = extract_scanned_student_token(payload)
+    if not token:
+        result = {"kind": "error", "message": "無法辨識掃描內容。請確認掃描器讀取的是學生 QR 碼，而不是設備配對 QR。"}
+    else:
+        try:
+            result = scan_student(token)
+        except HTTPException as exc:
+            result = {"kind": "error", "message": str(exc.detail)}
+
+    title, icon, detail = _scan_result_display(result)
+    body = (
+        "<section style='max-width:720px;margin:30px auto;text-align:center'>"
+        "<h1>USB QR 快速簽到</h1>"
+        f"<p>設備：<b>{escape(str(device.get('name') or '教室設備'))}</b></p>"
+        f"<div class='alert {'success' if result.get('kind') in {'check_in','check_out'} else ''}'>"
+        f"<div style='font-size:28px'>{icon}</div><h2>{escape(title)}</h2>"
+        f"<h3>{escape(str(result.get('student') or ''))}</h3>"
+        f"<p>{escape(str(result.get('course') or ''))}</p><p>{escape(detail)}</p></div>"
+        "<form id='usb-scan-form' method='post' action='/device/kiosk/scan'>"
+        "<label for='usb-scan-payload'>下一筆掃描</label><br>"
+        "<input id='usb-scan-payload' name='payload' type='text' autofocus autocomplete='off' "
+        "autocapitalize='off' spellcheck='false' placeholder='準備掃描下一位學生' "
+        "style='width:100%;max-width:640px;font-size:20px;padding:16px;margin:12px 0' required>"
+        "<br><button class='btn' type='submit'>送出掃描內容</button></form>"
+        "<p class='muted'>掃描器請設定為鍵盤輸入模式，建議每次掃描後送出 Enter；也支援掃描輸入停止後自動送出。</p>"
+        "<p><a class='btn btn2' href='/device'>設備首頁</a></p></section>"
+        "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
+        "let t=null;i.addEventListener('input',function(){if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(function(){if(i.value.trim())f.requestSubmit();},350);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();if(i.value.trim())f.requestSubmit();}});"
+        "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
+    )
+    return page("USB QR 快速簽到", body)
 
 
 @app.get("/admin/devices", response_class=HTMLResponse)
@@ -5038,7 +5111,7 @@ def device_pair_confirm(code: str = Form(...)):
 @app.get("/device", response_class=HTMLResponse)
 def device_home(request: Request):
     device = require_checkin_device(request)
-    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>現在可以用這支教室手機的內建相機掃描學生 QR。這就是正式的教室簽到設備，不需要電腦。</p><p class='mini muted'>如果清除瀏覽器 Cookie、換瀏覽器或換手機，需要重新配對；只要這支手機的這個瀏覽器保持登入配對即可。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
+    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>可使用手機相機直接掃描學生 QR，也可以使用 USB QR 掃描器連接電腦。</p><p><a class='btn' href='/device/kiosk'>開啟 USB QR 快速掃描</a></p><p class='mini muted'>USB 掃描器請設為鍵盤輸入模式，建議掃描結尾送出 Enter。若清除瀏覽器 Cookie、換瀏覽器或換設備，需要重新配對。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
     return page("教室簽到設備", body)
 
 
