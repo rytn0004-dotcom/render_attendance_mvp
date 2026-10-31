@@ -277,10 +277,9 @@ jobs:
           python - <<'PY'
           import app
           from datetime import datetime, timedelta
-          from zoneinfo import ZoneInfo
 
           app.setting_int = lambda key, fallback: fallback
-          when = datetime(2026, 10, 31, 17, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+          when = datetime(2026, 10, 31, 17, 30)
           general = {
               "id": 1, "source": "實際課程", "course_name": "英文",
               "effective_start": "17:00", "effective_end": "19:00",
@@ -294,6 +293,11 @@ jobs:
 
           chosen = app.choose_course([general, kbook], when, {})
           assert chosen["source"] == "K書", "K書 must take priority during its active time window"
+
+          early_scan = datetime(2026, 10, 31, 16, 30)
+          assert app.choose_course([general, kbook], early_scan, {})["source"] == "K書", (
+              "K書 must also take priority during the configured early-scan window"
+          )
 
           completed_kbook = {
               2: {"check_in_time": when - timedelta(hours=1), "check_out_time": when - timedelta(minutes=5)}
