@@ -30,7 +30,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Depends, UploadFile, 
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-APP_VERSION = "0.7.7"
+APP_VERSION = "0.8.14"
 logger = logging.getLogger("attendance")
 LINE_MODE = os.getenv("LINE_MODE", "live").strip().lower()
 if LINE_MODE in {"production", "prod", "正式"}:
@@ -106,7 +106,7 @@ WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "�
 STATUS_LABELS = {
     "checked_in": "已到班",
     "late": "遲到",
-    "completed": "已完成",
+    "completed": "已離班",
     "absent": "未到班",
 }
 NOTIFICATION_TYPE_LABELS = {
@@ -456,9 +456,12 @@ def sync_individual_templates_from_excel(cur, rows: list[dict[str, Any]]) -> int
     return imported
 
 
-def init_db() -> None:
+def _init_db_once() -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Serialize startup DDL/migrations across overlapping Render instances.
+            # Acquire this transaction-scoped lock before any CREATE/ALTER TABLE.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (731084108221,))
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS students (
@@ -628,6 +631,57 @@ def init_db() -> None:
             )
             ensure_notification_template_schema(cur)
             ensure_core_compat_schema(cur)
+            cur.execute("""
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_arrangement_id TEXT;
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_late_action TEXT;
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_absent_action TEXT;
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_missing_checkout_action TEXT;
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_notify_checkin BOOLEAN NOT NULL DEFAULT TRUE;
+                ALTER TABLE courses ADD COLUMN IF NOT EXISTS kbook_notify_checkout BOOLEAN NOT NULL DEFAULT TRUE;
+                CREATE TABLE IF NOT EXISTS kbook_student_settings (
+                    kbook_id TEXT PRIMARY KEY, student_id BIGINT NOT NULL REFERENCES students(id),
+                    status TEXT NOT NULL DEFAULT '啟用', start_date DATE, end_date DATE,
+                    late_grace_minutes INTEGER,
+                    weekday_schedule_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    default_start_time TEXT,
+                    default_end_time TEXT,
+                    late_action TEXT NOT NULL DEFAULT '依當日安排',
+                    absent_action TEXT NOT NULL DEFAULT '依當日安排',
+                    missing_checkout_action TEXT NOT NULL DEFAULT '只顯示後台',
+                    notify_checkin BOOLEAN NOT NULL DEFAULT TRUE, notify_checkout BOOLEAN NOT NULL DEFAULT TRUE,
+                    note TEXT, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS kbook_arrangements (
+                    arrangement_id TEXT PRIMARY KEY,
+                    kbook_id TEXT NOT NULL REFERENCES kbook_student_settings(kbook_id),
+                    schedule_type TEXT NOT NULL, weekday INTEGER, specific_date DATE, effective_date DATE, end_date DATE,
+                    start_time TEXT, end_time TEXT, late_grace_minutes INTEGER,
+                    late_action TEXT NOT NULL DEFAULT '只提醒', absent_action TEXT NOT NULL DEFAULT '只顯示後台',
+                    missing_checkout_action TEXT NOT NULL DEFAULT '只顯示後台',
+                    notify_checkin BOOLEAN NOT NULL DEFAULT TRUE, notify_checkout BOOLEAN NOT NULL DEFAULT TRUE,
+                    active BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                ALTER TABLE kbook_arrangements ALTER COLUMN start_time DROP NOT NULL;
+                ALTER TABLE kbook_arrangements ALTER COLUMN end_time DROP NOT NULL;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS weekday_schedule_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS default_start_time TEXT;
+                ALTER TABLE kbook_student_settings ADD COLUMN IF NOT EXISTS default_end_time TEXT;
+                CREATE INDEX IF NOT EXISTS idx_kbook_arrangements_active ON kbook_arrangements(active, weekday, specific_date);
+                CREATE INDEX IF NOT EXISTS idx_courses_kbook_date ON courses(source, course_date, active);
+                CREATE TABLE IF NOT EXISTS kbook_sync_diagnostics (
+                    id INTEGER PRIMARY KEY,
+                    last_sync_at TIMESTAMP,
+                    student_sheet_present BOOLEAN NOT NULL DEFAULT FALSE,
+                    arrangement_sheet_present BOOLEAN NOT NULL DEFAULT FALSE,
+                    student_source_rows INTEGER NOT NULL DEFAULT 0,
+                    arrangement_source_rows INTEGER NOT NULL DEFAULT 0,
+                    students_imported INTEGER NOT NULL DEFAULT 0,
+                    arrangements_imported INTEGER NOT NULL DEFAULT 0,
+                    errors_count INTEGER NOT NULL DEFAULT 0,
+                    errors_text TEXT,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
             _merge_student_name_aliases(cur)
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_student_line_binding ON student_line_bindings(student_id, line_user_id) WHERE active=TRUE")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_student_line_user ON student_line_bindings(line_user_id) WHERE active=TRUE")
@@ -649,6 +703,27 @@ def init_db() -> None:
                 )
             load_runtime_settings(cur)
         conn.commit()
+
+
+def init_db() -> None:
+    """Initialize schema with advisory locking and retry transient DDL deadlocks."""
+    max_attempts = 5
+    retryable_sqlstates = {"40P01", "40001", "55P03"}  # deadlock, serialization, lock timeout/unavailable
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _init_db_once()
+            return
+        except psycopg.Error as exc:
+            sqlstate = getattr(exc, "sqlstate", None)
+            if sqlstate not in retryable_sqlstates or attempt >= max_attempts:
+                logger.exception("Database initialization failed (attempt %s/%s)", attempt, max_attempts)
+                raise
+            delay_seconds = min(0.5 * (2 ** (attempt - 1)), 4.0)
+            logger.warning(
+                "Database initialization lock conflict (SQLSTATE %s); retrying attempt %s/%s in %.1fs",
+                sqlstate, attempt + 1, max_attempts, delay_seconds,
+            )
+            time.sleep(delay_seconds)
 
 
 def seed_demo_data(cur) -> None:
@@ -944,11 +1019,12 @@ def get_student(cur, token: str):
 
 
 def get_courses_today(cur, student_id: int, work_date: date):
-    """出勤唯一課程來源：總表「實際課程」同步進來的日課程。"""
+    """讀取當日一般課程與獨立 K 書安排；每筆活動維持獨立出勤紀錄。"""
     cur.execute(
         """SELECT * FROM courses
            WHERE student_id=%s AND course_date=%s AND active=TRUE
-             AND actual_course_id IS NOT NULL AND COALESCE(source, '實際課程')='實際課程'
+             AND actual_course_id IS NOT NULL
+             AND COALESCE(source, '實際課程') IN ('實際課程','K書')
            ORDER BY start_time, id""",
         (student_id, work_date),
     )
@@ -962,25 +1038,66 @@ def get_courses_today(cur, student_id: int, work_date: date):
 
 
 def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attendance: dict[int, dict[str, Any]] | None = None):
+    """依時間自動選擇活動；K 書的有效時段優先，不再要求現場手動選課。"""
     if not courses:
         return None
-    # 先優先已經有未離班紀錄的課程。
-    if existing_attendance:
-        for c in courses:
-            a = existing_attendance.get(c["id"])
-            if a and not a["check_out_time"]:
-                return c
+
+    early_minutes = setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES)
     scored = []
-    for c in courses:
-        st = parse_hhmm(c["effective_start"], when.date())
-        en = parse_hhmm(c["effective_end"], when.date()) if c.get("effective_end") else st
-        early = st - timedelta(minutes=setting_int("提前簽到（分鐘）", CHECKIN_EARLY_MINUTES))
-        late_end = en + timedelta(minutes=max(c["checkout_grace_minutes"], 60))
-        inside = early <= when <= late_end
-        distance = 0 if inside else abs((when - st).total_seconds())
-        scored.append((0 if inside else 1, distance, st, c))
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    return scored[0][3]
+    for course in courses:
+        start = parse_hhmm(course.get("effective_start") or course.get("start_time"), when.date())
+        end_text = course.get("effective_end") or course.get("end_time")
+        end = parse_hhmm(end_text, when.date()) if end_text else start
+        checkout_minutes = max(60, int(course.get("checkout_grace_minutes") or 0))
+        earliest = start - timedelta(minutes=early_minutes)
+        latest = end + timedelta(minutes=checkout_minutes)
+        in_scan_window = earliest <= when <= latest
+        record = (existing_attendance or {}).get(course["id"])
+        has_open_attendance = bool(
+            record and record.get("check_in_time") and not record.get("check_out_time")
+        )
+        kbook_active_now = (
+            str(course.get("source") or "").strip() == "K書"
+            and earliest <= when <= latest
+            and not (record and record.get("check_out_time"))
+        )
+        if when < earliest:
+            distance = (earliest - when).total_seconds()
+        elif when > latest:
+            distance = (when - latest).total_seconds()
+        else:
+            distance = 0
+
+        # 優先順序：
+        # 1. 已進入有效時段的 K 書（用 K 書排班時間決定要記哪一筆）
+        # 2. 其他尚未離班的既有紀錄（避免遺失簽退）
+        # 3. 落在簽到時間範圍內的其他課程
+        # 4. 最近的下一個／上一個可辨識課程
+        if kbook_active_now:
+            priority = 0
+        elif has_open_attendance:
+            priority = 1
+        elif in_scan_window:
+            priority = 2
+        else:
+            priority = 3
+        scored.append((priority, distance, start, 0 if has_open_attendance else 1, course))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["id"]))
+    return scored[0][4]
+
+
+def extract_scanned_student_token(payload: str) -> str | None:
+    """Accept either the complete /scan/<token> QR URL or a token-only scanner output."""
+    text_value = str(payload or "").strip()
+    if not text_value or len(text_value) > 2048:
+        return None
+    match = re.search(r"(?:^|/)scan/([A-Za-z0-9_-]{12,128})(?:[/?#]|$)", text_value)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,128}", text_value):
+        return text_value
+    return None
 
 
 def log_line_message(cur, event_id: str | None, direction: str, message_type: str,
@@ -1329,11 +1446,12 @@ def missing_checkout_message(row: dict[str, Any], now: datetime) -> str:
     return f"🔴 未完成離班簽到\n\n{row['name']}\n課程：{row['course_name']}\n到班：{row['check_in_time']:%H:%M}\n原定下課：{row['effective_end']}\n截至 {now:%H:%M} 尚未完成離班簽到。"
 
 
-def scan_student(token: str) -> dict[str, Any]:
+def scan_student(token: str, selected_course_id: int | None = None) -> dict[str, Any]:
     when = now_local()
     work_date = when.date()
     with db_conn() as conn:
         with conn.cursor() as cur:
+            _ensure_kbook_courses_for_date(cur, work_date)
             student = get_student(cur, token)
             if not student:
                 raise HTTPException(status_code=404, detail="無效 QR Code")
@@ -1350,7 +1468,13 @@ def scan_student(token: str) -> dict[str, Any]:
             cur.execute("SELECT * FROM attendance WHERE student_id=%s AND date=%s", (student["id"], work_date))
             for a in cur.fetchall():
                 existing[a["course_id"]] = a
-            course = choose_course(courses, when, existing)
+            # 不再要求現場選擇 K 書／一般課程；由 choose_course() 依當下時間自動判斷。
+            if selected_course_id is not None:
+                course = next((item for item in courses if int(item["id"]) == int(selected_course_id)), None)
+                if not course:
+                    return {"kind": "error", "student": student["name"], "message": "選擇的課程不屬於這位學生今天的有效安排，沒有寫入簽到紀錄。"}
+            else:
+                course = choose_course(courses, when, existing)
             if not course:
                 return {"kind": "error", "student": student["name"], "message": "今天沒有可用課程。"}
 
@@ -1402,15 +1526,18 @@ def scan_student(token: str) -> dict[str, Any]:
                         "UPDATE attendance SET check_out_time=%s,status='completed',last_scan_time=%s,updated_at=%s WHERE id=%s",
                         (when, when, when, attendance_id),
                     )
-                    send_student_template_line(cur, attendance_id, student, course, "check_out", check_in_time=attendance["check_in_time"], check_out_time=when, when=when, legacy_line_user_id=student["line_user_id"])
+                    if _kbook_notify(course, "check_out"):
+                        send_student_template_line(cur, attendance_id, student, course, "check_out", check_in_time=attendance["check_in_time"], check_out_time=when, when=when, legacy_line_user_id=student["line_user_id"])
                     conn.commit()
                     return {"kind": "check_out", "student": student["name"], "course": course["course_name"], "time": iso(when), "check_in": iso(attendance["check_in_time"])}
 
             # 到班通知（含原本先未到、後來補打卡的情況）
             cur.execute("SELECT * FROM attendance WHERE id=%s", (attendance_id,))
             final_a = cur.fetchone()
-            send_student_template_line(cur, attendance_id, student, course, "check_in", check_in_time=final_a["check_in_time"], when=final_a["check_in_time"], legacy_line_user_id=student["line_user_id"])
-            if final_a["late_minutes"] > course["late_grace_minutes"] and not final_a["late_notified_at"]:
+            if _kbook_notify(course, "check_in"):
+                send_student_template_line(cur, attendance_id, student, course, "check_in", check_in_time=final_a["check_in_time"], when=final_a["check_in_time"], legacy_line_user_id=student["line_user_id"])
+            late_action = str(course.get("kbook_late_action") or "只提醒") if course.get("source") == "K書" else "通知"
+            if final_a["late_minutes"] > course["late_grace_minutes"] and not final_a["late_notified_at"] and late_action not in {"停用", "只顯示後台", "不提醒", "關閉"}:
                 sent = send_admin_template_line(cur, attendance_id, student, course, "late", check_in_time=final_a["check_in_time"], when=when, late_minutes=final_a["late_minutes"])
                 if sent:
                     cur.execute("UPDATE attendance SET late_notified_at=%s WHERE id=%s", (when, attendance_id))
@@ -1431,13 +1558,20 @@ def check_scheduled_absences() -> int:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.absent.checker')) AS locked")
             if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute("SELECT c.*, s.name, s.active AS student_active FROM courses c JOIN students s ON s.id=c.student_id WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' AND s.active=TRUE ORDER BY c.start_time,c.id", (work_date,))
+            cur.execute("SELECT c.*, s.name, s.active AS student_active FROM courses c JOIN students s ON s.id=c.student_id WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書') AND s.active=TRUE ORDER BY c.start_time,c.id", (work_date,))
             threshold = setting_int("未到班通知（分鐘）", DEFAULT_LATE_GRACE_MINUTES)
             for course in cur.fetchall():
+                if course.get("source") == "K書" and str(course.get("kbook_absent_action") or "只顯示後台") not in {"通知", "提醒", "通知管理員", "通知家長及管理員"}:
+                    continue
                 eff = effective_schedule(cur, course, work_date)
                 if not eff:
                     continue
-                if now < parse_hhmm(eff["effective_start"], work_date) + timedelta(minutes=threshold):
+                threshold_minutes = (
+                    max(0, int(course.get("late_grace_minutes") or 0))
+                    if course.get("source") == "K書"
+                    else threshold
+                )
+                if now < parse_hhmm(eff["effective_start"], work_date) + timedelta(minutes=threshold_minutes):
                     continue
                 cur.execute("INSERT INTO attendance(student_id,course_id,date,status,updated_at) VALUES (%s,%s,%s,'absent',%s) ON CONFLICT(student_id,course_id,date) DO NOTHING RETURNING id", (course["student_id"],course["id"],work_date,now))
                 inserted = cur.fetchone()
@@ -1491,13 +1625,15 @@ def check_missing_checkout() -> int:
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext('attendance.missing_checkout.checker')) AS locked")
             if not cur.fetchone()["locked"]:
                 return 0
-            cur.execute("SELECT a.*,s.name,c.course_name,c.start_time,c.end_time,c.checkout_grace_minutes FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL AND a.missing_checkout_notified_at IS NULL AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程' FOR UPDATE OF a SKIP LOCKED",(work_date,))
+            cur.execute("SELECT a.*,s.name,c.course_name,c.start_time,c.end_time,c.checkout_grace_minutes FROM attendance a JOIN students s ON s.id=a.student_id JOIN courses c ON c.id=a.course_id WHERE a.date=%s AND a.check_in_time IS NOT NULL AND a.check_out_time IS NULL AND a.missing_checkout_notified_at IS NULL AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書') FOR UPDATE OF a SKIP LOCKED",(work_date,))
             for row in cur.fetchall():
                 if row.get("last_missing_checkout_attempt_at") and now-row["last_missing_checkout_attempt_at"] < timedelta(minutes=NOTIFICATION_RETRY_COOLDOWN_MINUTES):
                     continue
                 cur.execute("SELECT * FROM courses WHERE id=%s",(row["course_id"],))
                 course=cur.fetchone()
                 if not course: continue
+                if course.get("source") == "K書" and str(course.get("kbook_missing_checkout_action") or "只顯示後台") not in {"通知", "提醒", "通知管理員", "通知家長及管理員"}:
+                    continue
                 eff=effective_schedule(cur,course,work_date)
                 if not eff or not eff.get("effective_end") or now < parse_hhmm(eff["effective_end"],work_date)+timedelta(minutes=eff["checkout_grace_minutes"]):
                     continue
@@ -1532,7 +1668,11 @@ def check_missing_checkout() -> int:
 
 
 def run_all_checks() -> dict[str, int]:
-    result = {"absent": 0, "missing_checkout": 0}
+    result = {"absent": 0, "missing_checkout": 0, "kbook_courses": 0}
+    try:
+        result["kbook_courses"] = _ensure_kbook_courses_today()
+    except Exception:
+        logger.exception("K書今日安排產生失敗")
     try:
         result["absent"] = check_scheduled_absences()
     except Exception:
@@ -1577,7 +1717,7 @@ input,select,textarea{{padding:7px 8px;border:1px solid #d1d5db;border-radius:7p
 
 
 def admin_nav() -> str:
-    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/tomorrow'>明日簽到表</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
+    return "<div class='nav'><a class='btn btn2' href='/admin'>今日出勤</a><a class='btn btn2' href='/admin/tomorrow'>明日簽到表</a><a class='btn btn2' href='/admin/courses'>實際課程</a><a class='btn btn2' href='/admin/line'>LINE 綁定 / 測試</a><a class='btn btn2' href='/admin/logs'>訊息紀錄</a><a class='btn btn2' href='/admin/devices'>教室設備</a><a class='btn btn2' href='/admin/templates'>通知範本</a><a class='btn btn2' href='/admin/master-sync'>總表同步</a><a class='btn btn2' href='/admin/kbook'>K書出勤</a><a class='btn btn2' href='/admin/export.csv'>匯出 CSV</a></div>"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1641,7 +1781,7 @@ def dashboard(_: str = Depends(admin_auth)):
                 """
                 SELECT c.*, s.name, s.student_code, s.line_user_id
                 FROM courses c JOIN students s ON s.id=c.student_id
-                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程')='實際課程'
+                WHERE c.course_date=%s AND c.active=TRUE AND c.actual_course_id IS NOT NULL AND COALESCE(c.source,'實際課程') IN ('實際課程','K書')
                 ORDER BY c.start_time, s.name
                 """,
                 (today,),
@@ -1709,13 +1849,15 @@ def dashboard(_: str = Depends(admin_auth)):
         a = r["attendance"]
         late = a["late_minutes"] if a else 0
         if a and a["check_out_time"]:
-            status = "<span class='green'>✅ 已完成</span>"
+            status = "<span class='green'>✅ 已離班</span>"
         elif a and a["status"] == "absent" and not a["check_in_time"]:
             status = "<span class='red'>🔴 未到班</span>"
         elif late > r["late_grace_minutes"]:
             status = "<span class='orange'>🟠 遲到</span>"
         elif a and a["check_in_time"]:
             status = "<span class='gray'>✅ 已到班</span>"
+        elif r.get("source") == "K書" and now_local() > parse_hhmm(r["effective_start"], today) + timedelta(minutes=int(r.get("late_grace_minutes") or 0)):
+            status = "<span class='orange'>尚未到班（已超過門檻）</span>"
         else:
             status = "<span class='gray'>尚未掃描</span>"
         actions = []
@@ -3103,7 +3245,7 @@ def _xlsx_col_index(ref: str) -> int:
     return n - 1
 
 
-def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
+def _xlsx_read_sheet(raw: bytes, target_name: str, require_header: bool = False) -> list[dict[str, str]]:
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
         ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -3162,12 +3304,24 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
             "學生姓名/關聯", "LINE User ID", "LINE ID", "LINE_ID", "關係",
             "家長提醒", "啟用", "簽到識別碼", "下課時間（出勤用）", "開始時間（出勤用）",
             "通知類型", "預設訊息範本", "個別訊息範本", "套用方式", "剩餘次數", "有效至",
-            "設定項目", "目前值", "用途", "說明"
+            "設定項目", "目前值", "用途", "說明",
+            "K書設定ID", "安排ID", "安排類型", "指定日期（單日安排用）",
+            "系統學生編號（對應出勤學生）", "學生姓名（核對用）",
+            "生效日期（每週安排用）", "結束日期（可留空）", "預計到班時間",
+            "預計離班時間", "遲到門檻（分鐘）", "遲到處理", "未到班處理",
+            "未離班處理", "到班通知家長", "離班通知家長", "安排啟用",
+            "狀態", "開始使用日", "開始日期", "停用日期", "遲到門檻（分鐘；空白沿用全域）",
+            "遲到處理預設", "未到班處理預設", "未離班處理預設",
+            "到班通知家長預設", "離班通知家長預設",
+            "平日固定K書", "平日固定", "預設平日K書",
+            "預計到班時間", "預計離班時間", "應到教室時間"
         }
         # 不再限制標題只能出現在前 10 列。總表有些工作表在正式欄位前會有較長的說明／標題區，
         # 若硬限制前 10 列，可能把資料列誤當成標題，最後造成例如「出勤學生」讀取 0 筆。
         # 依工作表用途提高標題辨識精準度，並掃描整張工作表。
         preferred_headers = {
+            "K書學生": {"K書設定ID", "學生姓名", "狀態"},
+            "K書出勤安排": {"安排ID", "K書設定ID", "安排類型", "預計到班時間", "預計離班時間"},
             "出勤學生": {"學生編號", "學生姓名", "姓名", "簽到識別碼", "簽到啟用", "到班通知", "離班通知", "異常通知"},
             "出勤LINE綁定": {"學生編號", "學生姓名", "LINE User ID", "LINE ID", "LINE_ID", "關係", "家長提醒", "啟用"},
             "聯絡人": {"姓名", "身分", "LINE User ID", "LINE ID", "學生姓名/關聯（可多位）", "學生姓名/關聯"},
@@ -3188,7 +3342,10 @@ def _xlsx_read_sheet(raw: bytes, target_name: str) -> list[dict[str, str]]:
                 header_idx = i
 
         if best_score < 0:
-            logger.warning("Excel sheet %s 找不到可辨識的標題列；共讀取 %s 列。", target_name, len(matrix))
+            message = f"Excel 工作表「{target_name}」找不到可辨識的標題列；共讀取 {len(matrix)} 列。"
+            if require_header:
+                raise RuntimeError(message + " 請確認欄名與 K 書範本一致，避免整張排班表被當成空白。")
+            logger.warning(message)
             return []
 
         headers = [matrix[header_idx].get(i, "").strip() for i in range(max_col + 1)]
@@ -3671,10 +3828,22 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
         "出勤設定": "出勤設定",
         "出勤通知模板": "出勤通知模板",
         "出勤通知個別": "出勤通知個別",
+        "K書學生": "K書學生",
+        "K書出勤安排": "K書出勤安排",
+    }
+    with zipfile.ZipFile(io.BytesIO(raw)) as workbook_zip:
+        workbook_root = ET.fromstring(workbook_zip.read("xl/workbook.xml"))
+    workbook_names = {
+        str(sheet.attrib.get("name") or "")
+        for sheet in workbook_root.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheets/{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet")
     }
     out = {}
     for key, sheet in names.items():
-        out[key] = _xlsx_read_sheet(raw, sheet)
+        out[key] = _xlsx_read_sheet(raw, sheet, require_header=key in {"K書學生", "K書出勤安排"})
+    out["_kbook_source_meta"] = [{
+        "student_sheet_present": "K書學生" in workbook_names,
+        "arrangement_sheet_present": "K書出勤安排" in workbook_names,
+    }]
     # 目前正式總表沒有「出勤學生」工作表；學生名單直接由「實際課程」建立。
     # 因此「實際課程」是出勤同步的必要來源，其他工作表都是輔助資料。
     if not out["實際課程"]:
@@ -3685,6 +3854,450 @@ def _load_master_workbook_sheets(raw: bytes) -> dict[str, list[dict[str, Any]]]:
         len(out["出勤設定"]), len(out["出勤通知模板"]), len(out["出勤通知個別"])
     )
     return out
+
+
+
+def _kbook_date(v: Any) -> date | None:
+    t=str(v or "").strip()
+    if not t: return None
+    for fmt in ("%Y-%m-%d","%Y/%m/%d","%Y.%m.%d","%Y-%m-%d %H:%M:%S"):
+        try: return datetime.strptime(t[:19],fmt).date()
+        except ValueError: pass
+    try:
+        n=float(t)
+        if 30000 <= n <= 100000: return date(1899,12,30)+timedelta(days=int(n))
+    except (TypeError,ValueError,OverflowError): pass
+    return None
+
+
+def _kbook_weekday(v: Any) -> int | None:
+    t=str(v or "").strip()
+    aliases={"星期一":0,"週一":0,"周一":0,"一":0,"星期二":1,"週二":1,"周二":1,"二":1,
+    "星期三":2,"週三":2,"周三":2,"三":2,"星期四":3,"週四":3,"周四":3,"四":3,
+    "星期五":4,"週五":4,"周五":4,"五":4,"星期六":5,"週六":5,"周六":5,"六":5,
+    "星期日":6,"星期天":6,"週日":6,"週天":6,"周日":6,"日":6,"天":6}
+    if t in aliases: return aliases[t]
+    try:
+        n=int(float(t))
+        return n-1 if 1 <= n <= 7 else (0 if n == 0 else None)
+    except (TypeError,ValueError): return None
+
+
+def _kbook_schedule_type(value: Any) -> str | None:
+    text_value = str(value or "").strip().lower().replace(" ", "")
+    if not text_value:
+        return None
+    # One-day stop rows are enabled exceptions: enabled means this one date is excluded.
+    if "停用" in text_value and any(token in text_value for token in ("單日", "指定日期", "單次")):
+        return "skip"
+    if any(token in text_value for token in ("平日", "週一至週五", "周一至周五", "週一到週五", "周一到周五",
+                                             "週一～週五", "週一-週五", "工作日", "weekdays")):
+        return "weekdays"
+    if any(token in text_value for token in ("單日", "指定日期", "單次")):
+        return "single"
+    if any(token in text_value for token in ("每週", "每周", "週期", "周期", "weekly")):
+        return "weekly"
+    return None
+
+
+def _kbook_regular_day_matches(schedule_type: str, weekday: int | None) -> bool:
+    if weekday is None or not 0 <= weekday <= 6:
+        return False
+    if schedule_type == "weekdays":
+        return weekday <= 4
+    return schedule_type == "weekly"
+
+
+def _kbook_weekday_enabled(value: Any, has_default_times: bool) -> bool:
+    # When unspecified, complete default times imply a weekday routine;
+    # no times imply this student may be managed only through single-day rows.
+    return _truthy_binding(value, bool(has_default_times))
+
+
+def _kbook_resolve_action(primary: Any, student_default: Any, fallback: str = "只顯示後台") -> str:
+    # 「依當日安排」代表由單筆安排覆寫；若單筆也留空，採不推播的安全預設。
+    for value in (primary, student_default):
+        text_value = str(value or "").strip()
+        if text_value and text_value not in {"依當日安排", "依學生設定"}:
+            return text_value
+    return fallback
+
+
+def _kbook_sync_sheets(cur, student_rows, arrangement_rows):
+    counts={"students":0,"arrangements":0,"drafts":0,"errors":[]}
+    for row_number, raw in enumerate(student_rows, start=3):
+        r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
+        kid=r.get("K書設定ID",""); name=_canonical_student_name(r.get("學生姓名",""))
+        code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
+        if not kid or not name:
+            if any(str(value or "").strip() for value in raw.values()):
+                counts["errors"].append(f"工作表第 {row_number} 列 K書學生資料缺少 K書設定ID 或學生姓名，未匯入。")
+            continue
+
+        start_text=r.get("開始使用日","") or r.get("開始日期","")
+        stop_text=r.get("停用日期","")
+        start_date=_kbook_date(start_text)
+        stop_date=_kbook_date(stop_text)
+        if start_text and start_date is None:
+            counts["errors"].append(f"{name}：開始日期格式無法辨識，未同步。"); continue
+        if stop_text and stop_date is None:
+            counts["errors"].append(f"{name}：停用日期格式無法辨識，未同步。"); continue
+        if start_date and stop_date and stop_date <= start_date:
+            counts["errors"].append(f"{name}：停用日期必須晚於開始日期，未同步。"); continue
+        try:
+            grace=max(0,int(float(r["遲到門檻（分鐘；空白沿用全域）"]))) if r.get("遲到門檻（分鐘；空白沿用全域）") else None
+        except (TypeError,ValueError):
+            counts["errors"].append(f"{name}：遲到門檻格式錯誤，未同步。"); continue
+        weekday_flag = r.get("平日固定K書") or r.get("平日固定") or r.get("預設平日K書") or ""
+        default_start=_normalize_excel_time(r.get("預計到班時間") or r.get("應到教室時間") or "")
+        default_end=_normalize_excel_time(r.get("預計離班時間") or "")
+        if default_start or default_end:
+            try:
+                if not default_start or not default_end:
+                    raise ValueError("到班與離班時間必須一起填寫")
+                parse_hhmm(default_start,now_local().date())
+                parse_hhmm(default_end,now_local().date())
+                if default_end <= default_start:
+                    raise ValueError("預計離班時間須晚於預計到班時間")
+            except ValueError as exc:
+                counts["errors"].append(f"{name}：平日預設時段錯誤（{exc}）；已保留學生狀態，但暫不產生平日簽到表。")
+                default_start=None
+                default_end=None
+        weekday_enabled=_kbook_weekday_enabled(weekday_flag, bool(default_start and default_end))
+        if (weekday_flag.strip().lower() in {"是","啟用","1","true","yes","y"} and not (default_start and default_end)
+            and str(r.get("狀態") or "啟用").strip() in {"啟用","啟用中","是","TRUE","true","1"}):
+            counts["errors"].append(f"{name}：已明確啟用平日固定 K 書，但預計到班／離班時間未填完整；不會產生平日簽到表，單日排班仍可使用。")
+
+        # 同一 K書設定ID 優先沿用先前綁定，避免每次同步產生新的學生或 QR。
+        cur.execute("""SELECT s.id,s.name,s.student_code,s.active
+                       FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+                       WHERE ks.kbook_id=%s""",(kid,))
+        mapped=cur.fetchone()
+        st=None
+        if mapped:
+            if _canonical_student_name(mapped["name"]) != name:
+                counts["errors"].append(f"{kid}：已對應到不同姓名（{mapped['name']}），請先核對學生編號；未重新綁定。")
+                continue
+            if not mapped["active"]:
+                counts["errors"].append(f"{name}：既有系統學生已停用，為避免產生重複學生，請先核對或恢復原學生。")
+                continue
+            if code and code != mapped["student_code"]:
+                counts["errors"].append(f"{name}：填入的系統學生編號與既有 K書綁定不同，請核對後再同步。")
+                continue
+            st=mapped
+        elif code:
+            cur.execute("SELECT id,name,student_code,active FROM students WHERE student_code=%s",(code,))
+            st=cur.fetchone()
+            if not st:
+                counts["errors"].append(f"{name}：找不到系統學生編號 {code}；若是新 K 書學生，請先留空編號再同步，若是既有學生請填正確編號。")
+                continue
+            if not st["active"]:
+                counts["errors"].append(f"{name}：系統學生 {code} 已停用，未自動建立替代學生。")
+                continue
+            if _canonical_student_name(st["name"]) != name:
+                counts["errors"].append(f"{name}：系統學生編號 {code} 對應姓名不一致，未同步。")
+                continue
+        else:
+            cur.execute("SELECT id,name,student_code,active FROM students ORDER BY id")
+            matches=[x for x in cur.fetchall() if _canonical_student_name(x["name"])==name]
+            if len(matches)>1:
+                counts["errors"].append(f"{name}：系統內有多筆同名學生，請填入系統學生編號。")
+                continue
+            if len(matches)==1:
+                st=matches[0]
+                if not st["active"]:
+                    counts["errors"].append(f"{name}：找到同名但已停用的系統學生，為避免建立重複學生，請先恢復原學生或填入正確編號。")
+                    continue
+            else:
+                # 找不到既有姓名時，才建立新的系統學生與固定 QR；之後以 K書設定ID 穩定沿用。
+                new_code="KBOOK-"+hashlib.sha256(kid.encode("utf-8")).hexdigest()[:12].upper()
+                cur.execute("SELECT id,name,student_code,active FROM students WHERE student_code=%s",(new_code,))
+                collision=cur.fetchone()
+                if collision:
+                    if _canonical_student_name(collision["name"]) != name or not collision["active"]:
+                        counts["errors"].append(f"{name}：自動學生編號 {new_code} 已被其他資料使用，請人工指定系統學生編號。")
+                        continue
+                    st=collision
+                else:
+                    cur.execute("INSERT INTO students(student_code,name,qr_token) VALUES (%s,%s,%s) RETURNING id,name,student_code,active",
+                                (new_code,name,secrets.token_urlsafe(18)))
+                    st=cur.fetchone()
+                    logger.info("Created K-book-only student: kbook_id=%s student_code=%s",kid,new_code)
+        cur.execute("""INSERT INTO kbook_student_settings
+        (kbook_id,student_id,status,start_date,end_date,late_grace_minutes,weekday_schedule_enabled,default_start_time,default_end_time,
+         late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,note,updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(kbook_id) DO UPDATE SET student_id=EXCLUDED.student_id,status=EXCLUDED.status,
+        start_date=EXCLUDED.start_date,end_date=EXCLUDED.end_date,late_grace_minutes=EXCLUDED.late_grace_minutes,
+        weekday_schedule_enabled=EXCLUDED.weekday_schedule_enabled,default_start_time=EXCLUDED.default_start_time,
+        default_end_time=EXCLUDED.default_end_time,late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
+        missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
+        notify_checkout=EXCLUDED.notify_checkout,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
+        (kid,st["id"],r.get("狀態") or "啟用",start_date,stop_date,grace,weekday_enabled,default_start,default_end,
+        r.get("遲到處理預設") or "依當日安排",r.get("未到班處理預設") or "依當日安排",
+        r.get("未離班處理預設") or "只顯示後台",_truthy_binding(r.get("到班通知家長預設"),False),
+        _truthy_binding(r.get("離班通知家長預設"),False),r.get("管理備註",""),now_local()))
+        counts["students"]+=1
+    for raw in arrangement_rows:
+        r={str(k).strip():(str(v).strip() if v is not None else "") for k,v in raw.items()}
+        aid=r.get("安排ID",""); kid=r.get("K書設定ID","")
+        if not aid or not kid:
+            if any(str(value or "").strip() for value in raw.values()):
+                counts["errors"].append(f"有內容的 K 書排班列缺少安排ID或K書設定ID（安排ID={aid or '未填'}），未匯入。")
+            continue
+        # Inactive rows with missing times are draft templates; they must not block sync.
+        enabled_text=r.get("安排啟用") or r.get("啟用") or ""
+        draft_type=_kbook_schedule_type(r.get("安排類型",""))
+        draft_start=_normalize_excel_time(r.get("預計到班時間",""))
+        draft_end=_normalize_excel_time(r.get("預計離班時間",""))
+        if not _truthy_binding(enabled_text,True) and draft_type not in {"skip",None} and (not draft_start or not draft_end):
+            cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
+            draft_existing=cur.fetchone()
+            if draft_existing and draft_existing["kbook_id"] != kid:
+                counts["errors"].append(f"安排ID {aid} 已綁定其他 K書設定ID；請核對後再停用。")
+                continue
+            if draft_existing:
+                cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s",(now_local(),aid))
+            counts["drafts"]+=1
+            continue
+        cur.execute("""SELECT ks.*,s.name AS student_name,s.student_code AS student_code
+                       FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+                       WHERE ks.kbook_id=%s""",(kid,))
+        st=cur.fetchone()
+        if not st:
+            counts["errors"].append(f"安排 {aid}：找不到 K書設定ID {kid}。"); continue
+        arrangement_name=_canonical_student_name(r.get("學生姓名（核對用）",""))
+        arrangement_code=r.get("系統學生編號（對應出勤學生）","") or r.get("學生編號","")
+        if arrangement_name and arrangement_name != _canonical_student_name(st["student_name"]):
+            counts["errors"].append(f"安排 {aid}：學生姓名與 K書設定ID {kid} 不一致。"); continue
+        if arrangement_code and arrangement_code != st["student_code"]:
+            counts["errors"].append(f"安排 {aid}：系統學生編號與 K書設定ID {kid} 不一致。"); continue
+
+        schedule_text=r.get("安排類型","").strip()
+        typ=_kbook_schedule_type(schedule_text)
+        if typ is None:
+            counts["errors"].append(f"安排 {aid}：安排類型未填或不支援；請選「平日固定」、「每週固定」、「單日」或「單日停用」。")
+            continue
+        weekday_text=r.get("星期","")
+        specific_text=r.get("指定日期（單日安排用）","") or r.get("指定日期","") or r.get("日期","")
+        effective_text=r.get("生效日期（每週安排用）","") or r.get("生效日期","")
+        end_date_text=r.get("結束日期（可留空）","") or r.get("結束日期","")
+        wd=_kbook_weekday(weekday_text); sd=_kbook_date(specific_text)
+        ed=_kbook_date(effective_text); endd=_kbook_date(end_date_text)
+        if specific_text and sd is None:
+            counts["errors"].append(f"安排 {aid}：指定日期格式無法辨識。"); continue
+        if effective_text and ed is None:
+            counts["errors"].append(f"安排 {aid}：生效日期格式無法辨識。"); continue
+        if end_date_text and endd is None:
+            counts["errors"].append(f"安排 {aid}：結束日期格式無法辨識。"); continue
+        if typ in {"single", "skip"} and sd is None:
+            counts["errors"].append(f"安排 {aid}：單日安排／單日停用必須填寫指定日期。"); continue
+        if typ == "weekly" and (wd is None or ed is None):
+            counts["errors"].append(f"安排 {aid}：每週固定必須填星期與生效日期。"); continue
+        if typ == "weekdays" and ed is None:
+            counts["errors"].append(f"安排 {aid}：平日固定必須填寫生效日期。"); continue
+        start=_normalize_excel_time(r.get("預計到班時間","")) if typ != "skip" else None
+        end=_normalize_excel_time(r.get("預計離班時間","")) if typ != "skip" else None
+        if typ != "skip" and (not start or not end):
+            # Fail closed: do not keep an older active database schedule when the source row is now incomplete.
+            cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s AND kbook_id=%s", (now_local(),aid,kid))
+            counts["errors"].append(f"安排 {aid}：缺少預計到班或離班時間；此排班暫停產生簽到表，補齊時間後會自動恢復。"); continue
+        if typ in {"weekly","weekdays"} and endd is not None and ed is not None and endd < ed:
+            counts["errors"].append(f"安排 {aid}：結束日期早於生效日期。"); continue
+        cur.execute("SELECT kbook_id FROM kbook_arrangements WHERE arrangement_id=%s",(aid,))
+        existing_arrangement=cur.fetchone()
+        if existing_arrangement and existing_arrangement["kbook_id"] != kid:
+            counts["errors"].append(f"安排ID {aid} 已綁定其他 K書設定ID；若要新增安排，請使用新的安排ID。"); continue
+        try:
+            if typ != "skip":
+                parse_hhmm(start,date(2026,1,1)); parse_hhmm(end,date(2026,1,1))
+                if end <= start:
+                    raise ValueError("離班時間必須晚於到班時間")
+            grace_text=r.get("遲到門檻（分鐘）") or st["late_grace_minutes"]
+            grace=max(0,int(float(grace_text))) if grace_text not in (None,"") else None
+        except (ValueError,TypeError):
+            cur.execute("UPDATE kbook_arrangements SET active=FALSE,updated_at=%s WHERE arrangement_id=%s AND kbook_id=%s", (now_local(),aid,kid))
+            counts["errors"].append(f"安排 {aid}：時間或遲到門檻格式錯誤（離班時間須晚於到班時間）；此排班暫停產生簽到表，修正後會自動恢復。"); continue
+        cur.execute("""INSERT INTO kbook_arrangements
+        (arrangement_id,kbook_id,schedule_type,weekday,specific_date,effective_date,end_date,start_time,end_time,late_grace_minutes,
+         late_action,absent_action,missing_checkout_action,notify_checkin,notify_checkout,active,note,updated_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(arrangement_id) DO UPDATE SET kbook_id=EXCLUDED.kbook_id,schedule_type=EXCLUDED.schedule_type,
+        weekday=EXCLUDED.weekday,specific_date=EXCLUDED.specific_date,effective_date=EXCLUDED.effective_date,
+        end_date=EXCLUDED.end_date,start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,
+        late_grace_minutes=EXCLUDED.late_grace_minutes,late_action=EXCLUDED.late_action,absent_action=EXCLUDED.absent_action,
+        missing_checkout_action=EXCLUDED.missing_checkout_action,notify_checkin=EXCLUDED.notify_checkin,
+        notify_checkout=EXCLUDED.notify_checkout,active=EXCLUDED.active,note=EXCLUDED.note,updated_at=EXCLUDED.updated_at""",
+        (aid,kid,typ,wd,sd,ed,endd,start,end,grace,_kbook_resolve_action(r.get("遲到處理"), st["late_action"], "只顯示後台"),
+         _kbook_resolve_action(r.get("未到班處理"), st["absent_action"], "只顯示後台"),
+         _kbook_resolve_action(r.get("未離班處理"), st["missing_checkout_action"], "只顯示後台"),
+         _truthy_binding(r.get("到班通知家長"),bool(st["notify_checkin"])),
+         _truthy_binding(r.get("離班通知家長"),bool(st["notify_checkout"])),
+         _truthy_binding(r.get("安排啟用") or r.get("啟用"),True),r.get("管理備註",""),now_local()))
+        counts["arrangements"]+=1
+    return counts
+
+
+def _ensure_kbook_courses_for_date(cur, d: date) -> int:
+    # Reuse the target date's weekday for default-schedule filters and SQL parameters.
+    weekday = d.weekday()
+    cur.execute("""SELECT a.*,ks.student_id,ks.status AS kstatus,ks.start_date AS ks_start,ks.end_date AS ks_end,
+    ks.late_grace_minutes AS ks_grace FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+    JOIN students s ON s.id=ks.student_id AND s.active=TRUE
+    WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
+    AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
+    AND ((a.schedule_type='single' AND a.specific_date=%s)
+      OR (a.schedule_type='weekly' AND a.weekday=%s AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+      OR (a.schedule_type='weekdays' AND %s BETWEEN 0 AND 4 AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s)))
+    AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s)""",
+    (d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
+    count=0
+    for a in cur.fetchall():
+        try: parse_hhmm(a["start_time"],d); parse_hhmm(a["end_time"],d)
+        except ValueError: continue
+        actual_id=f"KBOOK-{a['arrangement_id']}-{d:%Y%m%d}"
+        grace=a["late_grace_minutes"] if a["late_grace_minutes"] is not None else (a["ks_grace"] if a["ks_grace"] is not None else setting_int("遲到門檻（分鐘）", DEFAULT_LATE_GRACE_MINUTES))
+        cur.execute("""INSERT INTO courses
+        (student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,active,
+         actual_course_id,course_date,source,source_note,kbook_arrangement_id,kbook_late_action,kbook_absent_action,
+         kbook_missing_checkout_action,kbook_notify_checkin,kbook_notify_checkout)
+        VALUES (%s,'K書','K書',%s,%s,%s,%s,%s,TRUE,%s,%s,'K書',%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(actual_course_id) WHERE actual_course_id IS NOT NULL DO UPDATE SET
+        student_id=EXCLUDED.student_id,start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,
+        late_grace_minutes=EXCLUDED.late_grace_minutes,checkout_grace_minutes=EXCLUDED.checkout_grace_minutes,
+        active=TRUE,source_note=EXCLUDED.source_note,kbook_arrangement_id=EXCLUDED.kbook_arrangement_id,
+        kbook_late_action=EXCLUDED.kbook_late_action,kbook_absent_action=EXCLUDED.kbook_absent_action,
+        kbook_missing_checkout_action=EXCLUDED.kbook_missing_checkout_action,
+        kbook_notify_checkin=EXCLUDED.kbook_notify_checkin,kbook_notify_checkout=EXCLUDED.kbook_notify_checkout""",
+        (a["student_id"],d.weekday(),a["start_time"],a["end_time"],grace,DEFAULT_CHECKOUT_GRACE_MINUTES,actual_id,d,
+         a.get("note") or f"K書安排 {a['arrangement_id']}",a["arrangement_id"],a["late_action"],a["absent_action"],
+         a["missing_checkout_action"],a["notify_checkin"],a["notify_checkout"]))
+        count+=1
+
+    # Default: one setting per student creates a daily course Monday-Friday.
+    # Explicit active single/weekly/weekdays rows override the default for that date.
+    if d.weekday() <= 4:
+        cur.execute("""SELECT ks.* FROM kbook_student_settings ks
+            JOIN students s ON s.id=ks.student_id
+            WHERE s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+              AND ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''
+              AND (ks.start_date IS NULL OR ks.start_date<=%s)
+              AND (ks.end_date IS NULL OR ks.end_date>%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+                  WHERE stop.kbook_id=ks.kbook_id AND stop.active=TRUE
+                    AND stop.schedule_type='skip' AND stop.specific_date=%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a
+                  WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE
+                    AND a.schedule_type IN ('single','weekly','weekdays')
+                    AND ((a.schedule_type='single' AND a.specific_date=%s)
+                      OR (a.schedule_type='weekly' AND a.weekday=%s
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))
+                      OR (a.schedule_type='weekdays'
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))))
+            ORDER BY s.name,ks.kbook_id""", 
+            (d,d,d,d,d.weekday(),d,d,d,d))
+        for row in cur.fetchall():
+            start=row.get("default_start_time")
+            end=row.get("default_end_time")
+            try:
+                parse_hhmm(start,d); parse_hhmm(end,d)
+                if end <= start:
+                    raise ValueError("離班時間須晚於到班時間")
+            except (ValueError,TypeError):
+                logger.warning("Invalid K-book weekday default: kbook_id=%s date=%s",row["kbook_id"],d)
+                continue
+            grace=row.get("late_grace_minutes")
+            if grace is None:
+                grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES)
+            default_id="DEFAULT-"+str(row["kbook_id"])
+            cur.execute("""INSERT INTO courses
+                (student_id,course_name,teacher_name,weekday,start_time,end_time,late_grace_minutes,checkout_grace_minutes,active,
+                 actual_course_id,course_date,source,source_note,kbook_arrangement_id,kbook_late_action,kbook_absent_action,
+                 kbook_missing_checkout_action,kbook_notify_checkin,kbook_notify_checkout)
+                VALUES (%s,'K書','K書',%s,%s,%s,%s,%s,TRUE,%s,%s,'K書','K書平日預設',%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(actual_course_id) WHERE actual_course_id IS NOT NULL DO UPDATE SET
+                student_id=EXCLUDED.student_id,start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,
+                late_grace_minutes=EXCLUDED.late_grace_minutes,checkout_grace_minutes=EXCLUDED.checkout_grace_minutes,
+                active=TRUE,source_note=EXCLUDED.source_note,kbook_arrangement_id=EXCLUDED.kbook_arrangement_id,
+                kbook_late_action=EXCLUDED.kbook_late_action,kbook_absent_action=EXCLUDED.kbook_absent_action,
+                kbook_missing_checkout_action=EXCLUDED.kbook_missing_checkout_action,
+                kbook_notify_checkin=EXCLUDED.kbook_notify_checkin,kbook_notify_checkout=EXCLUDED.kbook_notify_checkout""",
+                (row["student_id"],d.weekday(),start,end,int(grace),DEFAULT_CHECKOUT_GRACE_MINUTES,
+                 f"KBOOK-{default_id}-{d:%Y%m%d}",d,default_id,
+                 _kbook_resolve_action(row.get("late_action"),None,"只顯示後台"),
+                 _kbook_resolve_action(row.get("absent_action"),None,"只顯示後台"),
+                 _kbook_resolve_action(row.get("missing_checkout_action"),None,"只顯示後台"),
+                 bool(row.get("notify_checkin",False)),bool(row.get("notify_checkout",False))))
+            count+=1
+
+    cur.execute("""UPDATE courses c SET active=FALSE WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
+    AND LEFT(c.kbook_arrangement_id, 8) <> 'DEFAULT-'
+    AND NOT EXISTS (
+      SELECT 1 FROM attendance att
+      WHERE att.course_id=c.id AND att.date=%s
+        AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL)
+    )
+    AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+    JOIN students s ON s.id=ks.student_id AND s.active=TRUE
+    WHERE a.arrangement_id=c.kbook_arrangement_id AND a.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+    AND (ks.start_date IS NULL OR ks.start_date<=%s) AND (ks.end_date IS NULL OR ks.end_date>%s)
+    AND ((a.schedule_type='single' AND a.specific_date=%s)
+      OR (a.schedule_type='weekly' AND a.weekday=%s AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+      OR (a.schedule_type='weekdays' AND %s BETWEEN 0 AND 4 AND (a.effective_date IS NULL OR a.effective_date<=%s) AND (a.end_date IS NULL OR a.end_date>=%s))
+    )
+    AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+      WHERE stop.kbook_id=a.kbook_id AND stop.active=TRUE AND stop.schedule_type='skip' AND stop.specific_date=%s))""",
+    (d,d,d,d,d,d.weekday(),d,d,d.weekday(),d,d,d))
+
+    # Independently retire stale default weekday rows when the student is paused,
+    # default times are cleared, a one-day stop is enabled, or an explicit schedule overrides the date.
+    cur.execute("""UPDATE courses c SET active=FALSE
+        WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE
+          AND LEFT(c.kbook_arrangement_id, 8) = 'DEFAULT-'
+          AND NOT EXISTS (SELECT 1 FROM attendance att
+              WHERE att.course_id=c.id AND att.date=%s
+                AND (att.check_in_time IS NOT NULL OR att.check_out_time IS NOT NULL))
+          AND NOT EXISTS (
+            SELECT 1 FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+            WHERE c.kbook_arrangement_id='DEFAULT-' || ks.kbook_id
+              AND s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+              AND ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>''
+              AND (ks.start_date IS NULL OR ks.start_date<=%s)
+              AND (ks.end_date IS NULL OR ks.end_date>%s)
+              AND %s BETWEEN 0 AND 4
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements stop
+                  WHERE stop.kbook_id=ks.kbook_id AND stop.active=TRUE
+                    AND stop.schedule_type='skip' AND stop.specific_date=%s)
+              AND NOT EXISTS (SELECT 1 FROM kbook_arrangements a
+                  WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE
+                    AND a.schedule_type IN ('single','weekly','weekdays')
+                    AND ((a.schedule_type='single' AND a.specific_date=%s)
+                      OR (a.schedule_type='weekly' AND a.weekday=%s
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))
+                      OR (a.schedule_type='weekdays'
+                          AND (a.effective_date IS NULL OR a.effective_date<=%s)
+                          AND (a.end_date IS NULL OR a.end_date>=%s))))
+          )""", (d,d,d,d,weekday,d,d,weekday,d,d,d,d))
+    return count
+
+
+def _ensure_kbook_courses_today():
+    with db_conn() as conn:
+        with conn.cursor() as cur: n=_ensure_kbook_courses_for_date(cur,now_local().date())
+        conn.commit()
+    return n
+
+
+def _kbook_notify(course, kind):
+    if course.get("source") != "K書": return True
+    return bool(course.get("kbook_notify_checkin" if kind=="check_in" else "kbook_notify_checkout",True))
 
 
 def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -3755,6 +4368,61 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 f"實際課程讀取 {len(actual_course_rows)} 筆、跳過 {actual_skipped} 筆。"
                 f"原因：{detail}"
             )
+    kbook_student_rows = sheets.get("K書學生", [])
+    kbook_arrangement_rows = sheets.get("K書出勤安排", [])
+    kbook_summary = _kbook_sync_sheets(cur, kbook_student_rows, kbook_arrangement_rows)
+    source_meta = (sheets.get("_kbook_source_meta") or [{}])[0]
+    if not source_meta.get("student_sheet_present", True):
+        kbook_summary["errors"].append("主總表缺少「K書學生」工作表；請把 K 書工作表插入同一份主總表。")
+    if not source_meta.get("arrangement_sheet_present", True):
+        kbook_summary["errors"].append("主總表缺少「K書出勤安排」工作表；請保留此表供單日停用等例外設定使用。")
+    cur.execute("""SELECT COUNT(DISTINCT ks.kbook_id) AS n
+        FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+        WHERE s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+          AND (
+            (ks.weekday_schedule_enabled=TRUE
+              AND COALESCE(ks.default_start_time,'')<>'' AND COALESCE(ks.default_end_time,'')<>'')
+            OR EXISTS (SELECT 1 FROM kbook_arrangements a
+              WHERE a.kbook_id=ks.kbook_id AND a.active=TRUE AND a.schedule_type='weekdays'
+                AND COALESCE(a.start_time,'')<>'' AND COALESCE(a.end_time,'')<>'')
+          )""")
+    weekday_defaults_ready = int(cur.fetchone()["n"] or 0)
+    cur.execute("""SELECT COUNT(DISTINCT ks.kbook_id) AS n
+        FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+        JOIN students s ON s.id=ks.student_id
+        WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')
+          AND s.active=TRUE AND ks.status IN ('啟用','啟用中','是','TRUE','true','1')
+          AND ((a.schedule_type='single' AND a.specific_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL)
+            OR (a.schedule_type='weekly' AND a.weekday IS NOT NULL AND a.effective_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL)
+            OR (a.schedule_type='weekdays' AND a.effective_date IS NOT NULL AND a.start_time IS NOT NULL AND a.end_time IS NOT NULL))""")
+    configured_arrangement_students = int(cur.fetchone()["n"] or 0)
+    if weekday_defaults_ready == 0 and configured_arrangement_students == 0:
+        if kbook_summary.get("drafts",0):
+            kbook_summary["errors"].append(f"已讀取 {kbook_summary['drafts']} 筆未啟用的 K 書排班草稿。請先核對 K書設定ID／系統學生編號，填妥預計到班與預計離班時間，再將「安排啟用」改成「是」；草稿不會產生簽到表。固定平日每人一列「平日固定」，偶爾來一天使用「單日」，只有臨時不來才用「單日停用」。")
+        else:
+            kbook_summary["errors"].append("目前尚未設定可產生簽到表的 K 書時段。毋須新增或修改「K書學生」的時間欄位：請在既有「K書出勤安排」中，固定平日學生每人新增一列「平日固定」，填入 K書設定ID、安排ID、生效日期、預計到班與預計離班時間；偶爾來一天則用「單日」並填指定日期。這是每人一列，不需每週新增五列；「單日停用」只用於臨時不來的日期。")
+    cur.execute("""
+        INSERT INTO kbook_sync_diagnostics
+          (id,last_sync_at,student_sheet_present,arrangement_sheet_present,
+           student_source_rows,arrangement_source_rows,students_imported,arrangements_imported,
+           errors_count,errors_text,updated_at)
+        VALUES (1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(id) DO UPDATE SET last_sync_at=EXCLUDED.last_sync_at,
+          student_sheet_present=EXCLUDED.student_sheet_present,
+          arrangement_sheet_present=EXCLUDED.arrangement_sheet_present,
+          student_source_rows=EXCLUDED.student_source_rows,
+          arrangement_source_rows=EXCLUDED.arrangement_source_rows,
+          students_imported=EXCLUDED.students_imported,
+          arrangements_imported=EXCLUDED.arrangements_imported,
+          errors_count=EXCLUDED.errors_count,errors_text=EXCLUDED.errors_text,
+          updated_at=EXCLUDED.updated_at
+    """, (now_local(),bool(source_meta.get("student_sheet_present", True)),
+          bool(source_meta.get("arrangement_sheet_present", True)),len(kbook_student_rows),
+          len(kbook_arrangement_rows),kbook_summary["students"],kbook_summary["arrangements"],
+          len(kbook_summary["errors"]),("；".join(kbook_summary["errors"][:20])[:3500] or None),now_local()))
+    logger.info("K書同步：學生來源列=%s 已匯入=%s；排班來源列=%s 已匯入=%s；錯誤=%s",
+        len(kbook_student_rows),kbook_summary["students"],len(kbook_arrangement_rows),
+        kbook_summary["arrangements"],len(kbook_summary["errors"]))
     # 若舊同步曾把組合姓名當成單一學生，且新個別學生已建立、舊紀錄已無啟用課程，
     # 將舊組合名設為停用；歷史簽到紀錄保留，不會刪除。
     for composite_name, intended_names in STUDENT_GROUP_NAME_ALIASES.items():
@@ -3793,11 +4461,15 @@ def _apply_master_sync(cur, sheets: dict[str, list[dict[str, Any]]]) -> dict[str
                 fallback_rows.append({"學生姓名": student_name, "LINE User ID": line_id, "LINE 顯示名稱": person, "關係": "家長", "啟用": "是", "家長提醒": "是"})
         binding_imported, _ = _upsert_line_binding_rows(cur, fallback_rows)
     load_runtime_settings(cur)
+    _ensure_kbook_courses_for_date(cur, now_local().date())
     return {
         "actual_imported": actual_imported,
         "actual_skipped": actual_skipped,
         "binding_imported": binding_imported,
-        "errors": errors,
+        "kbook_students_imported": kbook_summary["students"],
+        "kbook_arrangements_imported": kbook_summary["arrangements"],
+        "kbook_errors": kbook_summary["errors"],
+        "errors": errors + kbook_summary["errors"],
     }
 
 
@@ -3840,9 +4512,13 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                     logger.exception("Master Excel sync download failed")
                     return {"status": "failed", "detail": str(exc)[:1000]}
 
-                cur.execute("SELECT remote_modified_at,remote_checksum,last_success FROM master_sync_state WHERE id=1")
+                cur.execute("SELECT remote_modified_at,remote_checksum,last_success,last_error FROM master_sync_state WHERE id=1")
                 state = cur.fetchone() or {}
-                if meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                if trigger != "manual" and meta.get("remote_modified_at") and meta.get("remote_checksum") and state.get("remote_modified_at") == meta.get("remote_modified_at") and state.get("remote_checksum") == meta.get("remote_checksum") and state.get("last_success") is True:
+                    if state.get("last_error"):
+                        cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
+                        conn.commit()
+                        return {"status": "unchanged_with_warnings", "source_name": meta.get("source_name"), "detail": "主總表沒有更新；保留上次資料警告", "warnings": state.get("last_error")}
                     cur.execute("UPDATE master_sync_state SET last_checked_at=%s,last_trigger=%s,last_error=NULL,updated_at=%s WHERE id=1", (now_local(), trigger, now_local()))
                     conn.commit()
                     return {"status": "unchanged", "source_name": meta.get("source_name"), "detail": "主總表沒有更新"}
@@ -3851,10 +4527,10 @@ def master_sync_once(trigger: str = "scheduled") -> dict[str, Any]:
                     sheets = _load_master_workbook_sheets(raw)
                     summary = _apply_master_sync(cur, sheets)
                     cur.execute("""UPDATE master_sync_state SET provider=%s,source_key=%s,source_name=%s,remote_modified_at=%s,remote_checksum=%s,
-                        last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger=%s,
+                        last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=%s,last_trigger=%s,
                         last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
                         (meta.get("provider"), meta.get("source_key"), meta.get("source_name"), meta.get("remote_modified_at"), meta.get("remote_checksum"),
-                         now_local(), now_local(), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                         now_local(), now_local(), ("；".join(summary["errors"][:10])[:1800] or None), trigger, summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
                     conn.commit()
                     logger.info("Master Excel sync success: %s", summary)
                     return {"status": "synced", "source_name": meta.get("source_name"), **summary}
@@ -3882,6 +4558,172 @@ async def periodic_master_sync():
             await asyncio.to_thread(master_sync_once, "scheduled")
 
 
+
+@app.get("/admin/kbook", response_class=HTMLResponse)
+def admin_kbook(_: str = Depends(admin_auth)):
+    today=now_local().date()
+    now=now_local()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            generated_today = _ensure_kbook_courses_for_date(cur,today)
+            cur.execute("SELECT * FROM kbook_sync_diagnostics WHERE id=1")
+            diag=cur.fetchone()
+            cur.execute("""SELECT ks.kbook_id,s.id AS student_id,s.student_code,s.name,ks.status,ks.start_date,ks.end_date,
+            ks.late_grace_minutes,ks.weekday_schedule_enabled,ks.default_start_time,ks.default_end_time,
+            ks.notify_checkin,ks.notify_checkout,ks.missing_checkout_action,s.active AS system_active
+            FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id
+            ORDER BY s.name,ks.kbook_id""")
+            students=cur.fetchall()
+            cur.execute("""SELECT s.name,s.student_code,c.id AS course_id,c.start_time,c.end_time,
+            c.late_grace_minutes,c.kbook_late_action,c.kbook_absent_action,c.kbook_missing_checkout_action,
+            c.kbook_notify_checkin,c.kbook_notify_checkout,a.check_in_time,a.check_out_time
+            FROM courses c JOIN students s ON s.id=c.student_id
+            LEFT JOIN attendance a ON a.course_id=c.id AND a.date=%s
+            WHERE c.source='K書' AND c.course_date=%s AND c.active=TRUE ORDER BY c.start_time,s.name""",(today,today))
+            rows=cur.fetchall()
+            pending=sum(1 for r in rows if r.get("check_in_time") and not r.get("check_out_time"))
+            cur.execute("""SELECT a.*,s.name,ks.status AS student_status,s.active AS system_active,
+            ks.late_grace_minutes AS student_late_grace_minutes
+            FROM kbook_arrangements a JOIN kbook_student_settings ks USING(kbook_id)
+            JOIN students s ON s.id=ks.student_id
+            WHERE ((a.schedule_type IN ('single','skip') AND a.specific_date >= %s)
+                OR (a.schedule_type IN ('weekly','weekdays') AND (a.end_date IS NULL OR a.end_date >= %s)))
+            ORDER BY s.name,a.weekday,a.specific_date,a.start_time,a.arrangement_id""",(today,today))
+            arrangements=cur.fetchall()
+        conn.commit()
+    body=[f"<div class='top'><div><h1>K書出勤管理</h1><div class='muted'>V{APP_VERSION}｜資料來自「K書學生」與「K書出勤安排」；原本「拉K」工作表不讀取、不修改。</div></div>{admin_nav()}</div>"]
+    body.append(
+        "<section><h2>每日自動建立簽到表</h2>"
+        "<p>不需要每天新增 K 書學生，也不需要每天手動建立簽到表。系統背景每 60 秒會依已同步的排班，建立或更新當日 K 書課程；主總表則每 "
+        + str(MASTER_SYNC_INTERVAL_MINUTES) + " 分鐘自動檢查是否有更新。"
+        "只有學生與排班均啟用、生效日期已到、且預計到班與預計離班時間都填妥，才會建立每日簽到表；空白時間不會被系統自行猜測。"
+        "若剛修改 Google 總表，可按下方「重新讀取主總表並建立今日簽到表」立即同步。"
+        + f"<br><b>本次頁面檢查：今日已建立或更新 {generated_today} 筆 K 書課程。</b></p></section>"
+    )
+    active_students=sum(1 for r in students if r.get("system_active") and str(r.get("status")) in {"啟用","啟用中","是","TRUE","true","1"})
+    active_statuses={"啟用","啟用中","是","TRUE","true","1"}
+    default_schedule_kids={r["kbook_id"] for r in students if r.get("system_active") and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time") and str(r.get("status")) in active_statuses}
+    arrangement_weekday_kids={r["kbook_id"] for r in arrangements if r.get("active") and r.get("system_active") and str(r.get("student_status")) in active_statuses and r.get("schedule_type")=="weekdays" and r.get("start_time") and r.get("end_time")}
+    weekday_defaults_ready=len(default_schedule_kids | arrangement_weekday_kids)
+    active_arrangements=sum(1 for r in arrangements if r.get("active") and r.get("system_active") and str(r.get("student_status")) in active_statuses and r.get("schedule_type") != "skip")
+    body.append(f"<div class='cards'><div class='card'><div class='muted'>啟用學生</div><div class='num'>{active_students}</div></div><div class='card'><div class='muted'>平日固定已設時間</div><div class='num'>{weekday_defaults_ready}</div></div><div class='card'><div class='muted'>今日已到班、尚未離班</div><div class='num'>{pending}</div></div></div>")
+    body.append("<section><h2>排班同步診斷</h2><p>此處確認主總表是否有 K 書工作表、系統實際讀到多少資料列，以及匯入多少筆排班。</p>")
+    if not diag:
+        body.append("<div class='alert'>尚未取得 K 書同步診斷。請按下方按鈕重新讀取主總表。</div>")
+    else:
+        diag_errors = str(diag.get("errors_text") or "").strip()
+        source_status = "正常" if diag.get("student_sheet_present") and diag.get("arrangement_sheet_present") else "缺少工作表"
+        alert_class = "alert danger" if diag_errors or source_status != "正常" else "alert success"
+        body.append(f"<div class='{alert_class}'><b>來源狀態：{escape(source_status)}</b><br>「K書學生」：{'存在' if diag.get('student_sheet_present') else '不存在'}，讀取 {diag.get('student_source_rows', 0)} 列、匯入 {diag.get('students_imported', 0)} 位。<br>「K書出勤安排」：{'存在' if diag.get('arrangement_sheet_present') else '不存在'}，讀取 {diag.get('arrangement_source_rows', 0)} 列、匯入 {diag.get('arrangements_imported', 0)} 筆。<br>最近同步：{escape(str(diag.get('last_sync_at') or '—'))}<br>警告：{escape(diag_errors or '無')}</div>")
+        if not diag.get("arrangement_source_rows") and weekday_defaults_ready == 0:
+            body.append("<p><b>目前原因：</b>目前 Excel 不需要新增「K書學生」時間欄位。請在既有「K書出勤安排」中，為每位固定 K 書學生新增一列「平日固定」，填入 K書設定ID、唯一安排ID、生效日期、預計到班時間與預計離班時間，並啟用該列。這一列會套用週一至週五；偶爾來一天則使用「單日」安排。只有臨時不來才新增「單日停用」。</p>")
+        elif not diag.get("arrangement_source_rows") and weekday_defaults_ready > 0:
+            body.append("<p>「K書出勤安排」沒有例外列是正常的；系統會依已設定的平日預設時段自動建立週一至週五簽到表。</p>")
+    body.append("<form method='post' action='/admin/kbook/sync-now'><button>重新讀取主總表並建立今日簽到表</button></form></section>")
+    body.append("<section><h2>今日 K 書出勤</h2><p class='muted'>實際到班／離班時間會在 QR 掃描後寫入；遲到以該筆排班的預計到班時間及遲到門檻判斷。</p>")
+    if rows:
+        body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>預計到班</th><th>預計離班</th><th>實際到班時間</th><th>實際離班時間</th><th>目前狀態</th><th>遲到門檻</th><th>未離班處理</th></tr>")
+        for r in rows:
+            ci=r.get("check_in_time"); co=r.get("check_out_time")
+            grace=int(r.get("late_grace_minutes") or 0)
+            try:
+                late_limit=parse_hhmm(r["start_time"],today)+timedelta(minutes=grace)
+                state="已離班" if co else ("已到班，尚未離班" if ci else ("尚未到班（已超過遲到門檻）" if now>late_limit else "尚未到班"))
+            except (ValueError,TypeError):
+                state="排班時間格式需檢查"
+            vals=(r["name"],r["start_time"],r["end_time"],iso(ci) or "—",iso(co) or "—",state,f"超過 {grace} 分鐘才記遲到",r.get("kbook_missing_checkout_action") or "只顯示後台")
+            body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
+        body.append("</table></div>")
+    else: body.append("<p>今日沒有已啟用的 K 書出勤安排；未安排日期不會判定未到班。</p>")
+    body.append("</section><section><h2>K書學生設定</h2><p>沿用目前 Excel，不必新增時間欄位。固定平日學生請在下方「K書出勤安排」每人新增一列「平日固定」並設定時間；偶爾來一天的學生只需新增「單日」安排。停用整位學生請將狀態改為停用；只有某一天不來，才新增「單日停用」例外。開始日期當天起生效，停用日期當天起不再排班。</p><div style='overflow:auto'><table><tr><th>K書設定ID</th><th>學生</th><th>狀態</th><th>開始日期</th><th>停用日期</th><th>平日固定</th><th>預計到班</th><th>預計離班</th><th>遲到門檻</th><th>通知設定</th><th>固定 QR</th></tr>")
+    for r in students:
+        state=str(r.get("status") or "停用")
+        if not r.get("system_active"): state += "（系統學生已停用）"
+        grace="沿用全域" if r.get("late_grace_minutes") is None else f"{r['late_grace_minutes']} 分鐘"
+        notify=f"到班預設：{'開啟' if r.get('notify_checkin') else '關閉（排班可單獨開啟）'}；離班預設：{'開啟' if r.get('notify_checkout') else '關閉（排班可單獨開啟）'}"
+        qr_html=f"<a href='/qr/{escape(str(r['student_code']))}.png' target='_blank' rel='noopener'>開啟固定 QR</a>" if r.get("system_active") and r.get("student_code") else "無可用 QR"
+        schedule_row=next((a for a in arrangements if a.get("kbook_id")==r["kbook_id"] and a.get("active") and a.get("system_active") and str(a.get("student_status")) in {"啟用","啟用中","是","TRUE","true","1"} and a.get("schedule_type")=="weekdays" and a.get("start_time") and a.get("end_time")),None)
+        if r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time"):
+            weekday_text="啟用（學生設定）"; display_start=r.get("default_start_time"); display_end=r.get("default_end_time")
+        elif schedule_row:
+            weekday_text="啟用（排班表）"; display_start=schedule_row.get("start_time"); display_end=schedule_row.get("end_time")
+        else:
+            weekday_text="未設定平日固定"; display_start="未設定"; display_end="未設定"
+        vals=(r["kbook_id"],r["name"],state,r.get("start_date") or "—",r.get("end_date") or "—",
+              weekday_text,display_start,display_end,grace,notify)
+        body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+f"<td>{qr_html}</td></tr>")
+    body.append("</table></div></section>") 
+    weekday_labels=["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
+    body.append("<section><h2>固定平日排班（由排班表設定）</h2><p class='muted'>沿用現有 Excel：每位固定學生在「K書出勤安排」只需一列「平日固定」，填到班／離班時間與生效日期，系統會自動產生週一至週五的每日簽到表。偶爾到場的學生不需要固定平日列。</p>")
+    weekday_rows=[]
+    students_by_kid={r["kbook_id"]:r for r in students}
+    used_weekday_kids=set()
+    for a in arrangements:
+        if not (a.get("active") and a.get("system_active") and str(a.get("student_status")) in active_statuses and a.get("schedule_type")=="weekdays" and a.get("start_time") and a.get("end_time")):
+            continue
+        student=students_by_kid.get(a["kbook_id"],{})
+        scope="週一至週五｜起 "+str(a.get("effective_date") or "未設定")
+        if a.get("end_date"): scope+="｜迄 "+str(a["end_date"])
+        raw_grace=a.get("late_grace_minutes")
+        if raw_grace is None: raw_grace=a.get("student_late_grace_minutes")
+        grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES) if raw_grace is None else int(raw_grace)
+        weekday_rows.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in (a["name"],scope,a["start_time"],a["end_time"],f"{grace} 分鐘","啟用（排班表）"))+"</tr>")
+        used_weekday_kids.add(a["kbook_id"])
+    for r in students:
+        if r["kbook_id"] in used_weekday_kids:
+            continue
+        if not (r.get("system_active") and str(r.get("status")) in active_statuses and r.get("weekday_schedule_enabled") and r.get("default_start_time") and r.get("default_end_time")):
+            continue
+        scope="週一至週五"
+        if r.get("start_date"): scope+="｜起 "+str(r["start_date"])
+        if r.get("end_date"): scope+="｜停 "+str(r["end_date"])
+        raw_grace=r.get("late_grace_minutes")
+        grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES) if raw_grace is None else int(raw_grace)
+        weekday_rows.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in (r["name"],scope,r["default_start_time"],r["default_end_time"],f"{grace} 分鐘","啟用（學生設定）"))+"</tr>")
+    if weekday_rows:
+        body.append("<div style='overflow:auto'><table><tr><th>學生</th><th>生效日期</th><th>應到教室時間</th><th>預計離班</th><th>遲到門檻</th><th>狀態</th></tr>"+"".join(weekday_rows)+"</table></div>")
+    else:
+        body.append("<p>目前沒有完整的固定平日排班。請在「K書出勤安排」新增一列「平日固定」，填妥 K書設定ID、安排ID、生效日期、預計到班與預計離班時間並啟用；不需要修改「K書學生」工作表。</p>")
+    body.append("</section><section><h2>特殊排班與單日停用例外</h2><p class='muted'>一般情況不需要填這張表。若某一天不來，新增「單日停用」，填指定日期並把「安排啟用」設為「是」；要恢復那天，將「安排啟用」切回「否」。例外只影響指定日，不改動其他平日。</p>")
+    if arrangements:
+        body.append("<div style='overflow:auto'><table><tr><th>安排ID</th><th>學生</th><th>類型／日期</th><th>應到教室時間</th><th>預計離開</th><th>遲到門檻</th><th>未到班處理</th><th>未離班處理</th><th>例外開關</th></tr>")
+        for r in arrangements:
+            if r.get("schedule_type")=="skip":
+                scope="單日停用："+str(r.get("specific_date") or "未填")
+                start_label="—"; end_label="—"
+            elif r.get("schedule_type")=="single":
+                scope="單日排班："+str(r.get("specific_date") or "未填")
+                start_label=r.get("start_time") or "—"; end_label=r.get("end_time") or "—"
+            else:
+                wd=r.get("weekday")
+                if r.get("schedule_type")=="weekdays":
+                    scope="平日固定｜"+str(r.get("effective_date") or "即日起")
+                else:
+                    scope=(weekday_labels[int(wd)] if wd is not None and 0<=int(wd)<=6 else "星期未設定")+"｜"+str(r.get("effective_date") or "即日起")
+                if r.get("end_date"): scope+="～"+str(r["end_date"])
+                start_label=r.get("start_time") or "—"; end_label=r.get("end_time") or "—"
+            raw_grace=r.get("late_grace_minutes")
+            if raw_grace is None: raw_grace=r.get("student_late_grace_minutes")
+            grace=setting_int("遲到門檻（分鐘）",DEFAULT_LATE_GRACE_MINUTES) if raw_grace is None else int(raw_grace)
+            grace_label=f"{grace} 分鐘（全域預設）" if raw_grace is None else f"{grace} 分鐘"
+            action_label=("生效：停用該日" if r.get("active") else "已關閉")
+            vals=(r["arrangement_id"],r["name"],scope,start_label,end_label,grace_label,r.get("absent_action") or "只顯示後台",r.get("missing_checkout_action") or "只顯示後台",action_label)
+            body.append("<tr>"+"".join("<td>%s</td>"%escape(str(v or "—")) for v in vals)+"</tr>")
+        body.append("</table></div>")
+    else:
+        body.append("<p>目前沒有單日停用或特殊排班例外；這是正常狀態。</p>")
+    body.append("</section><section><h2>設定方式</h2><p>請在 Google 總表修改「K書學生」與「K書出勤安排」，等待自動同步或到「總表同步」按立即同步。若找不到既有同名學生且「系統學生編號」留白，系統會建立新的系統學生與固定 QR；若有多筆同名或填入的編號不符，會提示核對並停止該列同步。停用日期當天起不再排 K 書，但不刪除學生 QR 或歷史紀錄。</p><p><a class='btn btn2' href='/admin/master-sync'>查看總表同步狀態</a></p></section>")
+    return page("K 書出勤", "".join(body))
+
+
+@app.post("/admin/kbook/sync-now")
+def admin_kbook_sync_now(_: str = Depends(admin_auth)):
+    # 手動操作一律強制重新讀取來源，即使 Google 檔案的修改時間沒有變也重新套用 K 書排班。
+    result = master_sync_once("manual")
+    logger.info("Manual K-book sync requested: status=%s detail=%s", result.get("status"), result.get("detail"))
+    return RedirectResponse("/admin/kbook", status_code=303)
+
+
 @app.get("/admin/master-sync", response_class=HTMLResponse)
 def admin_master_sync(_: str = Depends(admin_auth)):
     with db_conn() as conn:
@@ -3890,6 +4732,9 @@ def admin_master_sync(_: str = Depends(admin_auth)):
     configured, config_detail = _master_sync_configured()
     status_label = {True:"正常", False:"未完成"}.get(bool(state.get("last_success")), "尚未同步") if state else "尚未同步"
     color = "success" if state.get("last_success") else "alert"
+    if state.get("last_success") and state.get("last_error"):
+        status_label = "已同步，但有資料警告"
+        color = "alert"
     body = [f"<div class='top'><div><h1>主總表自動同步</h1><div class='muted'>V{APP_VERSION}｜主總表放在 Google Drive，Render 自動檢查更新；手動同步保留為備援。</div></div>{admin_nav()}</div>"]
     body.append(f"<section><h2>同步狀態</h2><div class='alert {color}'><b>{escape(status_label)}</b>｜{escape(config_detail)}</div><table>"
                 f"<tr><th>同步來源</th><td>{escape(str(state.get('source_name') or '尚未同步'))}</td></tr>"
@@ -3901,7 +4746,7 @@ def admin_master_sync(_: str = Depends(admin_auth)):
                 f"<tr><th>上次錯誤</th><td style='white-space:pre-wrap'>{escape(str(state.get('last_error') or '無'))}</td></tr></table>"
                 f"<p><b>自動檢查間隔：</b>{MASTER_SYNC_INTERVAL_MINUTES} 分鐘</p>"
                 f"<form method='post' action='/admin/master-sync/now'><button>立即檢查並同步</button></form></section>")
-    body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p></section>")
+    body.append("<section><h2>安全原則</h2><p>只有通過 Excel 結構與實際課程解析的資料才會寫入；同步失敗會保留上一份可用資料，不會因壞檔直接清空出勤資料。</p><p>Google Drive 檔案不需要公開分享；建議只把這一份總表分享給本服務專用的 Service Account。</p><p>K書學生若未填正確的系統學生編號，會保留錯誤記錄且不會自行建立學生或 QR。</p></section>")
     return page("主總表自動同步", ''.join(body))
 
 
@@ -3921,8 +4766,8 @@ def sync_master_excel_manual(raw: bytes) -> dict[str, Any]:
                 raise HTTPException(409, "目前正有自動同步正在執行，請稍後再試。")
             try:
                 summary = _apply_master_sync(cur, sheets)
-                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=NULL,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
-                            ("管理員手動上傳總表", now_local(), now_local(), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
+                cur.execute("""UPDATE master_sync_state SET provider='manual_upload',source_name=%s,last_checked_at=%s,last_synced_at=%s,last_success=TRUE,last_error=%s,last_trigger='manual_upload',last_actual_imported=%s,last_actual_skipped=%s,last_binding_imported=%s,last_error_count=%s,updated_at=%s WHERE id=1""",
+                            ("管理員手動上傳總表", now_local(), now_local(), ("；".join(summary["errors"][:10])[:1800] or None), summary["actual_imported"], summary["actual_skipped"], summary["binding_imported"], len(summary["errors"]), now_local()))
                 conn.commit()
                 return summary
             finally:
@@ -4103,22 +4948,100 @@ def regenerate_student_qr(student_id: int, _: str = Depends(admin_auth)):
     return RedirectResponse("/admin", status_code=303)
 
 
-@app.get("/scan/{token}", response_class=HTMLResponse)
-def scan(token: str, request: Request):
-    if setting_enabled("教室設備限制", True):
-        require_checkin_device(request)
-    result = scan_student(token)
+def _scan_result_display(result: dict[str, Any]) -> tuple[str, str, str]:
     kind = result.get("kind")
     if kind == "check_in":
-        title = "到班完成"; icon = "✅"; detail = f"{result['time'][11:16]}<br>遲到：{result['late']} 分鐘" if result.get('late', 0) else result['time'][11:16]
+        title = "到班完成"
+        icon = "✅"
+        detail = f"{result['time'][11:16]}｜遲到：{result['late']} 分鐘" if result.get("late", 0) else result["time"][11:16]
     elif kind == "check_out":
-        title = "離班完成"; icon = "👋"; detail = f"到班：{result['check_in'][11:16]}<br>離班：{result['time'][11:16]}"
+        title = "離班完成"
+        icon = "👋"
+        detail = f"到班：{result['check_in'][11:16]}｜離班：{result['time'][11:16]}"
     elif kind == "duplicate":
-        title = "已有紀錄"; icon = "ℹ️"; detail = escape(result["message"])
+        title, icon, detail = "已有紀錄", "ℹ️", str(result.get("message") or "")
     else:
-        title = result.get("message", "系統訊息"); icon = "⚠️"; detail = ""
-    body = f"<div style='max-width:540px;margin:60px auto;background:white;border-radius:16px;padding:28px;text-align:center;box-shadow:0 4px 20px #0001'><div style='font-size:30px'>{icon}</div><h1>{escape(title)}</h1><h2>{escape(result.get('student',''))}</h2><p>{escape(result.get('course',''))}</p><p>{detail}</p><p><a class='btn' href='/admin'>返回管理頁</a></p></div>"
+        title, icon, detail = str(result.get("message") or "系統訊息"), "⚠️", ""
+    return title, icon, detail
+
+
+@app.get("/scan/{token}", response_class=HTMLResponse)
+def scan(token: str, request: Request, course_id: int | None = None):
+    if setting_enabled("教室設備限制", True):
+        require_checkin_device(request)
+    result = scan_student(token, selected_course_id=course_id)
+    title, icon, detail = _scan_result_display(result)
+    body = (
+        "<div style='max-width:540px;margin:60px auto;background:white;border-radius:16px;padding:28px;text-align:center;box-shadow:0 4px 20px #0001'>"
+        f"<div style='font-size:30px'>{icon}</div><h1>{escape(title)}</h1>"
+        f"<h2>{escape(str(result.get('student') or ''))}</h2>"
+        f"<p>{escape(str(result.get('course') or ''))}</p><p>{escape(detail)}</p>"
+        "<p><a class='btn' href='/device/kiosk'>返回 USB 快速掃描</a></p></div>"
+    )
     return page("簽到結果", body)
+
+
+@app.get("/device/kiosk", response_class=HTMLResponse)
+def device_kiosk(request: Request):
+    device = require_checkin_device(request)
+    body = (
+        "<section style='max-width:720px;margin:40px auto;text-align:center'>"
+        "<h1>USB QR 快速簽到</h1>"
+        f"<p>已授權設備：<b>{escape(str(device.get('name') or '教室設備'))}</b></p>"
+        "<div class='alert success'>掃描器讀取學生 QR 後，會自動依排班時間判斷 K 書或一般課程，不需要另外選擇。</div>"
+        "<form id='usb-scan-form' method='post' action='/device/kiosk/scan'>"
+        "<label for='usb-scan-payload'>掃描輸入區</label><br>"
+        "<input id='usb-scan-payload' name='payload' type='text' autofocus autocomplete='off' "
+        "autocapitalize='off' spellcheck='false' placeholder='請把游標留在此處，再掃描學生 QR' "
+        "style='width:100%;max-width:640px;font-size:20px;padding:16px;margin:12px 0' required>"
+        "<br><button class='btn' type='submit'>送出掃描內容</button></form>"
+        "<p class='muted'>建議將 USB 掃描器設定為鍵盤輸入模式，並在每次掃描結尾送出 Enter。掃描完成後畫面會自動回到輸入框，可連續掃描下一位。</p>"
+        "<p><a class='btn btn2' href='/device'>返回設備首頁</a></p></section>"
+        "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
+        "let t=null,submitted=false;function submitScan(){if(submitted||!i.value.trim())return;submitted=true;if(t)clearTimeout(t);f.requestSubmit();}"
+        "i.addEventListener('input',function(){if(submitted)return;if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(submitScan,500);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();submitScan();}});"
+        "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
+    )
+    return page("USB QR 快速簽到", body)
+
+
+@app.post("/device/kiosk/scan", response_class=HTMLResponse)
+def device_kiosk_scan(request: Request, payload: str = Form(...)):
+    device = require_checkin_device(request)
+    token = extract_scanned_student_token(payload)
+    if not token:
+        result = {"kind": "error", "message": "無法辨識掃描內容。請確認掃描器讀取的是學生 QR 碼，而不是設備配對 QR。"}
+    else:
+        try:
+            result = scan_student(token)
+        except HTTPException as exc:
+            result = {"kind": "error", "message": str(exc.detail)}
+
+    title, icon, detail = _scan_result_display(result)
+    body = (
+        "<section style='max-width:720px;margin:30px auto;text-align:center'>"
+        "<h1>USB QR 快速簽到</h1>"
+        f"<p>設備：<b>{escape(str(device.get('name') or '教室設備'))}</b></p>"
+        f"<div class='alert {'success' if result.get('kind') in {'check_in','check_out'} else ''}'>"
+        f"<div style='font-size:28px'>{icon}</div><h2>{escape(title)}</h2>"
+        f"<h3>{escape(str(result.get('student') or ''))}</h3>"
+        f"<p>{escape(str(result.get('course') or ''))}</p><p>{escape(detail)}</p></div>"
+        "<form id='usb-scan-form' method='post' action='/device/kiosk/scan'>"
+        "<label for='usb-scan-payload'>下一筆掃描</label><br>"
+        "<input id='usb-scan-payload' name='payload' type='text' autofocus autocomplete='off' "
+        "autocapitalize='off' spellcheck='false' placeholder='準備掃描下一位學生' "
+        "style='width:100%;max-width:640px;font-size:20px;padding:16px;margin:12px 0' required>"
+        "<br><button class='btn' type='submit'>送出掃描內容</button></form>"
+        "<p class='muted'>掃描器請設定為鍵盤輸入模式，建議每次掃描後送出 Enter；也支援掃描輸入停止後自動送出。</p>"
+        "<p><a class='btn btn2' href='/device'>設備首頁</a></p></section>"
+        "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
+        "let t=null,submitted=false;function submitScan(){if(submitted||!i.value.trim())return;submitted=true;if(t)clearTimeout(t);f.requestSubmit();}"
+        "i.addEventListener('input',function(){if(submitted)return;if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(submitScan,500);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();submitScan();}});"
+        "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
+    )
+    return page("USB QR 快速簽到", body)
 
 
 @app.get("/admin/devices", response_class=HTMLResponse)
@@ -4191,7 +5114,7 @@ def device_pair_confirm(code: str = Form(...)):
 @app.get("/device", response_class=HTMLResponse)
 def device_home(request: Request):
     device = require_checkin_device(request)
-    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>現在可以用這支教室手機的內建相機掃描學生 QR。這就是正式的教室簽到設備，不需要電腦。</p><p class='mini muted'>如果清除瀏覽器 Cookie、換瀏覽器或換手機，需要重新配對；只要這支手機的這個瀏覽器保持登入配對即可。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
+    body = f"<section style='max-width:680px;margin:40px auto;text-align:center'><h1>教室簽到設備</h1><p>設備：<b>{escape(device['name'])}</b></p><div class='alert success'>✅ 本機已授權</div><p>可使用手機相機直接掃描學生 QR，也可以使用 USB QR 掃描器連接電腦。</p><p><a class='btn' href='/device/kiosk'>開啟 USB QR 快速掃描</a></p><p class='mini muted'>USB 掃描器請設為鍵盤輸入模式，建議掃描結尾送出 Enter。若清除瀏覽器 Cookie、換瀏覽器或換設備，需要重新配對。</p><p><a class='btn btn2' href='/admin/devices'>管理員設備頁</a></p></section>"
     return page("教室簽到設備", body)
 
 

@@ -1,0 +1,323 @@
+name: K-book attendance code checks
+
+on:
+  push:
+    branches:
+      - feature/kbook-attendance-management
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - ".github/workflows/kbook-check.yml"
+
+jobs:
+  syntax-and-helper-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m py_compile app.py
+
+      - name: Validate K-book SQL parentheses and parameter counts
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          source = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          fn = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "_ensure_kbook_courses_for_date")
+          checked = 0
+          for node in ast.walk(fn):
+              if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "execute" or not node.args:
+                  continue
+              sql_node = node.args[0]
+              if not isinstance(sql_node, ast.Constant) or not isinstance(sql_node.value, str):
+                  continue
+              sql = sql_node.value
+              # Every percent in these parameterized statements must be part of a supported placeholder.
+              percent_remainder = re.sub(r"%s|%b|%t", "", sql)
+              assert "%" not in percent_remainder, f"Unexpected percent in SQL near line {node.lineno}: {percent_remainder!r}"
+              depth = 0
+              for char in sql:
+                  if char == "(":
+                      depth += 1
+                  elif char == ")":
+                      depth -= 1
+                      assert depth >= 0, f"Extra closing parenthesis in K-book SQL near line {node.lineno}"
+              assert depth == 0, f"Unclosed parenthesis in K-book SQL near line {node.lineno}: depth={depth}"
+              placeholders = len(re.findall(r"%(?:s|b|t)", sql))
+              if len(node.args) < 2:
+                  params = 0
+              elif isinstance(node.args[1], (ast.Tuple, ast.List)):
+                  params = len(node.args[1].elts)
+              else:
+                  continue
+              assert placeholders == params, (
+                  f"K-book SQL near line {node.lineno}: {placeholders} placeholders but {params} parameters"
+              )
+              checked += 1
+          assert checked >= 5, f"Expected at least 5 K-book SQL statements checked, got {checked}"
+          print(f"Validated SQL parentheses and parameter counts for {checked} K-book statements")
+          PY
+
+      - name: Test K-book date and weekday parsing
+        run: |
+          python - <<'PY'
+          import app
+          assert app.STATUS_LABELS["completed"] == "已離班", "Completed attendance must display as 離班 in Chinese"
+          import ast
+          from pathlib import Path
+          from datetime import date, timedelta
+
+          # Regression test for NameError: weekday was used before it was defined.
+          source_tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
+          generator = next(node for node in source_tree.body
+                           if isinstance(node, ast.FunctionDef) and node.name == "_ensure_kbook_courses_for_date")
+          weekday_assignment = next((node for node in generator.body
+                                     if isinstance(node, ast.Assign)
+                                     and any(isinstance(target, ast.Name) and target.id == "weekday" for target in node.targets)), None)
+          assert weekday_assignment is not None, "_ensure_kbook_courses_for_date must define weekday"
+          assert isinstance(weekday_assignment.value, ast.Call)
+          assert isinstance(weekday_assignment.value.func, ast.Attribute)
+          assert weekday_assignment.value.func.attr == "weekday"
+          assert isinstance(weekday_assignment.value.func.value, ast.Name)
+          assert weekday_assignment.value.func.value.id == "d"
+          assert app._kbook_date("2026-10-21") == date(2026, 10, 21)
+          assert app._kbook_date("46000") == date(1899, 12, 30) + timedelta(days=46000)
+          assert app._kbook_date("5") is None
+          assert app._kbook_weekday("星期一") == 0
+          assert app._kbook_weekday("週日") == 6
+          assert app._kbook_weekday("1") == 0
+          assert app._kbook_weekday("5") == 4
+          assert app._kbook_weekday("7") == 6
+          assert app._kbook_weekday("8") is None
+          assert app._kbook_date("") is None
+          assert app._kbook_schedule_type("平日固定") == "weekdays"
+          assert app._kbook_schedule_type("每週固定") == "weekly"
+          assert app._kbook_schedule_type("單日") == "single"
+          assert app._kbook_schedule_type("單日停用") == "skip"
+          assert app._kbook_schedule_type("未知類型") is None
+          assert app._kbook_regular_day_matches("weekdays", 0) is True
+          assert app._kbook_regular_day_matches("weekdays", 4) is True
+          assert app._kbook_regular_day_matches("weekdays", 5) is False
+          assert app._kbook_weekday_enabled("", True) is True
+          assert app._kbook_weekday_enabled("", False) is False
+          assert app._kbook_weekday_enabled("是", False) is True
+          assert app._kbook_weekday_enabled("否", True) is False
+          assert app._normalize_excel_time(0.5) == "12:00"
+          assert app._normalize_excel_time("18:30") == "18:30"
+
+          # Build a small XLSX fixture with a title row before the headers.
+          from io import BytesIO
+          from zipfile import ZipFile, ZIP_DEFLATED
+          from xml.sax.saxutils import escape
+
+          def col_name(n):
+              out = ""
+              while n:
+                  n, rem = divmod(n - 1, 26)
+                  out = chr(65 + rem) + out
+              return out
+
+          def xml_row(row_no, values):
+              cells = []
+              for index, value in enumerate(values, 1):
+                  if value is None or value == "":
+                      continue
+                  ref = f"{col_name(index)}{row_no}"
+                  cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(value))}</t></is></c>')
+              return f'<row r="{row_no}">' + "".join(cells) + "</row>"
+
+          ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+          pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+          student_headers = ["K書設定ID", "系統學生編號（對應出勤學生）", "學生姓名", "狀態", "開始使用日", "停用日期", "遲到門檻（分鐘；空白沿用全域）", "平日固定K書", "預計到班時間", "預計離班時間"]
+          student_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, ["K 書學生設定｜標題"]) + xml_row(2, student_headers) + xml_row(3, ["KBOOK-TEST", None, "新同學", "啟用", "2026-10-21", None, "15", "是", "18:00", "20:00"]) + "</sheetData></worksheet>"
+          arrangement_headers = ["安排ID", "K書設定ID", "安排類型", "星期", "生效日期（每週安排用）", "預計到班時間", "預計離班時間", "遲到門檻（分鐘）", "安排啟用"]
+          arrangement_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, arrangement_headers) + xml_row(2, ["ARR-TEST", "KBOOK-TEST", "每週固定", "星期三", "2026-10-21", "18:00", "20:00", "10", "是"]) + "</sheetData></worksheet>"
+          course_headers = ["Course ID", "課程日期", "星期", "上課時間", "學生", "課程", "老師", "校區", "來源"]
+          course_xml = f'<worksheet xmlns="{ns}"><sheetData>' + xml_row(1, course_headers) + xml_row(2, ["COURSE-TEST", "2026-10-21", "星期三", "16:00", "測試學生", "英文", "測試老師", "信義", "固定課表"]) + "</sheetData></worksheet>"
+          workbook_xml = f'<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="K書學生" sheetId="1" r:id="rId1"/><sheet name="K書出勤安排" sheetId="2" r:id="rId2"/><sheet name="實際課程" sheetId="3" r:id="rId3"/></sheets></workbook>'
+          relationships_xml = f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="{rel}/worksheet" Target="worksheets/sheet3.xml"/></Relationships>'
+          fixture = BytesIO()
+          with ZipFile(fixture, "w", ZIP_DEFLATED) as z:
+              z.writestr("xl/workbook.xml", workbook_xml)
+              z.writestr("xl/_rels/workbook.xml.rels", relationships_xml)
+              z.writestr("xl/worksheets/sheet1.xml", student_xml)
+              z.writestr("xl/worksheets/sheet2.xml", arrangement_xml)
+              z.writestr("xl/worksheets/sheet3.xml", course_xml)
+          student_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書學生")
+          arrangement_rows = app._xlsx_read_sheet(fixture.getvalue(), "K書出勤安排")
+          assert student_rows[0]["K書設定ID"] == "KBOOK-TEST"
+          assert student_rows[0]["學生姓名"] == "新同學"
+          assert student_rows[0]["開始使用日"] == "2026-10-21"
+          assert student_rows[0]["平日固定K書"] == "是"
+          assert student_rows[0]["預計到班時間"] == "18:00"
+          assert student_rows[0]["預計離班時間"] == "20:00"
+          assert arrangement_rows[0]["安排ID"] == "ARR-TEST"
+          assert arrangement_rows[0]["預計到班時間"] == "18:00"
+          all_sheets = app._load_master_workbook_sheets(fixture.getvalue())
+          assert all_sheets["_kbook_source_meta"][0]["student_sheet_present"] is True
+          assert all_sheets["_kbook_source_meta"][0]["arrangement_sheet_present"] is True
+          assert len(all_sheets["K書出勤安排"]) == 1
+          print("K-book helpers and full workbook parsing checks passed")
+          PY
+      - name: Prevent disabled K-book students from generating active courses
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
+          generator = next(
+              node for node in tree.body
+              if isinstance(node, ast.FunctionDef)
+              and node.name == "_ensure_kbook_courses_for_date"
+          )
+          sql_statements = []
+          for node in ast.walk(generator):
+              if (
+                  isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "execute"
+                  and node.args
+                  and isinstance(node.args[0], ast.Constant)
+                  and isinstance(node.args[0].value, str)
+              ):
+                  sql_statements.append(re.sub(r"\s+", " ", node.args[0].value))
+
+          explicit_generation = next(
+              (sql for sql in sql_statements
+               if "WHERE a.active=TRUE AND a.schedule_type IN ('single','weekly','weekdays')" in sql),
+              None,
+          )
+          assert explicit_generation is not None, "Explicit K-book schedule query not found"
+          assert "JOIN students s ON s.id=ks.student_id AND s.active=TRUE" in explicit_generation, (
+              "Explicit K-book schedules must exclude disabled system students"
+          )
+
+          stale_cleanup = next(
+              (sql for sql in sql_statements if "WHERE a.arrangement_id=c.kbook_arrangement_id" in sql),
+              None,
+          )
+          assert stale_cleanup is not None, "Stale explicit K-book course cleanup query not found"
+          assert "JOIN students s ON s.id=ks.student_id AND s.active=TRUE" in stale_cleanup, (
+              "Stale K-book courses for disabled system students must be retired when no attendance was recorded"
+          )
+
+          default_generation = next(
+              (sql for sql in sql_statements
+               if "SELECT ks.* FROM kbook_student_settings ks JOIN students s ON s.id=ks.student_id" in sql),
+              None,
+          )
+          assert default_generation is not None and "WHERE s.active=TRUE" in default_generation, (
+              "Default weekday K-book schedules must exclude disabled system students"
+          )
+          print("Disabled-student K-book schedule regression checks passed")
+          PY
+      - name: Verify daily K-book generation and fail-closed schedule handling
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+
+          def function_source(name):
+              node = next(
+                  item for item in tree.body
+                  if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and item.name == name
+              )
+              return ast.get_source_segment(source, node)
+
+          run_checks = function_source("run_all_checks")
+          checker = function_source("periodic_checker")
+          startup = function_source("startup")
+          sync_schedules = function_source("_kbook_sync_sheets")
+          admin_page = function_source("admin_kbook")
+
+          assert "_ensure_kbook_courses_today()" in run_checks, (
+              "Background attendance checks must generate today's K-book courses"
+          )
+          assert "await asyncio.sleep(60)" in checker and "run_all_checks" in checker, (
+              "Daily course generation must run through the background checker, not only on page views"
+          )
+          assert 'asyncio.create_task(periodic_checker())' in startup, (
+              "Application startup must register the background attendance checker"
+          )
+          assert "UPDATE kbook_arrangements SET active=FALSE" in sync_schedules, (
+              "An incomplete/invalid source schedule must not leave a stale active database schedule"
+          )
+          assert "缺少預計到班或離班時間；此排班暫停產生簽到表" in sync_schedules, (
+              "Missing times must produce a clear diagnostic and pause the schedule"
+          )
+          assert 'generated_today = _ensure_kbook_courses_for_date(cur,today)' in admin_page, (
+              "K-book admin page should run today's generator and surface the count"
+          )
+          assert "本次頁面檢查：今日已建立或更新" in admin_page, (
+              "K-book admin page should show today's generated/updated course count"
+          )
+          print("Daily K-book generation wiring and fail-closed schedule checks passed")
+          PY
+      - name: K-book-first automatic selection and USB scanner checks
+        run: |
+          python - <<'PY'
+          import app
+          from datetime import datetime, timedelta
+
+          app.setting_int = lambda key, fallback: fallback
+          when = datetime(2026, 10, 31, 17, 30)
+          general = {
+              "id": 1, "source": "實際課程", "course_name": "英文",
+              "effective_start": "17:00", "effective_end": "19:00",
+              "checkout_grace_minutes": 15,
+          }
+          kbook = {
+              "id": 2, "source": "K書", "course_name": "K書",
+              "effective_start": "17:00", "effective_end": "19:00",
+              "checkout_grace_minutes": 15,
+          }
+
+          chosen = app.choose_course([general, kbook], when, {})
+          assert chosen["source"] == "K書", "K書 must take priority during its active time window"
+
+          early_scan = datetime(2026, 10, 31, 16, 30)
+          assert app.choose_course([general, kbook], early_scan, {})["source"] == "K書", (
+              "K書 must also take priority during the configured early-scan window"
+          )
+
+          completed_kbook = {
+              2: {"check_in_time": when - timedelta(hours=1), "check_out_time": when - timedelta(minutes=5)}
+          }
+          chosen_after_kbook_checkout = app.choose_course([general, kbook], when, completed_kbook)
+          assert chosen_after_kbook_checkout["source"] == "實際課程", (
+              "A completed K-book record must not block a concurrent ordinary class"
+          )
+
+          token = "Abcdefghijklmnopqrstuvwxyz_123456"
+          assert app.extract_scanned_student_token(token) == token
+          assert app.extract_scanned_student_token("https://attendance.test/scan/" + token) == token
+          assert app.extract_scanned_student_token("not a student qr!") is None
+
+          source = open("app.py", encoding="utf-8").read()
+          assert '@app.get("/device/kiosk"' in source
+          assert '@app.post("/device/kiosk/scan"' in source
+          assert "require_checkin_device(request)" in source
+          assert "function submitScan()" in source and "submitted=true" in source, (
+              "USB scanner page must guard against Enter plus auto-submit double posting"
+          )
+          print("K-book priority, completed-session fallback, QR parsing and USB kiosk checks passed")
+          PY
