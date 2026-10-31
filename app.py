@@ -1052,13 +1052,14 @@ def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attend
         earliest = start - timedelta(minutes=early_minutes)
         latest = end + timedelta(minutes=checkout_minutes)
         in_scan_window = earliest <= when <= latest
-        kbook_active_now = (
-            str(course.get("source") or "").strip() == "K書"
-            and start <= when <= latest
-        )
         record = (existing_attendance or {}).get(course["id"])
         has_open_attendance = bool(
             record and record.get("check_in_time") and not record.get("check_out_time")
+        )
+        kbook_active_now = (
+            str(course.get("source") or "").strip() == "K書"
+            and start <= when <= latest
+            and not (record and record.get("check_out_time"))
         )
         if when < earliest:
             distance = (earliest - when).total_seconds()
@@ -4997,8 +4998,9 @@ def device_kiosk(request: Request):
         "<p class='muted'>建議將 USB 掃描器設定為鍵盤輸入模式，並在每次掃描結尾送出 Enter。掃描完成後畫面會自動回到輸入框，可連續掃描下一位。</p>"
         "<p><a class='btn btn2' href='/device'>返回設備首頁</a></p></section>"
         "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
-        "let t=null;i.addEventListener('input',function(){if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(function(){if(i.value.trim())f.requestSubmit();},350);});"
-        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();if(i.value.trim())f.requestSubmit();}});"
+        "let t=null,submitted=false;function submitScan(){if(submitted||!i.value.trim())return;submitted=true;if(t)clearTimeout(t);f.requestSubmit();}"
+        "i.addEventListener('input',function(){if(submitted)return;if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(submitScan,500);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();submitScan();}});"
         "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
     )
     return page("USB QR 快速簽到", body)
@@ -5034,8 +5036,9 @@ def device_kiosk_scan(request: Request, payload: str = Form(...)):
         "<p class='muted'>掃描器請設定為鍵盤輸入模式，建議每次掃描後送出 Enter；也支援掃描輸入停止後自動送出。</p>"
         "<p><a class='btn btn2' href='/device'>設備首頁</a></p></section>"
         "<script>(function(){const f=document.getElementById('usb-scan-form');const i=document.getElementById('usb-scan-payload');"
-        "let t=null;i.addEventListener('input',function(){if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(function(){if(i.value.trim())f.requestSubmit();},350);});"
-        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();if(i.value.trim())f.requestSubmit();}});"
+        "let t=null,submitted=false;function submitScan(){if(submitted||!i.value.trim())return;submitted=true;if(t)clearTimeout(t);f.requestSubmit();}"
+        "i.addEventListener('input',function(){if(submitted)return;if(t)clearTimeout(t);if(i.value.trim())t=setTimeout(submitScan,500);});"
+        "i.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();submitScan();}});"
         "window.addEventListener('load',function(){i.focus();i.select();});})();</script>"
     )
     return page("USB QR 快速簽到", body)
