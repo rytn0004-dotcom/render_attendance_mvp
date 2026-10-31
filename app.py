@@ -1058,7 +1058,7 @@ def choose_course(courses: list[dict[str, Any]], when: datetime, existing_attend
         )
         kbook_active_now = (
             str(course.get("source") or "").strip() == "K書"
-            and start <= when <= latest
+            and earliest <= when <= latest
             and not (record and record.get("check_out_time"))
         )
         if when < earliest:
