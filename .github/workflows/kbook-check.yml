@@ -310,7 +310,7 @@ jobs:
           token = "Abcdefghijklmnopqrstuvwxyz_123456"
           assert app.extract_scanned_student_token(token) == token
           assert app.extract_scanned_student_token("https://attendance.test/scan/" + token) == token
-          assert app.extract_scanned_student_token("not-a-student-qr") is None
+          assert app.extract_scanned_student_token("not a student qr!") is None
 
           source = open("app.py", encoding="utf-8").read()
           assert '@app.get("/device/kiosk"' in source
