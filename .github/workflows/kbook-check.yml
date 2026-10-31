@@ -272,3 +272,48 @@ jobs:
           )
           print("Daily K-book generation wiring and fail-closed schedule checks passed")
           PY
+      - name: K-book-first automatic selection and USB scanner checks
+        run: |
+          python - <<'PY'
+          import app
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          app.setting_int = lambda key, fallback: fallback
+          when = datetime(2026, 10, 31, 17, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+          general = {
+              "id": 1, "source": "實際課程", "course_name": "英文",
+              "effective_start": "17:00", "effective_end": "19:00",
+              "checkout_grace_minutes": 15,
+          }
+          kbook = {
+              "id": 2, "source": "K書", "course_name": "K書",
+              "effective_start": "17:00", "effective_end": "19:00",
+              "checkout_grace_minutes": 15,
+          }
+
+          chosen = app.choose_course([general, kbook], when, {})
+          assert chosen["source"] == "K書", "K書 must take priority during its active time window"
+
+          completed_kbook = {
+              2: {"check_in_time": when - timedelta(hours=1), "check_out_time": when - timedelta(minutes=5)}
+          }
+          chosen_after_kbook_checkout = app.choose_course([general, kbook], when, completed_kbook)
+          assert chosen_after_kbook_checkout["source"] == "實際課程", (
+              "A completed K-book record must not block a concurrent ordinary class"
+          )
+
+          token = "Abcdefghijklmnopqrstuvwxyz_123456"
+          assert app.extract_scanned_student_token(token) == token
+          assert app.extract_scanned_student_token("https://attendance.test/scan/" + token) == token
+          assert app.extract_scanned_student_token("not-a-student-qr") is None
+
+          source = open("app.py", encoding="utf-8").read()
+          assert '@app.get("/device/kiosk"' in source
+          assert '@app.post("/device/kiosk/scan"' in source
+          assert "require_checkin_device(request)" in source
+          assert "function submitScan()" in source and "submitted=true" in source, (
+              "USB scanner page must guard against Enter plus auto-submit double posting"
+          )
+          print("K-book priority, completed-session fallback, QR parsing and USB kiosk checks passed")
+          PY
